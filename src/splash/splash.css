@@ -1,0 +1,248 @@
+/* Original, dependency-free loading surface: one tilted orbit, one satellite,
+   one soft core. No percentages, no imitation of the backend composer. */
+
+:root {
+  color-scheme: dark light;
+  --bg: #0b0f16;
+  --bg-soft: #101725;
+  --text: #e6edf6;
+  --text-dim: #9aa8bd;
+  --accent: #9dbdff;
+  --accent-strong: #dbe8ff;
+  --danger: #ffb4a8;
+  --ring: rgba(157, 189, 255, 0.28);
+  --ring-strong: rgba(219, 232, 255, 0.9);
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f6fb;
+    --bg-soft: #ffffff;
+    --text: #101725;
+    --text-dim: #55637a;
+    --accent: #2f5bbf;
+    --accent-strong: #16306a;
+    --danger: #b42318;
+    --ring: rgba(47, 91, 191, 0.22);
+    --ring-strong: rgba(22, 48, 106, 0.75);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgba(157, 189, 255, 0.12), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+
+.shell {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 22px 24px 18px;
+  text-align: center;
+  -webkit-app-region: drag;
+}
+
+.actions,
+button {
+  -webkit-app-region: no-drag;
+}
+
+.orbital {
+  position: relative;
+  width: 112px;
+  height: 112px;
+  margin-bottom: 4px;
+  display: grid;
+  place-items: center;
+}
+
+.orbit {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 1px solid var(--ring);
+}
+
+.orbit-back {
+  transform: rotate(-28deg) scaleY(0.42);
+  border-color: var(--ring);
+  opacity: 0.75;
+}
+
+.orbit-front {
+  transform: rotate(-28deg) scaleY(0.42);
+  border-color: transparent;
+  animation: orbit-spin 5.2s linear infinite;
+}
+
+.orbit-front::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: 50%;
+  border: 1px solid transparent;
+  border-top-color: var(--ring-strong);
+  border-right-color: color-mix(in srgb, var(--ring-strong) 45%, transparent);
+}
+
+.satellite {
+  position: absolute;
+  top: -3px;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  margin-left: -3px;
+  border-radius: 50%;
+  background: var(--accent-strong);
+  box-shadow: 0 0 12px 2px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.core {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, var(--accent-strong), var(--accent) 55%, transparent 72%);
+  box-shadow: 0 0 24px 4px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.core-glow {
+  position: absolute;
+  inset: -18px;
+  border-radius: 50%;
+  background: radial-gradient(circle, color-mix(in srgb, var(--accent) 26%, transparent), transparent 70%);
+  animation: core-breathe 3.6s ease-in-out infinite;
+}
+
+.title {
+  margin: 10px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.stage {
+  margin: 2px 0 0;
+  font-size: 15px;
+  font-weight: 500;
+  min-height: 20px;
+}
+
+.detail {
+  margin: 6px 0 0;
+  max-width: 360px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+
+.shell[data-state="ERROR"] .stage {
+  color: var(--danger);
+}
+
+.shell[data-state="ERROR"] .orbit-front {
+  animation-play-state: paused;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+button {
+  font-family: inherit;
+  font-size: 12px;
+  padding: 7px 14px;
+  border-radius: 7px;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 35%, transparent);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--text-dim);
+}
+
+button.primary {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  color: var(--accent-strong);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.meta {
+  margin: 10px 0 0;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--text-dim) 80%, transparent);
+  min-height: 14px;
+}
+
+@keyframes orbit-spin {
+  from {
+    transform: rotate(-28deg) scaleY(0.42) rotate(0deg);
+  }
+  to {
+    transform: rotate(-28deg) scaleY(0.42) rotate(360deg);
+  }
+}
+
+@keyframes core-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+
+/* Motion sensitivity: static ring, gentle opacity only, no rotation. */
+@media (prefers-reduced-motion: reduce) {
+  .orbit-front {
+    animation: none;
+  }
+  .satellite {
+    top: 46%;
+    left: 96%;
+  }
+  .core-glow {
+    animation: none;
+    opacity: 0.8;
+  }
+  .stage,
+  .detail,
+  .actions {
+    transition: none;
+  }
+}

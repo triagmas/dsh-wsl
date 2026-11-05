@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WSL Web Shell — Settings</title>
+    <link rel="stylesheet" href="./settings.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <header>
+        <h1>WSL Web Shell</h1>
+        <p class="subtitle">Backend settings. The WebUI itself stays unmodified.</p>
+      </header>
+
+      <form id="form" autocomplete="off">
+        <label class="field">
+          <span>WSL distribution</span>
+          <select id="distro" name="distro"></select>
+          <small>Only existing distributions are listed. The app never creates one.</small>
+        </label>
+
+        <label class="field">
+          <span>Loopback port</span>
+          <input id="port" name="port" type="number" min="1024" max="65535" step="1" inputmode="numeric" />
+          <small>Bind address is fixed to 127.0.0.1. The WebUI is never exposed to the LAN.</small>
+        </label>
+
+        <label class="field">
+          <span>Workspace root inside WSL</span>
+          <input id="workspace" name="workspace" type="text" spellcheck="false" placeholder="~" />
+          <small>Passed as the working directory; it becomes the default workspace root.</small>
+        </label>
+
+        <label class="field">
+          <span>DeepSeek Harness executable (optional)</span>
+          <input id="dshPath" name="dshPath" type="text" spellcheck="false" placeholder="/usr/local/bin/dsh" />
+          <small>Leave empty to auto-detect. Absolute POSIX path inside the distribution.</small>
+        </label>
+
+        <label class="toggle">
+          <input id="autoRestart" name="autoRestart" type="checkbox" />
+          <span>Restart the backend automatically after unexpected loss</span>
+        </label>
+
+        <label class="field compact">
+          <span>Maximum automatic restart attempts</span>
+          <input id="maxRestartAttempts" name="maxRestartAttempts" type="number" min="0" max="20" step="1" />
+        </label>
+
+        <label class="toggle">
+          <input id="openOnLaunch" name="openOnLaunch" type="checkbox" />
+          <span>Show the window as soon as the WebUI is ready</span>
+        </label>
+
+        <p class="notice" id="notice" role="status" aria-live="polite"></p>
+
+        <footer>
+          <button type="button" class="link" id="openConfig">Open config folder</button>
+          <span class="spacer"></span>
+          <button type="button" class="secondary" id="cancel">Close</button>
+          <button type="submit" class="primary" id="save">Save</button>
+        </footer>
+      </form>
+
+      <section class="status">
+        <span id="statusLabel">—</span>
+        <span id="statusDetail"></span>
+      </section>
+    </main>
+    <script src="./settings.js"></script>
+  </body>
+</html>
