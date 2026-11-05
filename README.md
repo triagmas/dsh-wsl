@@ -27,7 +27,11 @@ WSL Web Shell.exe
 ```
 
 Lifecycle: `CHECKING → STARTING_WSL → STARTING_WEB → CONNECTING → READY ↔ HIDDEN_IN_TRAY`,
-with `RECOVERING`, `ERROR`, `QUITTING`. Details: [docs/architecture.md](docs/architecture.md).
+with `RECOVERING`, `ERROR`, `QUITTING`. Closing the window hides it to the tray and
+the state follows; a later successful start never re-opens a window you closed.
+Recovery reloads the original WebUI, reclaims only a verified app-owned backend and
+re-checks PID identity before any forced kill. Details:
+[docs/architecture.md](docs/architecture.md).
 
 ## Requirements
 
@@ -45,6 +49,8 @@ npm run lint          # eslint
 npm test              # vitest (unit tests only, no WSL/Electron needed)
 npm run build         # esbuild -> dist/ (main, preloads, local pages, icons)
 npm start             # build + run Electron on the current platform
+npm run smoke:headless  # Linux/WSL: launch the built app under Xvfb with a
+                        # sanitised PATH/HOME; must reach a clean terminal error
 ```
 
 Windows packaging (x64, portable EXE):
