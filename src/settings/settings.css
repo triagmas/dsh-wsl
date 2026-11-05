@@ -38,7 +38,7 @@ body {
 
 .panel {
   height: 100%;
-  padding: 22px 24px 16px;
+  padding: 20px 24px 8px;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -126,12 +126,16 @@ select:focus-visible {
 .notice.ok { color: var(--ok); }
 
 footer {
+  position: sticky;
+  bottom: 0;
   display: flex;
   align-items: center;
   gap: 8px;
   margin-top: auto;
-  padding-top: 12px;
+  padding: 12px 0 4px;
   border-top: 1px solid var(--border);
+  background: var(--bg);
+  z-index: 1;
 }
 
 .spacer { flex: 1; }

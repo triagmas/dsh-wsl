@@ -173,6 +173,12 @@ button {
   margin-top: 14px;
 }
 
+/* Class rules override the UA [hidden] rule, so hide explicitly. */
+.actions[hidden],
+.detail[hidden] {
+  display: none;
+}
+
 button {
   font-family: inherit;
   font-size: 12px;

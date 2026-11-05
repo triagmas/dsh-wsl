@@ -212,7 +212,7 @@ export class Windows {
     const parent = this.mainWindow;
     const window = new BrowserWindow({
       width: 620,
-      height: 640,
+      height: 700,
       resizable: false,
       minimizable: true,
       maximizable: false,

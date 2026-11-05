@@ -1,5 +1,7 @@
 /* Splash / reconnect overlay controller. Plain DOM, no framework. */
-const shell = document.getElementById('shell');
+// NOTE: `window.shell` is defined by the preload bridge; a top-level `const shell`
+// would collide with that global property and break the whole script.
+const root = document.getElementById('shell');
 const stage = document.getElementById('stage');
 const detail = document.getElementById('detail');
 const actions = document.getElementById('actions');
@@ -9,7 +11,7 @@ const logsButton = document.getElementById('logs');
 
 function render(status) {
   if (!status) return;
-  shell.dataset.state = status.state;
+  root.dataset.state = status.state;
   stage.textContent = status.message;
   if (status.detail) {
     detail.hidden = false;
