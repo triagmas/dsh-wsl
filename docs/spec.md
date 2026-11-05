@@ -60,7 +60,7 @@ Additional states: `HIDDEN_IN_TRAY` (window hidden, still supervised), `RECOVERI
 - Verify backend ownership independently from port reachability; local port bind must not expose WebUI to LAN/Internet. Tokenized startup URLs are credentials: no logging, screenshots, clipboard or diagnostic uploads containing secrets.
 - Use `spawn` with fixed argument arrays, validate distro/port/profile args. If invoking a shell inside WSL for compatibility, use fixed scripts and safe argument handling; no interpolation of untrusted user text.
 - Track owned process IDs and lifecycle, handle WSL spawning process trees safely. No `wsl --shutdown`, mass `Stop-Process`, `taskkill`, or killing unrelated service on port.
-- Do **not** change official Windows DSH `F:\-ToolBox-\DSH`, `F:\-ToolBox-\DSH-Data\home`, Windows Desktop profile/plugin configs, global networking settings or user projects.
+- Do **not** change official Windows DSH the installed official Windows Harness application directory, the owner's existing Windows Harness data/profile directory, Windows Desktop profile/plugin configs, global networking settings or user projects.
 - Do not automatically download runtime dependencies at first launch. Respect Electron code-signing/installer trust considerations for future release. The software will be public; do not commit token samples, private addresses or identifiable log paths.
 
 ## UI / visual direction
