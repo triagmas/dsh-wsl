@@ -44,7 +44,7 @@ export class FakeServer implements ServerHandle {
 
   announce(): void {
     if (this.options.announceUrl === false) return;
-    this.emit(`${'dsh web: '}http://127.0.0.1:${this.options.urlPort ?? PORT}/?token=abcdefghijklmnop1234567890`);
+    this.emit(`dsh web: http://127.0.0.1:${this.options.urlPort ?? PORT}/?token=test-token-0123456789abcdef`);
   }
 
   exit(info: ExitInfo = { code: 1, signal: null }): void {

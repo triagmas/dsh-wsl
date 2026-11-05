@@ -8,7 +8,7 @@ import {
   redactSecrets,
 } from '../src/main/backend/urls.js';
 
-const TOKEN = 'Qk3f9Zt1sV7pLx2Rc8Nm4Yh6';
+const TOKEN = 'test-token-0123456789abcdef';
 const VALID = `dsh web: http://127.0.0.1:3080/?token=${TOKEN}`;
 
 describe('parseStartupLine', () => {
