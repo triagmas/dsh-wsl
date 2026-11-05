@@ -13,6 +13,7 @@ import type { RegistryStore } from './registry.js';
 import { Lifecycle, backoffDelay } from './lifecycle.js';
 import { verifyOwnership, type OwnedServerRecord } from './ownership.js';
 import { classifyPortSituation, type PortState } from './port.js';
+import { sanitizeOptional } from './display.js';
 
 export interface ExitInfo {
   code: number | null;
@@ -124,6 +125,9 @@ export class Supervisor {
   private recoveryRunning = false;
   private quitting = false;
   private detail: string | null = null;
+  /** Last known window visibility, so recovery can restore the tray state. */
+  private windowHidden = false;
+  private readyCount = 0;
 
   constructor(private readonly deps: SupervisorDeps) {
     this.status = this.buildStatus('CHECKING', null);
@@ -141,12 +145,27 @@ export class Supervisor {
     return this.lifecycle.state;
   }
 
+  /**
+   * Increments every time the backend becomes usable. The window layer uses it
+   * to force a real reload after a restart instead of trusting the old page.
+   */
+  get readyGeneration(): number {
+    return this.readyCount;
+  }
+
+  /** True when the user closed the window to the tray. */
+  get isWindowHidden(): boolean {
+    return this.windowHidden;
+  }
+
   private buildStatus(state: LifecycleState, detail: string | null): ShellStatus {
     const config = this.deps.config();
     return {
       state,
       message: STATE_MESSAGES[state],
-      detail,
+      // Every published string is sanitized: diagnostics may embed backend
+      // output, exception text or a URL that once carried a launch token.
+      detail: sanitizeOptional(detail),
       ownedServer: this.owned,
       canRetry: state === 'ERROR',
       port: this.port(),
@@ -221,6 +240,7 @@ export class Supervisor {
   }
 
   markHidden(hidden: boolean): void {
+    this.windowHidden = hidden;
     const state = this.lifecycle.state;
     if (hidden && state === 'READY') {
       this.setState('HIDDEN_IN_TRAY', null);
@@ -266,9 +286,10 @@ export class Supervisor {
     try {
       this.setState('RECOVERING', reason === 'process-exited' ? 'DeepSeek Harness stopped unexpectedly' : 'Connection to DeepSeek Harness lost');
       this.deps.log.info(`recovery started (${reason})`);
-      this.server = null;
-      this.serverPid = null;
-      this.serverStartTime = null;
+
+      // Keep the recorded PID/start time until the process is proven gone or
+      // stopped: a hung-but-alive backend still has to be reclaimed safely.
+      await this.releaseOwnedProcess();
 
       const config = this.deps.config();
       if (!config.autoRestart) {
@@ -327,6 +348,11 @@ export class Supervisor {
 
       this.setState('STARTING_WSL', `Starting ${config.distro}`);
       await this.deps.wsl.ensureDistro(config.distro);
+
+      // A previous in-session backend (healthy, hung or already dead) is
+      // resolved before anything else can fail, so a hung owned process never
+      // survives a failed recovery attempt.
+      await this.releaseOwnedProcess();
 
       const dshPath = await this.deps.wsl.resolveDshPath(config.distro, config.dshPath);
 
@@ -515,8 +541,10 @@ export class Supervisor {
       if (status === 200) {
         this.failures = 0;
         this.attempt = 0;
-        if (this.lifecycle.state === 'HIDDEN_IN_TRAY') return;
-        this.setState('READY', null);
+        this.readyCount += 1;
+        // Restore the tray state the user chose: a hidden window stays hidden.
+        const target: LifecycleState = this.windowHidden ? 'HIDDEN_IN_TRAY' : 'READY';
+        if (this.lifecycle.state !== target) this.setState(target, null);
         this.deps.log.info('backend ready');
         return;
       }
@@ -538,40 +566,72 @@ export class Supervisor {
     return { verdict, record };
   }
 
-  /** Graceful, ownership-checked termination of the backend this app started. */
+  /**
+   * Resolve a backend this app started before a new start/recovery.
+   *
+   * Ownership is verified first: a live app-owned process is stopped with
+   * TERM/KILL, a vanished one is simply forgotten, and a PID that no longer
+   * matches the recorded start time is left untouched.
+   */
+  private async releaseOwnedProcess(): Promise<void> {
+    if (!this.owned && this.serverPid === null && this.server === null) return;
+    await this.stopOwnedServer();
+  }
+
+  /**
+   * Graceful, ownership-checked termination of the backend this app started.
+   *
+   * Identity is verified three times: before TERM, before the escalated KILL
+   * (so a recycled PID is never targeted) and, for the KILL, once more as
+   * close to the signal as possible.
+   */
   private async stopOwnedServer(): Promise<void> {
     const pid = this.serverPid;
     const startTime = this.serverStartTime;
-    let killed = false;
+    const expectation = { port: this.port(), startTime };
 
     if (pid !== null) {
       const probe = await this.deps.wsl.probeProcess(this.distro(), pid);
-      const verdict = verifyOwnership(probe, { port: this.port(), startTime });
+      const verdict = verifyOwnership(probe, expectation);
       if (verdict === 'owned') {
         this.deps.log.info(`stopping owned backend pid=${pid}`);
         await this.deps.wsl.signal(this.distro(), pid, 'TERM').catch(() => undefined);
-        killed = true;
+
         const graceMs = this.deps.stopGraceMs ?? 5_000;
         const deadline = this.deps.now() + graceMs;
-        while (this.deps.now() < deadline) {
-          const check = await this.deps.wsl.probeProcess(this.distro(), pid);
-          if (check === null) break;
+        let check = await this.deps.wsl.probeProcess(this.distro(), pid);
+        while (check !== null && this.deps.now() < deadline) {
           await this.deps.sleep(200);
+          check = await this.deps.wsl.probeProcess(this.distro(), pid);
         }
-        const stillThere = await this.deps.wsl.probeProcess(this.distro(), pid);
-        if (stillThere !== null) {
-          this.deps.log.warn(`backend pid=${pid} ignored SIGTERM; sending SIGKILL`);
-          await this.deps.wsl.signal(this.distro(), pid, 'KILL').catch(() => undefined);
+
+        // Revalidate the full identity (PID + start time + command line) right
+        // before escalating: the PID may have been recycled while we waited.
+        const finalProbe = check === null ? null : await this.deps.wsl.probeProcess(this.distro(), pid);
+        const finalVerdict = verifyOwnership(finalProbe, expectation);
+        if (finalVerdict === 'owned') {
+          const confirmed = await this.deps.wsl.probeProcess(this.distro(), pid);
+          if (verifyOwnership(confirmed, expectation) === 'owned') {
+            this.deps.log.warn(`backend pid=${pid} ignored SIGTERM; sending SIGKILL`);
+            await this.deps.wsl.signal(this.distro(), pid, 'KILL').catch(() => undefined);
+          } else {
+            this.deps.log.warn(`pid=${pid} no longer matches the owned backend; SIGKILL withheld`);
+          }
+        } else if (finalVerdict === 'foreign') {
+          this.deps.log.warn(`pid=${pid} no longer matches the owned backend; leaving it alone`);
         }
       } else if (verdict === 'foreign') {
         this.deps.log.warn(`pid=${pid} no longer matches the owned backend; leaving it alone`);
       }
+    } else if (this.server !== null) {
+      // Spawned but no PID was observed yet: only the launcher handle exists.
+      this.deps.log.warn('stopping backend launcher without a known pid');
     }
 
     if (this.server !== null) {
       await this.server.stop().catch(() => undefined);
     }
-    if (killed || pid !== null) this.deps.registry.clear();
+    if (pid !== null) this.deps.registry.clear();
     this.server = null;
     this.serverPid = null;
     this.serverStartTime = null;

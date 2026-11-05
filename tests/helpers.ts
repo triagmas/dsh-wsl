@@ -31,7 +31,12 @@ export class FakeServer implements ServerHandle {
   readonly exited: Promise<ExitInfo>;
 
   constructor(
-    private readonly options: { pid?: number | null; announceUrl?: boolean; urlPort?: number } = {},
+    private readonly options: {
+      pid?: number | null;
+      announceUrl?: boolean;
+      urlPort?: number;
+      stderr?: string;
+    } = {},
   ) {
     this.pid = Promise.resolve(options.pid === undefined ? BACKEND_PID : options.pid);
     this.exited = new Promise<ExitInfo>((resolve) => this.exitResolvers.push(resolve));
@@ -65,7 +70,7 @@ export class FakeServer implements ServerHandle {
   }
 
   stderrTail(): string {
-    return 'stderr tail';
+    return this.options.stderr ?? 'stderr tail';
   }
 }
 
@@ -77,6 +82,8 @@ export interface FakeWslOptions {
   announceUrl?: boolean;
   dshPath?: string;
   failResolve?: 'dsh-missing' | null;
+  /** Simulate a backend that dies before announcing its WebUI URL. */
+  exitBeforeReady?: { code: number | null; stderr?: string };
 }
 
 export class FakeWsl implements WslGateway {
@@ -110,14 +117,22 @@ export class FakeWsl implements WslGateway {
   startServer(request: StartServerRequest): ServerHandle {
     this.starts.push(request);
     this.startHook?.();
+    const exitBeforeReady = this.options.exitBeforeReady;
     const server = new FakeServer({
       pid: this.options.pid === undefined ? BACKEND_PID : this.options.pid,
       urlPort: this.options.urlPort ?? request.port,
-      announceUrl: this.options.announceUrl,
+      announceUrl: exitBeforeReady === undefined ? this.options.announceUrl : false,
+      stderr: exitBeforeReady?.stderr,
     });
     this.servers.push(server);
     // Announce asynchronously, like the real process would.
-    queueMicrotask(() => server.announce());
+    queueMicrotask(() => {
+      if (exitBeforeReady !== undefined) {
+        server.exit({ code: exitBeforeReady.code, signal: null });
+        return;
+      }
+      server.announce();
+    });
     return server;
   }
 
