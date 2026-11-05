@@ -18,8 +18,22 @@ export interface WindowsOptions {
   preloadDir: string;
   log: Logger;
   origin(): string;
+  /** True only for development builds or an explicit developer-mode opt-in. */
+  devToolsEnabled: boolean;
   onRendererGone(reason: string): void;
   onExternalLink(url: string): void;
+  /** Window shown/hidden by the user (close to tray, tray open). */
+  onVisibilityChanged(visible: boolean): void;
+}
+
+export interface SplashOptions {
+  /** Focus the overlay; false keeps it behind the desktop while hidden. */
+  activate: boolean;
+}
+
+export interface LoadBackendOptions {
+  /** Reload even when the same origin is already loaded (after a restart). */
+  force?: boolean;
 }
 
 export class Windows {
@@ -53,7 +67,8 @@ export class Windows {
         allowRunningInsecureContent: false,
         webviewTag: false,
         spellcheck: true,
-        devTools: true,
+        // Packaged builds keep the debugger closed unless development is explicit.
+        devTools: this.options.devToolsEnabled,
       },
     });
     window.setMenuBarVisibility(false);
@@ -104,6 +119,12 @@ export class Windows {
       event.preventDefault();
       window.hide();
     });
+    window.on('show', () => this.options.onVisibilityChanged(true));
+    window.on('hide', () => this.options.onVisibilityChanged(false));
+    window.on('minimize', () => {
+      // Minimised is not "hidden in tray": supervision state must not change.
+      this.options.log.debug('window minimized');
+    });
     window.on('closed', () => {
       this.main = null;
     });
@@ -123,8 +144,15 @@ export class Windows {
     this.quitting = true;
   }
 
-  /** Harden the shared session: deny permissions outside the allowlist. */
+  private backendSession: Session | null = null;
+
+  /**
+   * Harden the shared session: deny permissions outside the allowlist.
+   * Must be called after `app.whenReady()`; repeated calls return the same
+   * configured session.
+   */
   configureSession(): Session {
+    if (this.backendSession !== null) return this.backendSession;
     const backendSession = session.fromPartition(PARTITION);
     backendSession.setPermissionRequestHandler((_webContents, permission, callback) => {
       callback(decidePermission(permission));
@@ -135,6 +163,7 @@ export class Windows {
       event.preventDefault();
       this.options.log.warn('download blocked');
     });
+    this.backendSession = backendSession;
     return backendSession;
   }
 
@@ -154,11 +183,19 @@ export class Windows {
     return window !== null && window.isVisible();
   }
 
-  /** Splash doubles as the reconnect overlay while the backend recovers. */
-  showSplash(): void {
+  /**
+   * Splash doubles as the reconnect overlay while the backend recovers.
+   * When the app is hidden it is created without activation, so an always-on-top
+   * window never pops over the desktop uninvited.
+   */
+  showSplash(options: SplashOptions): void {
     if (this.splash !== null && !this.splash.isDestroyed()) {
-      this.splash.show();
-      this.splash.focus();
+      if (options.activate) {
+        this.splash.show();
+        this.splash.focus();
+      } else {
+        this.splash.hide();
+      }
       if (this.status !== null) this.publishStatus(this.status);
       return;
     }
@@ -182,19 +219,25 @@ export class Windows {
         contextIsolation: true,
         sandbox: true,
         webSecurity: true,
+        devTools: this.options.devToolsEnabled,
       },
     });
     window.loadFile(join(this.options.rendererDir, 'splash', 'index.html')).catch((error: unknown) => {
       this.options.log.error(`splash load failed: ${error instanceof Error ? error.message : 'unknown'}`);
     });
     window.once('ready-to-show', () => {
-      window.show();
+      if (options.activate) window.show();
       if (this.status !== null) this.publishStatus(this.status);
     });
     window.on('closed', () => {
       this.splash = null;
     });
     this.splash = window;
+  }
+
+  /** Hide the overlay without destroying it (window sent to tray). */
+  hideSplash(): void {
+    if (this.splash !== null && !this.splash.isDestroyed()) this.splash.hide();
   }
 
   closeSplash(): void {
@@ -226,6 +269,7 @@ export class Windows {
         contextIsolation: true,
         sandbox: true,
         webSecurity: true,
+        devTools: this.options.devToolsEnabled,
       },
     });
     window.setMenuBarVisibility(false);
@@ -247,13 +291,40 @@ export class Windows {
     }
   }
 
-  async loadBackend(origin: string): Promise<void> {
+  private loadInFlight: Promise<void> | null = null;
+
+  /**
+   * Load (or reload) the original WebUI.
+   *
+   * After a backend restart the same URL may still be "loaded" while the session
+   * behind it is gone, so recovery passes `force`. Concurrent requests share one
+   * navigation instead of racing, and the page is never replaced by a local
+   * substitute UI.
+   */
+  async loadBackend(origin: string, options: LoadBackendOptions = {}): Promise<void> {
     const window = this.ensureMain();
+    const target = `${origin}/`;
     const current = window.webContents.getURL();
-    if (current === `${origin}/` || current === origin) {
-      return;
+    const alreadyThere = current === target || current === origin;
+    if (alreadyThere && options.force !== true) return;
+    if (this.loadInFlight !== null) {
+      // Never race two navigations; a forced reload still happens afterwards,
+      // because the in-flight document may predate the backend restart.
+      await this.loadInFlight;
+      if (options.force !== true) return;
     }
-    await window.loadURL(`${origin}/`);
+    const navigation = window
+      .loadURL(target)
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        this.options.log.error(`WebUI load failed: ${error instanceof Error ? error.name : 'unknown'}`);
+      });
+    this.loadInFlight = navigation;
+    try {
+      await navigation;
+    } finally {
+      if (this.loadInFlight === navigation) this.loadInFlight = null;
+    }
   }
 
   openExternal(url: string): void {

@@ -20,7 +20,8 @@
     "verify": "npm run typecheck && npm run lint && npm run test && npm run build",
     "start": "npm run build && electron .",
     "dist:dir": "npm run build && electron-builder --win dir --x64 --publish never",
-    "dist": "npm run build && electron-builder --win portable --x64 --publish never"
+    "dist": "npm run build && electron-builder --win portable --x64 --publish never",
+    "smoke:headless": "node scripts/smoke-headless.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

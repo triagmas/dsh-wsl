@@ -13,6 +13,7 @@ import { createFileRegistry } from './core/registry.js';
 import { ShellError, Supervisor } from './core/supervisor.js';
 import { buildOrigin } from './backend/urls.js';
 import { createWslGateway } from './wsl/gateway.js';
+import { decideReadyVisibility, decideTrayOpen, shouldActivateSplash } from './core/visibility.js';
 import { createConfigStore } from './electron/config-store.js';
 import { createWebClient } from './electron/web-client.js';
 import { TrayController } from './electron/tray.js';
@@ -24,7 +25,12 @@ const APP_ID = 'com.triagmas.wslwebshell';
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  void bootstrap();
+  void bootstrap().catch((error: unknown) => {
+    // A failure before the logger exists must still be visible and fatal.
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    process.stderr.write(`wsl-web-shell: fatal startup error: ${message}\n`);
+    app.exit(1);
+  });
 }
 
 async function bootstrap(): Promise<void> {
@@ -44,20 +50,35 @@ async function bootstrap(): Promise<void> {
   // Origin of the running backend; updated from every status snapshot so the
   // navigation guard always matches the page that is actually loaded.
   let activePort = config.port;
+  // Whether the user was ever shown a window in this session; afterwards the
+  // visibility choice belongs to the user, not to the startup setting.
+  let everShown = false;
+  let loadedGeneration: number | null = null;
 
-  const windows = new Windows({
+  const windows: Windows = new Windows({
     rendererDir,
     preloadDir,
     log,
     origin: () => buildOrigin(activePort),
+    devToolsEnabled: !app.isPackaged || process.env.WSL_WEB_SHELL_DEVTOOLS === '1',
     onRendererGone: () => {
       log.warn('renderer process gone; health supervisor will decide on recovery');
     },
-    onExternalLink: (url) => windows.openExternal(url),
+    onExternalLink: (url: string) => {
+      windows.openExternal(url);
+    },
+    onVisibilityChanged: (visible: boolean) => {
+      if (visible) everShown = true;
+      supervisor.markHidden(!visible);
+      // The splash is an overlay of this window: it leaves with it.
+      if (!visible) windows.hideSplash();
+      tray?.update(supervisor.getStatus(), visible);
+    },
   });
 
-  const backendSession = windows.configureSession();
-  const web = createWebClient(() => backendSession, log);
+  // Electron sessions only exist after `app.whenReady()`, so the session is
+  // resolved lazily and configured in `whenReady` below.
+  const web = createWebClient(() => windows.configureSession(), log);
   const wsl = createWslGateway({ log });
 
   let tray: TrayController | null = null;
@@ -85,16 +106,32 @@ async function bootstrap(): Promise<void> {
 
   const onStatusChange = (status: ShellStatus): void => {
     switch (status.state) {
-      case 'READY':
+      case 'READY': {
         windows.closeSplash();
-        void windows.loadBackend(buildOrigin(status.port)).catch((error: unknown) => {
-          log.error(`loading WebUI failed: ${error instanceof Error ? error.name : 'error'}`);
+        // A new backend generation means the page behind the same URL is stale.
+        const generation = supervisor.readyGeneration;
+        const force = loadedGeneration !== null && loadedGeneration !== generation;
+        loadedGeneration = generation;
+        void windows
+          .loadBackend(buildOrigin(status.port), { force })
+          .catch((error: unknown) => {
+            log.error(`loading WebUI failed: ${error instanceof Error ? error.name : 'error'}`);
+          });
+        const decision = decideReadyVisibility({
+          openOnLaunch: config.openOnLaunch,
+          everShown,
+          visible: windows.isMainVisible(),
         });
-        if (config.openOnLaunch) windows.showMain();
+        if (decision === 'show') windows.showMain();
         break;
+      }
       case 'RECOVERING':
       case 'ERROR':
-        windows.showSplash();
+        // Never steal focus with the always-on-top overlay while hidden.
+        windows.showSplash({ activate: shouldActivateSplash(windows.isMainVisible()) });
+        break;
+      case 'HIDDEN_IN_TRAY':
+        windows.closeSplash();
         break;
       case 'QUITTING':
         windows.closeSplash();
@@ -138,52 +175,55 @@ async function bootstrap(): Promise<void> {
       });
   };
 
-  tray = new TrayController({
-    iconPath: join(rendererDir, 'assets', 'tray.png'),
-    log: (message) => log.info(message),
-    handlers: {
-      open: () => {
-        const state = supervisor.getStatus().state;
-        if (state === 'ERROR' || state === 'RECOVERING') {
-          // Nothing loadable yet: keep the actionable overlay in front.
-          windows.showSplash();
-          return;
-        }
-        windows.showMain();
-        if (state === 'READY' || state === 'HIDDEN_IN_TRAY') {
-          void supervisor.healthTick().catch(() => undefined);
-        }
+  const startTray = (): void => {
+    if (tray !== null) return;
+    tray = new TrayController({
+      iconPath: join(rendererDir, 'assets', 'tray.png'),
+      log: (message) => log.info(message),
+      handlers: {
+        open: () => {
+          const state = supervisor.getStatus().state;
+          if (decideTrayOpen(state) === 'overlay') {
+            // Nothing loadable yet: bring the actionable overlay to the front.
+            windows.showSplash({ activate: true });
+            return;
+          }
+          windows.showMain();
+          if (state === 'READY' || state === 'HIDDEN_IN_TRAY') {
+            void supervisor.healthTick().catch(() => undefined);
+          }
+        },
+        status: () => {
+          const status = supervisor.getStatus();
+          const lines = [
+            `State: ${status.state}`,
+            `Message: ${status.message}`,
+            status.detail === null ? null : `Detail: ${status.detail}`,
+            `Distribution: ${status.distro}`,
+            `Port: ${status.port}`,
+            `Backend managed by this app: ${status.ownedServer ? 'yes' : 'no'}`,
+            `Log: ${logPath}`,
+          ].filter((line): line is string => line !== null);
+          void dialog.showMessageBox({
+            type: status.state === 'ERROR' ? 'error' : 'info',
+            title: 'WSL Web Shell — Connection status',
+            message: status.message,
+            detail: lines.join('\n'),
+            buttons: ['OK'],
+          });
+        },
+        restart: () => {
+          const state = supervisor.getStatus().state;
+          if (state === 'ERROR') void supervisor.retry().catch(() => undefined);
+          else void supervisor.restart().catch(() => undefined);
+        },
+        settings: () => windows.openSettings(),
+        quit,
       },
-      status: () => {
-        const status = supervisor.getStatus();
-        const lines = [
-          `State: ${status.state}`,
-          `Message: ${status.message}`,
-          status.detail === null ? null : `Detail: ${status.detail}`,
-          `Distribution: ${status.distro}`,
-          `Port: ${status.port}`,
-          `Backend managed by this app: ${status.ownedServer ? 'yes' : 'no'}`,
-          `Log: ${logPath}`,
-        ].filter((line): line is string => line !== null);
-        void dialog.showMessageBox({
-          type: status.state === 'ERROR' ? 'error' : 'info',
-          title: 'WSL Web Shell — Connection status',
-          message: status.message,
-          detail: lines.join('\n'),
-          buttons: ['OK'],
-        });
-      },
-      restart: () => {
-        const state = supervisor.getStatus().state;
-        if (state === 'ERROR') void supervisor.retry().catch(() => undefined);
-        else void supervisor.restart().catch(() => undefined);
-      },
-      settings: () => windows.openSettings(),
-      quit,
-    },
-  });
-  tray.create();
-  tray.update(supervisor.getStatus(), false);
+    });
+    tray.create();
+    tray.update(supervisor.getStatus(), false);
+  };
 
   const isTrustedSender = (event: IpcMainInvokeEvent): boolean => {
     const url = event.senderFrame?.url ?? '';
@@ -292,7 +332,10 @@ async function bootstrap(): Promise<void> {
   app.on('activate', () => windows.showMain());
 
   app.whenReady().then(async () => {
-    windows.showSplash();
+    // Sessions and the tray only become available once Electron is ready.
+    windows.configureSession();
+    startTray();
+    windows.showSplash({ activate: true });
     tray?.update(supervisor.getStatus(), false);
     try {
       await supervisor.start();
