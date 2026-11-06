@@ -1,0 +1,193 @@
+/*
+ * Footer bar of the main window.
+ *
+ * The remote WebUI is a separate WebContentsView placed above this bar, so this
+ * page owns the bottom strip only: it never overlays the original interface.
+ */
+:root {
+  /* Must match FOOTER_HEIGHT in src/main/core/footer.ts (guarded by a test). */
+  --footer-height: 32px;
+  --bg: #0d1219;
+  --fg: #94a3b8;
+  --fg-strong: #e2e8f0;
+  --border: rgba(148, 163, 184, 0.18);
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --error: #ef4444;
+  --idle: #64748b;
+  --radius: 6px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #0b0f16;
+  color: var(--fg);
+  font: 11.5px/1 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  user-select: none;
+  overflow: hidden;
+}
+
+#bar {
+  position: fixed;
+  inset: auto 0 0 0;
+  height: var(--footer-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 10px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+
+.left,
+.right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.left {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.right {
+  flex: 0 0 auto;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  background: var(--idle);
+  box-shadow: 0 0 0 2px rgba(100, 116, 139, 0.18);
+}
+
+.dot[data-tone='ok'] {
+  background: var(--ok);
+  box-shadow: 0 0 0 2px rgba(34, 197, 94, 0.2);
+}
+
+.dot[data-tone='warn'] {
+  background: var(--warn);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2);
+}
+
+.dot[data-tone='error'] {
+  background: var(--error);
+  box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.2);
+}
+
+.label {
+  color: var(--fg-strong);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sep {
+  color: var(--border);
+}
+
+.endpoint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.version {
+  all: unset;
+  cursor: default;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 6px;
+  border-radius: var(--radius);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.version-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.version-arrow {
+  font-size: 10px;
+  line-height: 1;
+  color: #fbbf24;
+}
+
+.version[data-state='loading'] {
+  color: var(--idle);
+}
+
+.version[data-update='true'] {
+  color: #fbbf24;
+  cursor: pointer;
+}
+
+.version[data-state='link'] {
+  cursor: pointer;
+}
+
+.version:hover {
+  background: rgba(148, 163, 184, 0.12);
+}
+
+.gear {
+  all: unset;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 22px;
+  border-radius: var(--radius);
+  color: var(--fg);
+}
+
+.gear:hover,
+.gear[aria-expanded='true'] {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--fg-strong);
+}
+
+.gear:focus-visible {
+  outline: 1px solid #60a5fa;
+  outline-offset: 1px;
+}
+
+/* Narrow window: drop the endpoint first, then shorten the state word. */
+@media (max-width: 720px) {
+  .sep,
+  .endpoint {
+    display: none;
+  }
+  .version {
+    max-width: 13ch;
+  }
+}
+
+@media (max-width: 520px) {
+  #installed {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

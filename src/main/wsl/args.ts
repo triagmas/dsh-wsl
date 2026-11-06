@@ -11,6 +11,7 @@ import {
   isValidIsolationRoot,
   isValidRuntimeBinary,
 } from '../core/isolation.js';
+import { normalizeWorkspacePath } from '../core/workspace.js';
 
 export const WSL_EXE = 'wsl.exe';
 
@@ -155,7 +156,6 @@ export const PROBE_PROCESS_SCRIPT = [
 ].join(' ');
 
 const DISTRO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const POSIX_PATH_PATTERN = /^(?:~|\/)[^\0\r\n]*$/;
 
 export class ArgumentError extends Error {
   constructor(message: string) {
@@ -179,25 +179,16 @@ export function assertPort(port: number): number {
 }
 
 /**
- * Workspace validation. The shell expands `~` and enters the directory, so the
- * value must be `~`, `~/...` or absolute, with no structural or empty segments:
- * a `..` inside a workspace path could reach outside the intended project.
+ * Workspace validation (shared with Settings, issue #8).
+ *
+ * The shell expands `~` and enters the directory, so the value must be `~`,
+ * `~/...` or absolute with no structural or empty segments. A trailing slash is
+ * conventional and is normalised away instead of failing the launch.
  */
 export function assertWorkspace(workspace: string): string {
-  if (typeof workspace !== 'string' || workspace.length > 4096 || !POSIX_PATH_PATTERN.test(workspace)) {
-    throw new ArgumentError('invalid-workspace-path');
-  }
-  if (workspace.includes('\\')) throw new ArgumentError('invalid-workspace-path');
-  if (/[\0\r\n\t]/.test(workspace)) throw new ArgumentError('invalid-workspace-path');
-  if (workspace === '~' || workspace === '~/') return '~';
-  const relative = workspace.startsWith('~/') ? workspace.slice(2) : workspace.startsWith('/') ? workspace.slice(1) : null;
-  if (relative === null) throw new ArgumentError('invalid-workspace-path');
-  if (relative === '') throw new ArgumentError('invalid-workspace-path');
-  const segments = relative.split('/');
-  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
-    throw new ArgumentError('invalid-workspace-path');
-  }
-  return workspace;
+  const normalized = normalizeWorkspacePath(workspace);
+  if (normalized === null) throw new ArgumentError('invalid-workspace-path');
+  return normalized;
 }
 
 export function assertDshPath(dshPath: string): string {
@@ -225,6 +216,16 @@ export function buildListDistrosArgs(): string[] {
 /** Verify a user-supplied absolute executable path without running it. */
 export function buildDshPathCheckArgs(distro: string, dshPath: string): string[] {
   return ['-d', assertDistroName(distro), '--exec', '/bin/test', '-x', assertDshPath(dshPath)];
+}
+
+/**
+ * Ask the selected executable for its version.
+ *
+ * `--version` is read-only and never touches a project, a session or the network.
+ * The path is validated like every other launcher argument.
+ */
+export function buildDshVersionArgs(distro: string, dshPath: string): string[] {
+  return ['-d', assertDistroName(distro), '--exec', assertDshPath(dshPath), '--version'];
 }
 
 export interface StartServerOptions {

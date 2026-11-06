@@ -15,8 +15,10 @@ Windows
    │  └─ health loop (10 s visible / 25 s hidden, two failures => recovery)
    ├─ splash window  : frameless local page, orbital loader + error/retry
    ├─ settings window: local page, validated patch -> config.json
-   └─ backend window : partition "persist:wsl-web-shell", no preload, sandboxed
-        ⇅ http://127.0.0.1:<port>
+   ├─ popover window : frameless local page, same validated patch path
+   └─ main window    : app-owned footer bar (local page + chrome preload)
+        └─ WebContentsView: partition "persist:wsl-web-shell", no preload, sandboxed
+             ⇅ http://127.0.0.1:<port>
       Ubuntu (existing) → dsh web --host 127.0.0.1 --port <port> --no-open
 ```
 
@@ -155,9 +157,20 @@ runs on every log line and the token never leaves the module's local scope.
 
 ## Window hardening
 
-Backend window: `nodeIntegration:false`, `contextIsolation:true`,
+Since issue #9 the remote backend page is no longer the window itself: the window
+hosts the app-owned footer bar (local `file://` page, `chrome` preload) and the
+WebUI lives in a `WebContentsView` sized to `computeViewBounds(contentWidth,
+contentHeight)` — exactly the window content minus the 32 px bar. The view is
+re-laid out on resize/maximize/restore/fullscreen and destroyed with the window,
+so no remote content ever shares a document with app chrome. The bar is never
+`alwaysOnTop`, never overlays the page and injects nothing into it
+(`docs/footer.md`).
+
+Backend view: `nodeIntegration:false`, `contextIsolation:true`,
 `sandbox:true`, `webSecurity:true`, no preload, `webviewTag:false`, menu bar
-hidden, devtools available only to the developer.
+hidden, devtools available only to the developer. The main window adds no
+further privileges: its page is local, its preload exposes only named footer
+channels, and it may not navigate away from `file://` or open windows.
 
 - `will-navigate` / `will-redirect`: only the exact configured origin.
 - `setWindowOpenHandler`: popups denied; safe public HTTPS links are handed to
@@ -181,10 +194,21 @@ whitespace is normalised, launch tokens are redacted and length is capped. The
 log redacts as well, so a token can never reach a screenshot, the clipboard or a
 shared diagnostic bundle.
 
+Linear bar semantics: `footer:status` and `footer:versions` are read-only
+snapshots published to the bar, `footer:toggle-settings` accepts only a validated
+anchor rect (four finite numbers), `footer:open-release` can open only the URL the
+version lookup returned, and the popover reuses `settings:load`/`settings:save`.
+The version lookup itself lives outside the renderer
+(`src/main/backend/github-versions.ts`): one hard-coded GitHub API origin, no
+credentials, 8 s timeout, 512 KiB response cap, `redirect: 'error'`, results
+cached in `userData/versions-cache.json` for 18 h, failures fail soft. Installed
+version is read from `dsh --version` inside the distro once per successful start.
+
 ## Configuration
 
 `userData/config.json` (validated on load and on save), `userData/owned-server.json`
-(ownership record), `userData/logs/app.log` (redacted, rotated at 2 MB). The app
+(ownership record), `userData/versions-cache.json` (upstream release snapshot),
+`userData/logs/app.log` (redacted, rotated at 2 MB). The app
 never writes into the Linux home, the Windows DeepSeek Harness installation,
 `app.asar`, user projects or any global runtime.
 
@@ -233,6 +257,12 @@ probe, lifecycle transitions and backoff, navigation/popup/permission policy,
 configuration validation, tray model, and supervisor flows against injected
 fakes (ready, collision, foreign listener, cookie rejection, unexpected exit,
 retry exhaustion, health recovery, shutdown).
+
+Issue #9 added `tests/footer.test.ts` (bar model, geometry, anchor validation),
+`tests/versions.test.ts` (CLI parsing, SemVer precedence, release selection, cache
+policy, offline fail-soft) and `tests/r09.test.ts` (composition guards). The
+workspace contract moved to `src/main/core/workspace.ts` so Settings and the
+launcher cannot disagree about a trailing slash (issue #8).
 
 Configuration gained two fields: `isolateEnvironment` (default on) and
 `runtimeRoot`. Both require a backend restart, so the tray decision stays

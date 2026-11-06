@@ -25,8 +25,10 @@ const shared = {
 await build({ ...shared, entryPoints: [join(root, 'src/main/index.ts')], outfile: join(dist, 'main/index.js') });
 await build({ ...shared, entryPoints: [join(root, 'src/preload/splash.ts')], outfile: join(dist, 'preload/splash.js') });
 await build({ ...shared, entryPoints: [join(root, 'src/preload/settings.ts')], outfile: join(dist, 'preload/settings.js') });
+await build({ ...shared, entryPoints: [join(root, 'src/preload/chrome.ts')], outfile: join(dist, 'preload/chrome.js') });
+await build({ ...shared, entryPoints: [join(root, 'src/preload/popover.ts')], outfile: join(dist, 'preload/popover.js') });
 
-for (const dir of ['splash', 'settings']) {
+for (const dir of ['splash', 'settings', 'chrome', 'popover']) {
   const from = join(root, 'src', dir);
   if (!existsSync(from)) continue;
   cpSync(from, join(dist, dir), { recursive: true });

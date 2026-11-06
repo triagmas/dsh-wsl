@@ -60,6 +60,8 @@ export interface WslGateway {
   prepareIsolation(distro: string, root: string): Promise<void>;
   startServer(request: StartServerRequest): ServerHandle;
   probeProcess(distro: string, pid: number): Promise<ProcessProbe | null>;
+  /** `dsh --version` of the selected executable; `null` when it cannot be read. */
+  dshVersion(distro: string, dshPath: string): Promise<string | null>;
   signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
 }
 
@@ -141,6 +143,8 @@ export class Supervisor {
   /** Last known window visibility, so recovery can restore the tray state. */
   private windowHidden = false;
   private readyCount = 0;
+  /** Version reported by the DSH executable in use, informational only. */
+  private dshVersion: string | null = null;
 
   constructor(private readonly deps: SupervisorDeps) {
     this.status = this.buildStatus('CHECKING', null);
@@ -186,6 +190,7 @@ export class Supervisor {
       attempt: this.attempt,
       maxAttempts: config.maxRestartAttempts,
       logPath: this.deps.logPath(),
+      dshVersion: this.dshVersion,
       updatedAt: new Date(this.deps.now()).toISOString(),
     };
   }
@@ -377,6 +382,7 @@ export class Supervisor {
         config.dshPath,
         plan.enabled ? plan.root : null,
       );
+      await this.refreshDshVersion(config.distro, runtime.dshPath);
 
       const portState = await this.deps.probePort(config.port);
       let reassessed = portState;
@@ -425,6 +431,28 @@ export class Supervisor {
           : new ShellError('unexpected', describe(error), 'See the log for details.'),
       );
       throw error;
+    }
+  }
+
+  /**
+   * Read the version of the executable that is actually in use.
+   *
+   * Read-only and fail-soft: an unhelpful CLI must not turn a working backend
+   * into an error, so the footer simply shows "unknown".
+   */
+  private async refreshDshVersion(distro: string, dshPath: string): Promise<void> {
+    try {
+      const version = await this.deps.wsl.dshVersion(distro, dshPath);
+      if (version === this.dshVersion) return;
+      this.dshVersion = version;
+      this.status = this.buildStatus(this.status.state, this.status.detail);
+      this.deps.publish(this.status);
+    } catch (error) {
+      this.deps.log.debug(`dsh version query failed: ${describe(error)}`);
+      if (this.dshVersion === null) return;
+      this.dshVersion = null;
+      this.status = this.buildStatus(this.status.state, this.status.detail);
+      this.deps.publish(this.status);
     }
   }
 

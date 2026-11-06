@@ -14,7 +14,10 @@ import {
   describeWindowEvent,
   summarizePreviousSession,
 } from './core/diagnostics.js';
+import { createLatestVersionService } from './backend/github-versions.js';
 import { createLogger } from './core/logger.js';
+import { isNewer } from './core/versions.js';
+import { parsePopoverAnchor } from './core/footer.js';
 import { probePort } from './core/port.js';
 import { createFileRegistry } from './core/registry.js';
 import { ShellError, Supervisor } from './core/supervisor.js';
@@ -25,7 +28,7 @@ import { createConfigStore } from './electron/config-store.js';
 import { createWebClient } from './electron/web-client.js';
 import { TrayController } from './electron/tray.js';
 import { Windows } from './electron/windows.js';
-import type { AppConfig, ConfigPatch, ShellStatus } from '../shared/types.js';
+import type { AppConfig, ConfigPatch, ShellStatus, VersionSnapshot } from '../shared/types.js';
 
 const APP_ID = 'com.triagmas.wslwebshell';
 
@@ -81,6 +84,10 @@ async function bootstrap(): Promise<void> {
   // this flag an OS-initiated close would look like the user clicking X.
   let sessionEnding = false;
 
+  const versions = createLatestVersionService({
+    cachePath: join(userData, 'versions-cache.json'),
+    log,
+  });
   const configStore = createConfigStore(join(userData, 'config.json'));
   let config: AppConfig = configStore.load();
   const registry = createFileRegistry(join(userData, 'owned-server.json'));
@@ -129,6 +136,19 @@ async function bootstrap(): Promise<void> {
   const web = createWebClient(() => windows.configureSession(), log);
   const wsl = createWslGateway({ log });
 
+  /** Footer payload; installed comes from the running status, upstream from cache. */
+  function versionSnapshot(): VersionSnapshot {
+    const cache = versions.snapshot();
+    const installed = supervisor.getStatus().dshVersion;
+    return {
+      installed,
+      latest: cache.latest,
+      checkedAt: cache.checkedAt,
+      error: cache.error,
+      updateAvailable: cache.latest !== null && isNewer(cache.latest.version, installed),
+    };
+  }
+
   let tray: TrayController | null = null;
   let healthTimer: NodeJS.Timeout | null = null;
   let quitting = false;
@@ -147,6 +167,7 @@ async function bootstrap(): Promise<void> {
     publish: (status) => {
       activePort = status.port;
       windows.publishStatus(status);
+      windows.publishVersions(versionSnapshot());
       tray?.update(status, windows.isMainVisible());
       onStatusChange(status);
     },
@@ -171,6 +192,10 @@ async function bootstrap(): Promise<void> {
           visible: windows.isMainVisible(),
         });
         if (decision === 'show') windows.showMain();
+        void versions
+          .refreshIfStale()
+          .then(() => windows.publishVersions(versionSnapshot()))
+          .catch(() => undefined);
         break;
       }
       case 'RECOVERING':
@@ -280,17 +305,41 @@ async function bootstrap(): Promise<void> {
     return url.startsWith('file://');
   };
 
-  const guard = <T>(channel: string, handler: (event: IpcMainInvokeEvent) => Promise<T> | T): void => {
-    ipcMain.handle(channel, async (event) => {
+  const guard = <T>(
+    channel: string,
+    handler: (event: IpcMainInvokeEvent, ...args: unknown[]) => Promise<T> | T,
+  ): void => {
+    ipcMain.handle(channel, async (event, ...args: unknown[]) => {
       if (!isTrustedSender(event)) {
         log.warn(`rejected ${channel} from untrusted sender`);
         throw new Error('untrusted-sender');
       }
-      return await handler(event);
+      return await handler(event, ...args);
     });
   };
 
   guard('shell:status:get', () => supervisor.getStatus());
+
+  // --- footer bar and settings popover -----------------------------------
+  guard('footer:status', () => supervisor.getStatus());
+  guard('footer:versions', () => versionSnapshot());
+  guard('footer:toggle-settings', (_event, anchor) => {
+    const parsed = parsePopoverAnchor(anchor);
+    if (parsed === null) throw new Error('invalid-anchor');
+    windows.toggleSettingsPopover(parsed);
+  });
+  guard('footer:open-release', () => {
+    // Only the URL that came from the upstream lookup may be opened, and only
+    // through the system browser (never inside the WebUI).
+    const url = versions.snapshot().latest?.url ?? null;
+    if (url !== null) windows.openExternal(url);
+  });
+  guard('popover:close', () => {
+    windows.closeSettingsPopover();
+  });
+  guard('settings:open-window', () => {
+    windows.openSettings();
+  });
 
   guard('shell:retry', async () => {
     await supervisor.retry().catch(() => undefined);
@@ -387,6 +436,11 @@ async function bootstrap(): Promise<void> {
     startTray();
     windows.showSplash({ activate: true });
     tray?.update(supervisor.getStatus(), false);
+    // Informational only: the footer must never delay or block the backend.
+    void versions
+      .refreshIfStale()
+      .then(() => windows.publishVersions(versionSnapshot()))
+      .catch(() => undefined);
     try {
       await supervisor.start();
     } catch (error) {
