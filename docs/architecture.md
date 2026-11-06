@@ -192,6 +192,38 @@ Backend-affecting settings (distro, port, workspace, executable path) are
 snapshotted when a server is brought up, so editing them never silently restarts
 or re-points a running backend; the tray "Restart WebUI" applies them.
 
+## Diagnostics
+
+Two failure modes are invisible from the UI and were left unexplained by the
+first real run: a window that disappears on its own, and an Electron process that
+ends without an error. Both are now recorded as causes, never as content
+(`src/main/core/diagnostics.ts`, wired in `index.ts` and `windows.ts`):
+
+- **Window events** — one `window <surface> <event> (...)` line for
+  `shown`/`hidden`/`close-requested`/`closed` on the main window and on the splash
+  overlay, with `visible`, `focused`, `quitting` and `session-ending` flags. A
+  `close-requested` with `quitting=no` and `session-ending=no` means the close came
+  from outside the app (X button, Alt+F4, taskbar menu, or a page-initiated
+  `window.close()`); the app itself only ever exits through `quitting=yes`.
+- **OS logoff/shutdown** — the Windows-only `session-end` window event sets the
+  flag before the window is closed, so a shutdown-driven hide is not mistaken for
+  a user click.
+- **Previous run** — the tail of the log is read *before* the new run writes its
+  first line. The orderly quit path writes the `shutdown complete` marker, so a
+  missing marker on start-up means the previous process was killed externally or
+  died from a native fault; the last recorded event is quoted (sanitised, capped).
+- **Fatal faults** — `uncaughtException` and `unhandledRejection` are logged
+  (`name: message`, no stack) before the process is terminated; the outcome stays
+  fatal, the cause no longer silent. `child-process-gone` records renderer/utility
+  failures with type, reason and exit code.
+
+The log stays content-free by construction: nothing here reads window text, page
+markup, cookies, environment values or backend payloads, every string passes
+`sanitizeForDisplay` (ANSI/control stripping, token redaction) and
+`redactUserPaths` (`C:\Users\<user>`, `/home/<user>`, `/mnt/<drive>/Users/<user>`,
+`/Users/<user>`). Diagnostics never change window behaviour, and their own
+failures are swallowed.
+
 ## Testing
 
 `npm test` (vitest) covers the Electron-free core: startup URL parsing and
@@ -220,7 +252,8 @@ crashing. It never touches a WSL distribution. It caught two launch-blocking
 regressions that unit tests cannot see: Electron `session` and `Tray` being
 created before `app.whenReady()`.
 
-Not covered by unit tests (needs R02): real `wsl.exe` behaviour, real `dsh`
-output, Chromium cookie handling for the loopback origin, packaging runtime,
-window/tray rendering on Windows, and the visual result of the refresh-after-
-restart path.
+Covered by the real R02 acceptance (see `docs/evidence/r02.md`): real `wsl.exe`
+behaviour, real `dsh web` output, Chromium cookie handling for the loopback
+origin, the packaged runtime, window/tray rendering on Windows and the
+refresh-after-restart path. Still uncovered: OS logoff/shutdown during a running
+session, and any distro other than the owner's default Ubuntu.

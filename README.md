@@ -4,7 +4,9 @@
 
 Launch a small Electron application on Windows, automatically start a supported WebUI backend inside your **existing WSL2 distro**, and use the **original browser-based interface** in a standalone desktop window — without browser tabs or an address bar.
 
-**Project status: M1 implementation in progress.** `R00` (scaffold, tests, CI, upstream verification) and `R01` (launcher, supervisor, tray, recovery, Windows EXE) are implemented in `feat/m1-electron-shell`. `R02` — the real run against a live Ubuntu + DeepSeek Harness installation — is **not done yet** and requires explicit owner approval. No release exists.
+**Project status: M1 release candidate.** `R00` (scaffold, CI, upstream contract), `R01`/`R01.1` (launcher, supervisor, tray, recovery, Windows EXE), `R02-A` (read-only environment inventory) and `R02-B` (isolated backend environment, real WebUI/tray acceptance) are implemented on `feat/m1-electron-shell`. A real acceptance run against a live Windows 11 + Ubuntu WSL2 machine **passed** on a packaged EXE; it is recorded in [docs/evidence/r02.md](docs/evidence/r02.md) with the exact artifact, SHA-256 and the gates that were checked.
+
+**No release exists yet.** No installer, no code signing, no auto-update, no merge to `main`.
 
 ## First supported backend: DeepSeek Harness
 
@@ -44,10 +46,40 @@ Recovery reloads the original WebUI, reclaims only a verified app-owned backend 
 re-checks PID identity before any forced kill. Details:
 [docs/architecture.md](docs/architecture.md).
 
+## Verified in a real run
+
+Acceptance was executed on the packaged portable EXE inside the owner's own
+Windows 11 + Ubuntu WSL2 environment (details and evidence in
+[docs/evidence/r02.md](docs/evidence/r02.md)):
+
+| Checked | Result |
+|---|---|
+| Backend starts from the isolated runtime, token exchanged in the main process | pass (`token exchange status=200`, `backend ready`) |
+| The window shows the **original** DeepSeek Harness WebUI, no duplicate UI | pass (title `DeepSeek Harness`, `http://127.0.0.1:3080/`, upstream onboarding screen) |
+| Token never exposed | pass (unauthenticated `GET /` answers `401`) |
+| X closes to tray, app and backend keep running | pass (tray tooltip `Connected (window hidden)`) |
+| Tray `Open` / `Restart WebUI` / `Settings…` / `Quit` | pass (each action logged, backend restarted and stopped through the app) |
+| Recovery after the backend dies | pass (`recovery succeeded on attempt 1`, new PID, page reloaded) |
+| Isolated environment holds | pass (`DSH_HOME`, agents, caches, temp and workspace under the isolation root) |
+| Owner's other software untouched | pass (no global packages changed, official Windows Harness install/profile not modified) |
+
+Not covered by that run: a model provider and agent sessions (the UI stops at the
+onboarding screen), signing, installer, auto-update, other distros, non-default ports.
+
+### Diagnostics for support
+
+When a window disappears or the app exits, the log now distinguishes the cause
+without recording content: `window <surface> <event>` lines with
+`visible/focused/quitting/session-ending` flags, a `previous session: …` line on
+start-up that reports whether the last run ended through the app's own quit path,
+fatal-error messages (name and message only, no stack), and Electron
+child-process failures. Launch tokens and local user directories are redacted.
+
 ## Requirements
 
 - Windows 10/11 with WSL2 and an existing distribution (default preset: `Ubuntu`).
-- DeepSeek Harness CLI installed **by you** inside that distribution (`dsh`).
+- DeepSeek Harness CLI installed **by you** inside that distribution (`dsh`), either
+  globally or into the app's isolated runtime under `~/.local/share/wsl-web-shell`.
 - The app never installs or upgrades Node, `dsh`, WSL or distributions. Missing
   prerequisites produce an actionable error instead.
 
@@ -93,6 +125,10 @@ are never presented as a real Windows/WSL acceptance PASS.
 - Existing WSL distributions and Linux projects are never deleted or shut down.
 - Local profile only: `config.json`, the ownership record, the redacted log and
   the isolated browser session live in the app's own `userData`.
+- Diagnostics record causes, not content: window show/hide/close events with
+  boolean flags, tray actions, clean/unclean shutdown of the previous run, fatal
+  error messages without stacks, and Electron child-process failures. Page text,
+  cookies, launch tokens and local user directories never reach the log.
 
 ## Documentation
 
@@ -101,8 +137,18 @@ are never presented as a real Windows/WSL acceptance PASS.
 - [Upstream `dsh web` contract and unknowns](docs/upstream-dsh-web.md)
 - [M1 issue](https://github.com/triagmas/wsl-web-shell/issues/1) and [agent guidance](AGENTS.md)
 
-A packaged EXE, CI and real smoke evidence are acceptance requirements. CI covers
-typecheck, lint, unit tests and the Windows package build; **real GUI/WSL
-acceptance is not claimed yet.**
+## Artifact provenance
+
+The portable EXE is built by the `windows-package` CI job (Windows runner,
+`npm run dist`), which records `sha256` in the job summary and uploads
+`SHA256SUMS.txt` next to the EXE. Locally built EXEs are byte-different (packager
+metadata), so a digest is only meaningful together with its source commit and run.
+Pinned release-candidate artifact, its commit and its digest are listed in
+[docs/evidence/r02.md](docs/evidence/r02.md).
+
+A packaged EXE, CI and real acceptance evidence are acceptance requirements. CI
+covers typecheck, lint, unit tests and the Windows package build; the real GUI/WSL
+acceptance for M1 was executed separately and is recorded with its exact artifact.
+Source-level green checks are still never presented as acceptance on their own.
 
 Licensed MIT. No DeepSeek model weights or official Windows Desktop binaries are redistributed.
