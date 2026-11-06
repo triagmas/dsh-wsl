@@ -20,7 +20,7 @@ import { createFileRegistry } from './core/registry.js';
 import { ShellError, Supervisor } from './core/supervisor.js';
 import { buildOrigin } from './backend/urls.js';
 import { createWslGateway } from './wsl/gateway.js';
-import { decideReadyVisibility, decideTrayOpen, decideLaunchMode, decideSplashPresentation, decideStartupSurface, type LaunchMode } from './core/visibility.js';
+import { decideReadyVisibility, decideTrayOpen, shouldActivateSplash } from './core/visibility.js';
 import { createConfigStore } from './electron/config-store.js';
 import { createWebClient } from './electron/web-client.js';
 import { TrayController } from './electron/tray.js';
@@ -51,13 +51,6 @@ async function bootstrap(): Promise<void> {
   // app's own quit path (external kill, power loss, native fault).
   const previousSession = summarizePreviousSession(log.tail(10).split('\n'));
   log.info(`wsl-web-shell ${app.getVersion()} starting (pid=${process.pid})`);
-  // An automated run must never put a window over the owner's desktop: the mode
-  // is decided once, from the command line or the environment.
-  const launchMode: LaunchMode = decideLaunchMode({
-    flag: process.argv.some((argument) => argument === '--automation' || argument === '--quiet'),
-    env: process.env.WSL_WEB_SHELL_AUTOMATION === '1',
-  });
-  if (launchMode === 'automation') log.info('automation mode: no windows will be shown');
   if (previousSession.lastEvent !== '') {
     log.info(
       previousSession.clean
@@ -159,22 +152,6 @@ async function bootstrap(): Promise<void> {
     },
   });
 
-  /**
-   * The single place that may put the loading surface on screen.
-   * `userRequested` is true only when the user did something in this action
-   * (started the app, clicked tray Open); a reconnect from the tray passes false,
-   * which either draws over an already visible window or stays out of the way.
-   */
-  const presentSplash = (reason: 'startup' | 'blocked', userRequested: boolean): void => {
-    const presentation = decideSplashPresentation({
-      reason,
-      mode: launchMode,
-      userRequested,
-      mainVisible: windows.isMainVisible(),
-    });
-    windows.showSplash(presentation);
-  };
-
   const onStatusChange = (status: ShellStatus): void => {
     switch (status.state) {
       case 'READY': {
@@ -192,15 +169,14 @@ async function bootstrap(): Promise<void> {
           openOnLaunch: config.openOnLaunch,
           everShown,
           visible: windows.isMainVisible(),
-          mode: launchMode,
         });
         if (decision === 'show') windows.showMain();
         break;
       }
       case 'RECOVERING':
       case 'ERROR':
-        // Recovery in the tray must stay invisible; a visible window gets the overlay.
-        presentSplash('blocked', false);
+        // Never steal focus with the always-on-top overlay while hidden.
+        windows.showSplash({ activate: shouldActivateSplash(windows.isMainVisible()) });
         break;
       case 'HIDDEN_IN_TRAY':
         windows.closeSplash();
@@ -256,11 +232,10 @@ async function bootstrap(): Promise<void> {
       log: (message) => log.info(message),
       handlers: {
         open: () => {
-          if (launchMode === 'automation') return;
           const state = supervisor.getStatus().state;
           if (decideTrayOpen(state) === 'overlay') {
-            // Nothing loadable yet: the user asked for the app, so show the overlay.
-            presentSplash('blocked', true);
+            // Nothing loadable yet: bring the actionable overlay to the front.
+            windows.showSplash({ activate: true });
             return;
           }
           windows.showMain();
@@ -292,10 +267,7 @@ async function bootstrap(): Promise<void> {
           if (state === 'ERROR') void supervisor.retry().catch(() => undefined);
           else void supervisor.restart().catch(() => undefined);
         },
-        settings: () => {
-          if (launchMode === 'automation') return;
-          windows.openSettings();
-        },
+        settings: () => windows.openSettings(),
         quit,
       },
     });
@@ -394,7 +366,6 @@ async function bootstrap(): Promise<void> {
   }
 
   app.on('second-instance', () => {
-    if (launchMode === 'automation') return;
     windows.showMain();
   });
 
@@ -408,20 +379,13 @@ async function bootstrap(): Promise<void> {
     // Tray application: closing every window must keep the supervisor alive.
   });
 
-  app.on('activate', () => {
-    if (launchMode === 'automation') return;
-    windows.showMain();
-  });
+  app.on('activate', () => windows.showMain());
 
   app.whenReady().then(async () => {
     // Sessions and the tray only become available once Electron is ready.
     windows.configureSession();
     startTray();
-    // A manual start shows the loading surface; a background or automated start
-    // shows nothing at all.
-    if (decideStartupSurface({ mode: launchMode, openOnLaunch: config.openOnLaunch }) === 'splash') {
-      presentSplash('startup', true);
-    }
+    windows.showSplash({ activate: true });
     tray?.update(supervisor.getStatus(), false);
     try {
       await supervisor.start();

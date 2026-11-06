@@ -14,10 +14,7 @@ Launch a small Electron application on Windows, automatically start a supported 
 - Electron's bundled Chromium displays the **unchanged official WebUI**, including its real chat composer. No replica and no modified official Windows Desktop.
 - Default local endpoint: `127.0.0.1:3080` (port configurable in app settings, no arbitrary navigation).
 - Start on demand, supervisor/health checks, hide window to tray on X, reopen with auto-reconnect if needed, Quit via tray to exit.
-- Lightweight orbital loading/recovery surface with real stages and no fake
-  progress: it appears on a manual start, and during recovery only over an
-  already visible window. It is never always-on-top and never steals focus,
-  so a background or tray-mode reconnect shows nothing at all.
+- Lightweight orbital startup/recovery screen; no fake progress percentages.
 - Original WebUI auth bootstrap is handled privately: the tokenized startup URL is exchanged for a session cookie in the main process, so the token never reaches the window, the history or the logs.
 
 Planned later: other trusted WSL WebUI backend presets. **Not** a general-purpose browser, reverse proxy or GUI redesign.
@@ -44,9 +41,7 @@ This is variable/prefix isolation, **not an OS sandbox**: npm install scripts an
 
 Lifecycle: `CHECKING → STARTING_WSL → STARTING_WEB → CONNECTING → READY ↔ HIDDEN_IN_TRAY`,
 with `RECOVERING`, `ERROR`, `QUITTING`. Closing the window hides it to the tray and
-the state follows; a later successful start never re-opens a window you closed, and
-while the app sits in the tray a restart or reconnect happens silently — no window,
-no focus change. The loading surface is a normal window (never always-on-top).
+the state follows; a later successful start never re-opens a window you closed.
 Recovery reloads the original WebUI, reclaims only a verified app-owned backend and
 re-checks PID identity before any forced kill. Details:
 [docs/architecture.md](docs/architecture.md).
@@ -98,15 +93,7 @@ npm test              # vitest (unit tests only, no WSL/Electron needed)
 npm run build         # esbuild -> dist/ (main, preloads, local pages, icons)
 npm start             # build + run Electron on the current platform
 npm run smoke:headless  # Linux/WSL: launch the built app under Xvfb with a
-                        # sanitised PATH/HOME in automation mode; must reach a
-                        # clean terminal error and show no window at all
-```
-
-Automation mode (no window is created, shown or focused for the whole run — use
-it for scripted tests so nothing appears over your desktop):
-
-```sh
-WSL_WEB_SHELL_AUTOMATION=1 ./WSL\ Web\ Shell.exe     # or: --automation / --quiet
+                        # sanitised PATH/HOME; must reach a clean terminal error
 ```
 
 Windows packaging (x64, portable EXE):
