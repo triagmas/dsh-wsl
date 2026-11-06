@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   ArgumentError,
+  PREPARE_ISOLATION_SCRIPT,
   PROBE_PROCESS_SCRIPT,
-  RESOLVE_DSH_SCRIPT,
+  RESOLVE_RUNTIME_SCRIPT,
+  SCRIPT_ARGV0,
   START_WRAPPER_SCRIPT,
   buildDshPathCheckArgs,
   buildListDistrosArgs,
   buildProbeProcessArgs,
-  buildResolveDshArgs,
+  buildResolveRuntimeArgs,
   buildSignalArgs,
   buildStartServerArgs,
 } from '../src/main/wsl/args.js';
@@ -21,7 +23,14 @@ import {
 } from '../src/main/wsl/output.js';
 
 describe('start command construction', () => {
-  const base = { distro: 'Ubuntu', dshPath: '/usr/local/bin/dsh', port: 3080, workspace: '~' };
+  const base = {
+    distro: 'Ubuntu',
+    dshPath: '/usr/local/bin/dsh',
+    port: 3080,
+    workspace: '~',
+    isolationRoot: '-',
+    nodePath: null,
+  };
 
   it('uses an argument array with no shell interpolation of values', () => {
     const argv = buildStartServerArgs(base);
@@ -37,6 +46,8 @@ describe('start command construction', () => {
       '/usr/local/bin/dsh',
       '127.0.0.1',
       '3080',
+      '-',
+      '-',
     ]);
     // Per-launch values never appear inside the script text.
     expect(START_WRAPPER_SCRIPT).not.toContain('3080');
@@ -74,8 +85,18 @@ describe('start command construction', () => {
 
   it('keeps diagnostic helpers read-only', () => {
     expect(buildListDistrosArgs()).toEqual(['-l', '-q']);
-    expect(buildResolveDshArgs('Ubuntu')).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', RESOLVE_DSH_SCRIPT]);
-    expect(RESOLVE_DSH_SCRIPT).not.toMatch(/\b(apt|npm i|pnpm|curl|wget)\b/);
+    expect(buildResolveRuntimeArgs('Ubuntu', null)).toEqual([
+      '-d',
+      'Ubuntu',
+      '--exec',
+      '/bin/sh',
+      '-c',
+      RESOLVE_RUNTIME_SCRIPT,
+      SCRIPT_ARGV0,
+      '-',
+    ]);
+    expect(RESOLVE_RUNTIME_SCRIPT).not.toMatch(/\b(apt|npm i|pnpm|curl|wget)\b/);
+    expect(PREPARE_ISOLATION_SCRIPT).not.toMatch(/\b(apt|npm|pnpm|curl|wget|rm|mv)\b/);
     expect(buildDshPathCheckArgs('Ubuntu', '/tmp/dsh')).toContain('/bin/test');
     expect(buildProbeProcessArgs('Ubuntu', 42)).toContain(PROBE_PROCESS_SCRIPT);
     expect(buildProbeProcessArgs('Ubuntu', 42).at(-1)).toBe('42');

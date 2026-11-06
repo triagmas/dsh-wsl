@@ -1,4 +1,5 @@
 /** Configuration validation. Pure: no fs, no Electron. */
+import { isValidIsolationRoot } from './isolation.js';
 import {
   DEFAULT_CONFIG,
   PRESET_DEEPSEEK_HARNESS,
@@ -42,6 +43,9 @@ export function normalizeConfig(input: unknown): AppConfig {
     port: isValidPort(source.port) ? source.port : DEFAULT_CONFIG.port,
     workspace: isValidWorkspace(source.workspace) ? source.workspace : DEFAULT_CONFIG.workspace,
     dshPath: isValidDshPath(source.dshPath) ? source.dshPath : null,
+    isolateEnvironment:
+      typeof source.isolateEnvironment === 'boolean' ? source.isolateEnvironment : DEFAULT_CONFIG.isolateEnvironment,
+    runtimeRoot: isValidIsolationRoot(source.runtimeRoot) ? source.runtimeRoot : DEFAULT_CONFIG.runtimeRoot,
     openOnLaunch: typeof source.openOnLaunch === 'boolean' ? source.openOnLaunch : DEFAULT_CONFIG.openOnLaunch,
     autoRestart: typeof source.autoRestart === 'boolean' ? source.autoRestart : DEFAULT_CONFIG.autoRestart,
     maxRestartAttempts:
@@ -82,6 +86,14 @@ export function applyConfigPatch(current: AppConfig, patch: ConfigPatch): PatchR
     else if (isValidDshPath(patch.dshPath)) next.dshPath = patch.dshPath;
     else errors.push('dshPath: expected an absolute path inside the distribution');
   }
+  if (patch.isolateEnvironment !== undefined) {
+    if (typeof patch.isolateEnvironment === 'boolean') next.isolateEnvironment = patch.isolateEnvironment;
+    else errors.push('isolateEnvironment: expected a boolean');
+  }
+  if (patch.runtimeRoot !== undefined) {
+    if (isValidIsolationRoot(patch.runtimeRoot)) next.runtimeRoot = patch.runtimeRoot;
+    else errors.push('runtimeRoot: expected a POSIX path such as ~/.local/share/wsl-web-shell');
+  }
   if (patch.openOnLaunch !== undefined) {
     if (typeof patch.openOnLaunch === 'boolean') next.openOnLaunch = patch.openOnLaunch;
     else errors.push('openOnLaunch: expected a boolean');
@@ -109,6 +121,8 @@ export function requiresRestart(previous: AppConfig, next: AppConfig): boolean {
     previous.distro !== next.distro ||
     previous.port !== next.port ||
     previous.workspace !== next.workspace ||
-    previous.dshPath !== next.dshPath
+    previous.dshPath !== next.dshPath ||
+    previous.isolateEnvironment !== next.isolateEnvironment ||
+    previous.runtimeRoot !== next.runtimeRoot
   );
 }

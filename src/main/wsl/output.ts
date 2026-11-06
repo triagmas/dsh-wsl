@@ -29,6 +29,31 @@ export function parseDistroList(text: string): string[] {
   return names;
 }
 
+export interface RuntimeProbe {
+  /** Absolute path of the `dsh` executable, or null when none was found. */
+  dshPath: string | null;
+  /** Absolute path of the node binary used by the launcher PATH. */
+  nodePath: string | null;
+}
+
+function asAbsolutePath(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('/') || trimmed.length > 4096) return null;
+  if (/[\0\r\n]/.test(trimmed) || trimmed.split('/').includes('..')) return null;
+  return trimmed;
+}
+
+/** Parse the `dsh=`/`node=` lines printed by the read-only runtime probe. */
+export function parseRuntimeProbe(text: string): RuntimeProbe {
+  const probe: RuntimeProbe = { dshPath: null, nodePath: null };
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/\0/g, '').trim();
+    if (line.startsWith('dsh=')) probe.dshPath = asAbsolutePath(line.slice(4));
+    else if (line.startsWith('node=')) probe.nodePath = asAbsolutePath(line.slice(5));
+  }
+  return probe;
+}
+
 /** PID announcement printed by the start wrapper, if already observed. */
 export function parsePidMarker(text: string): number | null {
   const pattern = new RegExp(`${PID_MARKER}\\s+(\\d+)`);

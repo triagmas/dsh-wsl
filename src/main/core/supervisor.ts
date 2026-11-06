@@ -14,6 +14,7 @@ import { Lifecycle, backoffDelay } from './lifecycle.js';
 import { verifyOwnership, type OwnedServerRecord } from './ownership.js';
 import { classifyPortSituation, type PortState } from './port.js';
 import { sanitizeOptional } from './display.js';
+import { buildIsolationPlan, isolationRootArg, resolveLaunchWorkspace, type IsolationPlan } from './isolation.js';
 
 export interface ExitInfo {
   code: number | null;
@@ -38,13 +39,25 @@ export interface StartServerRequest {
   port: number;
   workspace: string;
   host: string;
+  /** Validated isolated environment root, or `-` when isolation is disabled. */
+  isolationRoot: string;
+  /** Resolved node binary used to build the launcher PATH, or null. */
+  nodePath: string | null;
+}
+
+export interface ResolvedRuntime {
+  dshPath: string;
+  nodePath: string | null;
 }
 
 export interface WslGateway {
   listDistros(): Promise<string[]>;
   /** Any `wsl.exe` invocation starts a stopped distribution. */
   ensureDistro(distro: string): Promise<void>;
-  resolveDshPath(distro: string, override: string | null): Promise<string>;
+  /** Resolve `dsh` and `node` inside the distribution (read-only). */
+  resolveRuntime(distro: string, override: string | null, isolationRoot: string | null): Promise<ResolvedRuntime>;
+  /** Create the isolated environment directories below the validated root. */
+  prepareIsolation(distro: string, root: string): Promise<void>;
   startServer(request: StartServerRequest): ServerHandle;
   probeProcess(distro: string, pid: number): Promise<ProcessProbe | null>;
   signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
@@ -354,7 +367,16 @@ export class Supervisor {
       // survives a failed recovery attempt.
       await this.releaseOwnedProcess();
 
-      const dshPath = await this.deps.wsl.resolveDshPath(config.distro, config.dshPath);
+      const plan = this.isolationPlan(config);
+      if (plan.enabled) {
+        this.setState('STARTING_WSL', `Preparing isolated environment in ${config.distro}`);
+        await this.deps.wsl.prepareIsolation(config.distro, plan.root);
+      }
+      const runtime = await this.deps.wsl.resolveRuntime(
+        config.distro,
+        config.dshPath,
+        plan.enabled ? plan.root : null,
+      );
 
       const portState = await this.deps.probePort(config.port);
       let reassessed = portState;
@@ -391,7 +413,7 @@ export class Supervisor {
         }
       }
 
-      await this.spawnServer(dshPath);
+      await this.spawnServer(runtime, plan);
       await this.finishReady();
     } catch (error) {
       // Never leave a half-started process behind.
@@ -406,16 +428,23 @@ export class Supervisor {
     }
   }
 
-  private async spawnServer(dshPath: string): Promise<void> {
+  private isolationPlan(config: AppConfig): IsolationPlan {
+    return buildIsolationPlan({ enabled: config.isolateEnvironment, root: config.runtimeRoot });
+  }
+
+  private async spawnServer(runtime: ResolvedRuntime, plan: IsolationPlan): Promise<void> {
     const config = this.deps.config();
+    const workspace = resolveLaunchWorkspace(config.workspace, plan);
     this.setState('STARTING_WEB', null);
 
     const handle = this.deps.wsl.startServer({
       distro: config.distro,
-      dshPath,
+      dshPath: runtime.dshPath,
       port: this.port(),
-      workspace: config.workspace,
+      workspace,
       host: LOOPBACK_HOST,
+      isolationRoot: isolationRootArg(plan),
+      nodePath: runtime.nodePath,
     });
     this.server = handle;
     this.owned = true;
@@ -446,7 +475,7 @@ export class Supervisor {
       port: this.port(),
       pid,
       startTime: probe.startTime,
-      workspace: config.workspace,
+      workspace,
       startedAt: new Date(this.deps.now()).toISOString(),
       appVersion: this.deps.appVersion,
     } satisfies OwnedServerRecord);

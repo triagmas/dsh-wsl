@@ -6,33 +6,86 @@
  * text is a module constant; per-launch values arrive as positional parameters.
  */
 import { LOOPBACK_HOST } from '../../shared/types.js';
+import {
+  ISOLATION_DISABLED,
+  isValidIsolationRoot,
+  isValidRuntimeBinary,
+} from '../core/isolation.js';
 
 export const WSL_EXE = 'wsl.exe';
 
 /**
  * Prints the Linux PID that will own the web server, then replaces itself with
  * the server process (same PID), so the PID we record stays valid.
- * `$0` = resolved dsh path, `$1` = host, `$2` = port.
+ *
+ * `$0` = resolved dsh path, `$1` = host, `$2` = port,
+ * `$3` = isolation root (or `-`), `$4` = resolved node binary (or `-`).
+ *
+ * The isolation block runs inside the distribution, so `~` is expanded by the
+ * Linux shell and no variable depends on `WSLENV` forwarding from Windows.
+ * Every exported value is a validated positional argument, never interpolated
+ * shell text.
  */
 export const START_WRAPPER_SCRIPT = [
+  'root="$3"; node="$4";',
+  'if [ "$root" != "-" ]; then',
+  'case "$root" in "~") root="$HOME";; "~/"*) root="$HOME/${root#"~/"}";; /*) ;; *) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
+  'export DSH_HOME="$root/dsh-home";',
+  'export DSH_AGENTS_HOME="$root/agents";',
+  'export XDG_CACHE_HOME="$root/cache";',
+  'export TMPDIR="$root/tmp";',
+  'export WSL_WEB_SHELL_ISOLATION_ROOT="$root";',
+  'if [ "$node" != "-" ]; then export PATH="$root/runtime/bin:$(dirname "$node"):$PATH"; else export PATH="$root/runtime/bin:$PATH"; fi;',
+  'fi;',
   'printf "%s %s\\n" "__dsh_web_shell_pid__" "$$";',
   'exec "$0" web --host "$1" --port "$2" --no-open',
+].join(' ');
+
+/**
+ * Create the isolated environment (private runtime, DSH_HOME, agents home,
+ * caches, temp, workspace) before the backend starts. `mkdir -p` only touches
+ * directories below the validated root; nothing is installed or removed.
+ */
+export const PREPARE_ISOLATION_SCRIPT = [
+  'root="$1";',
+  'case "$root" in "~") root="$HOME";; "~/"*) root="$HOME/${root#"~/"}";; /*) ;; *) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
+  'umask 077;',
+  'for d in runtime/bin dsh-home agents cache tmp workspace; do mkdir -p "$root/$d" || exit 70; done;',
+  'printf "%s\\n" "$root"',
 ].join(' ');
 
 export const PID_MARKER = '__dsh_web_shell_pid__';
 
 /**
- * Locate the `dsh` executable inside the distribution. Diagnostics only:
- * read-only filesystem tests, no package installation.
+ * `sh -c SCRIPT arg0 arg1 ...` puts the first operand into `$0`, so every
+ * script invoked without a meaningful `$0` receives this fixed label and reads
+ * its real parameters from `$1`, `$2`, ...
  */
-export const RESOLVE_DSH_SCRIPT = [
-  'for c in "$HOME/.local/bin/dsh" /usr/local/bin/dsh /usr/bin/dsh "$HOME/.npm-global/bin/dsh"; do',
-  'if [ -x "$c" ]; then printf "%s\\n" "$c"; exit 0; fi; done;',
-  'for c in "$HOME"/.nvm/versions/node/*/bin/dsh "$HOME"/.volta/bin/dsh; do',
-  'if [ -x "$c" ]; then printf "%s\\n" "$c"; exit 0; fi; done;',
-  'p=$(command -v dsh 2>/dev/null) && [ -x "$p" ] && { printf "%s\\n" "$p"; exit 0; };',
-  'p=$(bash -lc "command -v dsh" 2>/dev/null | tail -n 1) && [ -x "$p" ] && { printf "%s\\n" "$p"; exit 0; };',
-  'exit 3',
+export const SCRIPT_ARGV0 = 'wsl-web-shell';
+
+/**
+ * Locate the backend executable and a node runtime inside the distribution.
+ * `$1` = isolation root (`-` when disabled); the isolated runtime is preferred
+ * over system installs. Diagnostics only: read-only filesystem tests.
+ */
+export const RESOLVE_RUNTIME_SCRIPT = [
+  'iso="$1";',
+  'case "$iso" in "~") iso="$HOME";; "~/"*) iso="$HOME/${iso#"~/"}";; /*) ;; *) iso="";; esac;',
+  'dsh="";',
+  'if [ -n "$iso" ] && [ -x "$iso/runtime/bin/dsh" ]; then dsh="$iso/runtime/bin/dsh"; fi;',
+  'if [ -z "$dsh" ]; then for c in "$HOME/.local/bin/dsh" /usr/local/bin/dsh /usr/bin/dsh "$HOME/.npm-global/bin/dsh"; do',
+  'if [ -x "$c" ]; then dsh="$c"; break; fi; done; fi;',
+  'if [ -z "$dsh" ]; then for c in "$HOME"/.nvm/versions/node/*/bin/dsh "$HOME"/.volta/bin/dsh; do',
+  '[ -x "$c" ] && { dsh="$c"; break; }; done; fi;',
+  'if [ -z "$dsh" ]; then p=$(command -v dsh 2>/dev/null) && [ -x "$p" ] && dsh="$p"; fi;',
+  'if [ -z "$dsh" ]; then p=$(bash -lc "command -v dsh" 2>/dev/null | tail -n 1) && [ -x "$p" ] && dsh="$p"; fi;',
+  'node="";',
+  'for c in "$HOME/.local/bin/node" /usr/local/bin/node /usr/bin/node; do',
+  'if [ -x "$c" ]; then node="$c"; break; fi; done;',
+  'if [ -z "$node" ]; then p=$(command -v node 2>/dev/null) && [ -x "$p" ] && node="$p"; fi;',
+  'printf "dsh=%s\\n" "$dsh";',
+  'printf "node=%s\\n" "$node";',
+  'exit 0',
 ].join(' ');
 
 /**
@@ -106,11 +159,6 @@ export function buildListDistrosArgs(): string[] {
   return ['-l', '-q'];
 }
 
-/** Resolve the backend executable; prints its absolute path on success. */
-export function buildResolveDshArgs(distro: string): string[] {
-  return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', RESOLVE_DSH_SCRIPT];
-}
-
 /** Verify a user-supplied absolute executable path without running it. */
 export function buildDshPathCheckArgs(distro: string, dshPath: string): string[] {
   return ['-d', assertDistroName(distro), '--exec', '/bin/test', '-x', assertDshPath(dshPath)];
@@ -122,16 +170,26 @@ export interface StartServerOptions {
   port: number;
   workspace: string;
   host?: string;
+  /** Isolated environment root (validated) and the resolved node binary. */
+  isolationRoot: string;
+  nodePath: string | null;
 }
 
 /**
  * Launch `dsh web` inside the distribution.
- * `--exec` avoids a shell for the outer command; the inner `bash -c` receives
- * only fixed script text plus validated positional values.
+ * `--exec` avoids a shell for the outer command; the inner `bash` receives only
+ * fixed script text plus validated positional values, so isolation variables are
+ * exported by the distribution itself rather than forwarded from Windows.
  */
 export function buildStartServerArgs(options: StartServerOptions): string[] {
   const host = options.host ?? LOOPBACK_HOST;
   if (host !== LOOPBACK_HOST) throw new ArgumentError('invalid-bind-host');
+  if (options.isolationRoot !== ISOLATION_DISABLED && !isValidIsolationRoot(options.isolationRoot)) {
+    throw new ArgumentError('invalid-isolation-root');
+  }
+  if (options.nodePath !== null && !isValidRuntimeBinary(options.nodePath)) {
+    throw new ArgumentError('invalid-runtime-binary');
+  }
   return [
     '-d',
     assertDistroName(options.distro),
@@ -144,16 +202,49 @@ export function buildStartServerArgs(options: StartServerOptions): string[] {
     assertDshPath(options.dshPath),
     host,
     String(assertPort(options.port)),
+    options.isolationRoot,
+    options.nodePath ?? ISOLATION_DISABLED,
   ];
 }
 
+/** Create the isolated environment directories before the backend starts. */
+export function buildPrepareIsolationArgs(distro: string, root: string): string[] {
+  if (!isValidIsolationRoot(root)) throw new ArgumentError('invalid-isolation-root');
+  return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', PREPARE_ISOLATION_SCRIPT, SCRIPT_ARGV0, root];
+}
+
+/** Resolve `dsh` and `node` inside the distribution (read-only). */
+export function buildResolveRuntimeArgs(distro: string, isolationRoot: string | null): string[] {
+  const iso = isolationRoot === null ? ISOLATION_DISABLED : isolationRoot;
+  if (iso !== ISOLATION_DISABLED && !isValidIsolationRoot(iso)) throw new ArgumentError('invalid-isolation-root');
+  return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', RESOLVE_RUNTIME_SCRIPT, SCRIPT_ARGV0, iso];
+}
+
 export function buildProbeProcessArgs(distro: string, pid: number): string[] {
-  return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', PROBE_PROCESS_SCRIPT, String(assertLinuxPid(pid))];
+  return [
+    '-d',
+    assertDistroName(distro),
+    '--exec',
+    '/bin/sh',
+    '-c',
+    PROBE_PROCESS_SCRIPT,
+    SCRIPT_ARGV0,
+    String(assertLinuxPid(pid)),
+  ];
 }
 
 /** POSIX signal delivery by number-free name to one verified PID. */
 export function buildSignalArgs(distro: string, pid: number, signal: 'TERM' | 'KILL'): string[] {
-  return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', `kill -s ${signal} "$1" 2>/dev/null || exit 1`, String(assertLinuxPid(pid))];
+  return [
+    '-d',
+    assertDistroName(distro),
+    '--exec',
+    '/bin/sh',
+    '-c',
+    `kill -s ${signal} "$1" 2>/dev/null || exit 1`,
+    SCRIPT_ARGV0,
+    String(assertLinuxPid(pid)),
+  ];
 }
 
 export function buildDistroProbeArgs(distro: string): string[] {

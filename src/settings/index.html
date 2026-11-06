@@ -43,6 +43,20 @@
         </label>
 
         <label class="toggle">
+          <input id="isolateEnvironment" name="isolateEnvironment" type="checkbox" />
+          <span>Keep the backend in an isolated environment (private runtime, DSH_HOME, agents home)</span>
+        </label>
+
+        <label class="field">
+          <span>Isolated environment root inside WSL</span>
+          <input id="runtimeRoot" name="runtimeRoot" type="text" spellcheck="false" placeholder="~/.local/share/wsl-web-shell" />
+          <small>
+            Private runtime, DSH_HOME, DSH_AGENTS_HOME, caches, temp files and the test workspace live here.
+            Nothing outside this directory is modified.
+          </small>
+        </label>
+
+        <label class="toggle">
           <input id="autoRestart" name="autoRestart" type="checkbox" />
           <span>Restart the backend automatically after unexpected loss</span>
         </label>

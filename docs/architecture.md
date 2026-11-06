@@ -33,6 +33,35 @@ All entry points (`start`, `restart`, `retry`, `shutdown`) go through one promis
 chain, so two launches can never spawn two servers. `start()` is also idempotent
 while a backend is already owned and healthy.
 
+### Isolated backend environment
+
+The backend never inherits a shared harness home. Every launch derives one
+validated root — `~/.local/share/wsl-web-shell` by default — and puts the private
+runtime, `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files and the test workspace
+below it (`src/main/core/isolation.ts`):
+
+| Path | Purpose |
+|---|---|
+| `<root>/runtime/bin` | private npm prefix: the isolated `dsh` install lives here |
+| `<root>/dsh-home` | `DSH_HOME`: harness config, credentials, sessions |
+| `<root>/agents` | `DSH_AGENTS_HOME`: keeps the shared `~/.agents` out of the backend |
+| `<root>/cache`, `<root>/tmp` | `XDG_CACHE_HOME`, `TMPDIR` |
+| `<root>/workspace` | test workspace used when the configured workspace is the bare `~` |
+
+Directory preparation (`mkdir -p`, `umask 077`) is the only write the shell ever
+performs inside the distribution, and it is confined to the root. The root is
+validated against a strict charset (no spaces, quotes, `$`, `;`, `|`, `..`), so a
+value can never be re-parsed by `wsl.exe`, `env` or a shell as another command.
+
+Variables are exported **inside** the distribution by the start wrapper, so
+`~` expands against the Linux home and nothing depends on `WSLENV` forwarding
+from Windows. The wrapper also prefixes `PATH` with the isolated runtime and the
+resolved `node` binary, which makes resolution deterministic instead of
+inheriting whatever the user's shell profile happens to contain. `dsh` is
+resolved read-only in the same pass, preferring `<root>/runtime/bin/dsh` over
+system installs; an explicit `dshPath` still wins, and a missing `dsh` stays a
+hard `ERROR` (the app never installs packages).
+
 ### Window and tray state
 
 Window `show`/`hide` events feed `Supervisor.markHidden()`, so `READY` and
@@ -145,6 +174,17 @@ probe, lifecycle transitions and backoff, navigation/popup/permission policy,
 configuration validation, tray model, and supervisor flows against injected
 fakes (ready, collision, foreign listener, cookie rejection, unexpected exit,
 retry exhaustion, health recovery, shutdown).
+
+Configuration gained two fields: `isolateEnvironment` (default on) and
+`runtimeRoot`. Both require a backend restart, so the tray decision stays
+explicit; a settings file written by an older build normalises to the isolated
+defaults instead of silently running unisolated.
+
+The launcher scripts are not only string-tested: `tests/isolation.test.ts` runs
+them under `/bin/bash` with a throw-away `HOME` and a stub backend, proving that
+the environment really reaches the child process, that preparation creates only
+the planned directories, and that the single-argument helpers receive their
+parameter (a `sh -c` operand lands in `$0`, not `$1`).
 
 `npm run smoke:headless` additionally starts the real built main process under
 Xvfb with a sanitised environment (Windows interop removed from `PATH`, throw-away

@@ -1,6 +1,12 @@
 /** Shared, renderer-safe type definitions. No Electron or Node imports here. */
 
 export const PRESET_DEEPSEEK_HARNESS = 'deepseek-harness' as const;
+
+/**
+ * Default root of the isolated backend environment (runtime, `DSH_HOME`,
+ * `DSH_AGENTS_HOME`, caches, temp and the test workspace all live below it).
+ */
+export const ISOLATION_ROOT_DEFAULT = '~/.local/share/wsl-web-shell' as const;
 export type PresetId = typeof PRESET_DEEPSEEK_HARNESS;
 
 /** Lifecycle states from `docs/spec.md`. The values are also used in logs. */
@@ -26,6 +32,10 @@ export interface AppConfig {
   workspace: string;
   /** Optional absolute POSIX path to the `dsh` executable inside WSL. */
   dshPath: string | null;
+  /** Keep the backend in a private environment (runtime, DSH_HOME, agents home). */
+  isolateEnvironment: boolean;
+  /** Root directory of the isolated environment inside the distribution. */
+  runtimeRoot: string;
   /** Show the window as soon as the shell is ready. */
   openOnLaunch: boolean;
   /** Supervise the owned backend and restart it after unexpected loss. */
@@ -59,6 +69,8 @@ export interface ConfigPatch {
   port?: number;
   workspace?: string;
   dshPath?: string | null;
+  isolateEnvironment?: boolean;
+  runtimeRoot?: string;
   openOnLaunch?: boolean;
   autoRestart?: boolean;
   maxRestartAttempts?: number;
@@ -70,6 +82,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   port: 3080,
   workspace: '~',
   dshPath: null,
+  isolateEnvironment: true,
+  runtimeRoot: ISOLATION_ROOT_DEFAULT,
   openOnLaunch: true,
   autoRestart: true,
   maxRestartAttempts: 4,

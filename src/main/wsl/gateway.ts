@@ -4,14 +4,23 @@ import type { WslGateway, ServerHandle, StartServerRequest, ExitInfo } from '../
 import { ShellError } from '../core/supervisor.js';
 import type { Logger } from '../core/logger.js';
 import type { ProcessProbe } from './output.js';
-import { decodeWslOutput, LineBuffer, parseDistroList, parsePidMarker, parseProcessProbe, stripAnsi } from './output.js';
+import {
+  decodeWslOutput,
+  LineBuffer,
+  parseDistroList,
+  parsePidMarker,
+  parseProcessProbe,
+  parseRuntimeProbe,
+  stripAnsi,
+} from './output.js';
 import {
   WSL_EXE,
   buildDistroProbeArgs,
   buildDshPathCheckArgs,
   buildListDistrosArgs,
+  buildPrepareIsolationArgs,
   buildProbeProcessArgs,
-  buildResolveDshArgs,
+  buildResolveRuntimeArgs,
   buildSignalArgs,
   buildStartServerArgs,
 } from './args.js';
@@ -119,35 +128,49 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       options.log.info(`wsl distribution ready: ${distro}`);
     },
 
-    async resolveDshPath(distro, override) {
+    async prepareIsolation(distro, root) {
+      const result = await run(buildPrepareIsolationArgs(distro, root), 30_000);
+      if (result.code !== 0) {
+        throw new ShellError(
+          'unexpected',
+          'The isolated backend environment could not be created inside WSL.',
+          (result.stderr || result.stdout).trim().split('\n').slice(-2).join(' ') || 'Check permissions of the runtime root in Settings.',
+        );
+      }
+      options.log.info(`isolated environment ready: ${result.stdout.trim().split('\n').pop() ?? root}`);
+    },
+
+    async resolveRuntime(distro, override, isolationRoot) {
+      const result = await run(buildResolveRuntimeArgs(distro, isolationRoot), 30_000);
+      const probe = parseRuntimeProbe(result.stdout);
+      if (probe.nodePath !== null) options.log.info(`node runtime: ${probe.nodePath}`);
+
       if (override !== null) {
         const check = await run(buildDshPathCheckArgs(distro, override), 20_000);
-        if (check.code === 0) return override;
+        if (check.code === 0) {
+          options.log.info(`dsh (configured): ${override}`);
+          return { dshPath: override, nodePath: probe.nodePath };
+        }
         throw new ShellError(
           'dsh-missing',
           `The configured DeepSeek Harness path is not executable: ${override}`,
           'Update the path in Settings.',
         );
       }
-      const result = await run(buildResolveDshArgs(distro), 30_000);
-      const candidate = result.stdout
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith('/'))
-        .pop();
-      if (result.code !== 0 || candidate === undefined) {
+
+      if (probe.dshPath === null) {
         throw new ShellError(
           'dsh-missing',
           'DeepSeek Harness CLI (dsh) was not found inside the WSL distribution.',
-          'Install it in your Linux environment (npm install -g @deepseek-ai/dsh) or set the executable path in Settings. This app never installs packages automatically.',
+          'Install it into the isolated runtime (npm install --prefix ~/.local/share/wsl-web-shell/runtime -g @deepseek-ai/dsh) or set the executable path in Settings. This app never installs packages automatically.',
         );
       }
-      const check = await run(buildDshPathCheckArgs(distro, candidate), 20_000);
+      const check = await run(buildDshPathCheckArgs(distro, probe.dshPath), 20_000);
       if (check.code !== 0) {
         throw new ShellError('dsh-missing', 'The detected DeepSeek Harness CLI is not executable.', 'Set the executable path in Settings.');
       }
-      options.log.info(`dsh resolved: ${candidate}`);
-      return candidate;
+      options.log.info(`dsh resolved: ${probe.dshPath}`);
+      return { dshPath: probe.dshPath, nodePath: probe.nodePath };
     },
 
     startServer(request: StartServerRequest): ServerHandle {

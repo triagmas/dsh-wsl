@@ -26,6 +26,13 @@ WSL Web Shell.exe
      └─ sandboxed window with the original WebUI at http://127.0.0.1:3080
 ```
 
+The backend runs in an isolated environment under `~/.local/share/wsl-web-shell`:
+private runtime (`runtime/bin`), `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files
+and the test workspace. Variables are exported inside WSL by the start wrapper, so
+nothing depends on Windows environment forwarding and the shared `~/.dsh` /
+`~/.agents` are never touched. Disable it in Settings if you want the distro-wide
+environment instead.
+
 Lifecycle: `CHECKING → STARTING_WSL → STARTING_WEB → CONNECTING → READY ↔ HIDDEN_IN_TRAY`,
 with `RECOVERING`, `ERROR`, `QUITTING`. Closing the window hides it to the tray and
 the state follows; a later successful start never re-opens a window you closed.

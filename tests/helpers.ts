@@ -1,4 +1,4 @@
-import type { ExitInfo, ServerHandle, StartServerRequest, WslGateway } from '../src/main/core/supervisor.js';
+import type { ExitInfo, ResolvedRuntime, ServerHandle, StartServerRequest, WslGateway } from '../src/main/core/supervisor.js';
 import type { ProcessProbe } from '../src/main/wsl/output.js';
 import type { WebClient } from '../src/main/core/supervisor.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
@@ -81,7 +81,9 @@ export interface FakeWslOptions {
   urlPort?: number;
   announceUrl?: boolean;
   dshPath?: string;
+  nodePath?: string | null;
   failResolve?: 'dsh-missing' | null;
+  failPrepare?: boolean;
   /** Simulate a backend that dies before announcing its WebUI URL. */
   exitBeforeReady?: { code: number | null; stderr?: string };
 }
@@ -103,13 +105,33 @@ export class FakeWsl implements WslGateway {
     this.distroProbes += 1;
   }
 
-  async resolveDshPath(_distro: string, override: string | null): Promise<string> {
+  readonly isolationPreparations: string[] = [];
+  readonly runtimeQueries: { isolationRoot: string | null; override: string | null }[] = [];
+
+  async prepareIsolation(_distro: string, root: string): Promise<void> {
+    this.isolationPreparations.push(root);
+    if (this.options.failPrepare === true) {
+      const error = new Error('isolation prepare failed');
+      error.name = 'ShellError';
+      throw error;
+    }
+  }
+
+  async resolveRuntime(
+    _distro: string,
+    override: string | null,
+    isolationRoot: string | null,
+  ): Promise<ResolvedRuntime> {
+    this.runtimeQueries.push({ isolationRoot, override });
     if (this.options.failResolve === 'dsh-missing') {
       const error = new Error('dsh missing');
       error.name = 'ShellError';
       throw error;
     }
-    return override ?? this.options.dshPath ?? '/usr/local/bin/dsh';
+    return {
+      dshPath: override ?? this.options.dshPath ?? '/usr/local/bin/dsh',
+      nodePath: this.options.nodePath === undefined ? '/usr/bin/node' : this.options.nodePath,
+    };
   }
 
   startHook: (() => void) | null = null;

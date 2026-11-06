@@ -4,6 +4,8 @@ const distro = document.getElementById('distro');
 const port = document.getElementById('port');
 const workspace = document.getElementById('workspace');
 const dshPath = document.getElementById('dshPath');
+const isolateEnvironment = document.getElementById('isolateEnvironment');
+const runtimeRoot = document.getElementById('runtimeRoot');
 const autoRestart = document.getElementById('autoRestart');
 const openOnLaunch = document.getElementById('openOnLaunch');
 const maxRestartAttempts = document.getElementById('maxRestartAttempts');
@@ -54,6 +56,9 @@ async function load() {
   port.value = String(config.port);
   workspace.value = config.workspace;
   dshPath.value = config.dshPath ?? '';
+  isolateEnvironment.checked = config.isolateEnvironment;
+  runtimeRoot.value = config.runtimeRoot;
+  runtimeRoot.disabled = !config.isolateEnvironment;
   autoRestart.checked = config.autoRestart;
   openOnLaunch.checked = config.openOnLaunch;
   maxRestartAttempts.value = String(config.maxRestartAttempts);
@@ -69,6 +74,8 @@ form.addEventListener('submit', async (event) => {
       port: Number.parseInt(port.value, 10),
       workspace: workspace.value.trim(),
       dshPath: dshPath.value.trim() === '' ? null : dshPath.value.trim(),
+      isolateEnvironment: isolateEnvironment.checked,
+      runtimeRoot: runtimeRoot.value.trim(),
       autoRestart: autoRestart.checked,
       openOnLaunch: openOnLaunch.checked,
       maxRestartAttempts: Number.parseInt(maxRestartAttempts.value, 10),
@@ -85,6 +92,10 @@ form.addEventListener('submit', async (event) => {
   } finally {
     saveButton.disabled = false;
   }
+});
+
+isolateEnvironment.addEventListener('change', () => {
+  runtimeRoot.disabled = !isolateEnvironment.checked;
 });
 
 document.getElementById('cancel').addEventListener('click', () => window.settings.close());
