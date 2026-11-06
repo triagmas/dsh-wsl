@@ -101,12 +101,27 @@ main process:
 
 - the first successful start honours `openOnLaunch`; afterwards a window the user
   hid is **never** re-shown by a later `READY`;
-- the always-on-top splash is activated only when the app window is on screen, so
-  a hidden app never pops a window over the desktop during recovery or failure;
+- the loading surface is **not** always-on-top (`alwaysOnTop: false`,
+  `skipTaskbar: true`) and is presented in exactly three ways: `user` (show and
+  focus) only when the user performed the action in that step, `overlay`
+  (`showInactive()`, no focus) only on top of an already visible window, and
+  `hidden` (the window is not created and a leftover overlay is hidden) for a
+  background start or a tray-mode reconnect;
+- a background start (`openOnLaunch: false`) shows no loading surface at all;
 - tray Open routes to the overlay when there is nothing loadable yet (`ERROR`,
   `RECOVERING`), otherwise to the window;
 - recovery restores the tray state it started from: a hidden app recovers into
-  `HIDDEN_IN_TRAY`, not `READY`.
+  `HIDDEN_IN_TRAY`, not `READY`, and never opens a window.
+
+### Automation mode
+
+`--automation`, `--quiet` or `WSL_WEB_SHELL_AUTOMATION=1` switch the process to
+automation mode for the whole lifetime: no window is created, shown or focused
+(start-up surface `none`, every presentation `hidden`, `READY` never opens the
+window, second instance and tray Open/Settings are ignored). The tray icon and the
+supervisor still run, so a test can observe status and logs while the desktop stays
+untouched. `npm run smoke:headless` runs in this mode and asserts that the log
+contains no `window … shown` line.
 
 ### Reconnection after a restart
 
@@ -167,7 +182,9 @@ hidden, devtools available only to the developer.
 - Close (X) hides to tray; only the tray Quit path destroys windows.
 
 Splash and settings windows are local `file://` pages with tiny preloads. Every
-IPC handler rejects senders whose frame is not a local file.
+IPC handler rejects senders whose frame is not a local file. The splash window is a
+plain (not always-on-top) window; it is only created when the visibility policy
+asks for it, so a tray-mode reconnect never constructs one.
 
 DevTools are enabled only for unpackaged builds or with
 `WSL_WEB_SHELL_DEVTOOLS=1`; packaged production builds keep the debugger closed.
