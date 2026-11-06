@@ -1,0 +1,28 @@
+appId: com.triagmas.wslwebshell
+productName: WSL Web Shell
+copyright: Copyright (c) 2026 triagmas
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - package.json
+  - '!**/*.map'
+
+asar: true
+compression: maximum
+electronLanguages:
+  - en-US
+
+win:
+  target:
+    - target: portable
+      arch:
+        - x64
+  icon: build/icon.png
+  artifactName: WSL-Web-Shell-${version}-x64.${ext}
+
+portable:
+  artifactName: WSL-Web-Shell-${version}-x64.${ext}

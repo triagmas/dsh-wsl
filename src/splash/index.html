@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; font-src 'self'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WSL Web Shell</title>
+    <link rel="stylesheet" href="./splash.css" />
+  </head>
+  <body>
+    <main class="shell" id="shell" data-state="CHECKING">
+      <section class="orbital" aria-hidden="true">
+        <div class="orbit orbit-back"></div>
+        <div class="orbit orbit-front">
+          <span class="satellite"></span>
+        </div>
+        <div class="core">
+          <span class="core-glow"></span>
+        </div>
+      </section>
+
+      <h1 class="title">WSL Web Shell</h1>
+      <p class="stage" id="stage" role="status" aria-live="polite">Checking environment</p>
+      <p class="detail" id="detail" hidden></p>
+
+      <div class="actions" id="actions" hidden>
+        <button type="button" class="primary" id="retry">Retry</button>
+        <button type="button" class="secondary" id="logs">Open log folder</button>
+      </div>
+
+      <p class="meta" id="meta"></p>
+    </main>
+    <script src="./splash.js"></script>
+  </body>
+</html>
