@@ -30,8 +30,12 @@ The backend runs in an isolated environment under `~/.local/share/wsl-web-shell`
 private runtime (`runtime/bin`), `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files
 and the test workspace. Variables are exported inside WSL by the start wrapper, so
 nothing depends on Windows environment forwarding and the shared `~/.dsh` /
-`~/.agents` are never touched. Disable it in Settings if you want the distro-wide
-environment instead.
+`~/.agents` are never touched. The root must be a dedicated subtree: `/`, `~`,
+one-level paths, traversal and symlinked components are rejected before anything
+is created. Disable it in Settings if you want the distro-wide environment instead.
+
+This is variable/prefix isolation, **not an OS sandbox**: npm install scripts and
+`dsh` tools still run with your Linux user permissions.
 
 Lifecycle: `CHECKING → STARTING_WSL → STARTING_WEB → CONNECTING → READY ↔ HIDDEN_IN_TRAY`,
 with `RECOVERING`, `ERROR`, `QUITTING`. Closing the window hides it to the tray and

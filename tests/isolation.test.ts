@@ -1,19 +1,22 @@
 /**
- * R02-B0 regression suite: isolated backend environment.
+ * R02-B0/B0.1 regression suite: isolated backend environment.
  *
- * Covers the isolation plan, the exact launcher arguments (variables are
- * exported inside the distribution, never forwarded from Windows), the
- * read-only runtime probe with isolated-runtime priority, directory preparation
- * that cannot escape the root, and the supervisor wiring that fails closed.
+ * Covers root validation (dedicated subtree only, no `/`, `~`, traversal or
+ * shell-significant characters), the exact launcher arguments, environment
+ * delivery inside the distribution, the working directory handling, and real
+ * execution of the preparation/launch scripts inside a throw-away sandbox
+ * (symlink redirection, pre-existing content, missing workspace).
  */
 import { describe, expect, it } from 'vitest';
 import { Supervisor } from '../src/main/core/supervisor.js';
 import {
   ISOLATION_DISABLED,
+  ISOLATION_ROOT_MIN_DEPTH,
   buildIsolationPlan,
   isValidIsolationRoot,
   isValidRuntimeBinary,
   isolationRootArg,
+  normalizeIsolationRoot,
   resolveLaunchWorkspace,
 } from '../src/main/core/isolation.js';
 import { normalizeConfig, applyConfigPatch, requiresRestart } from '../src/main/core/config.js';
@@ -33,7 +36,7 @@ import { parseProcessProbe, parseRuntimeProbe } from '../src/main/wsl/output.js'
 import { DEFAULT_CONFIG, ISOLATION_ROOT_DEFAULT } from '../src/shared/types.js';
 import { createHarness, lastStatus } from './helpers.js';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -48,18 +51,41 @@ const launchBase = {
 };
 
 describe('isolation root validation', () => {
-  it('accepts the default and absolute POSIX roots', () => {
-    for (const root of [ISOLATION_ROOT_DEFAULT, ROOT, '~/sandbox', '/srv/wsl-web-shell', '/']) {
+  it('accepts dedicated subtrees only', () => {
+    for (const root of [ISOLATION_ROOT_DEFAULT, ROOT, '/srv/wsl-web-shell', '/opt/apps/wsl-web-shell', '/home/me/.local/share/wsl-web-shell']) {
       expect(isValidIsolationRoot(root)).toBe(true);
+    }
+    expect(ISOLATION_ROOT_MIN_DEPTH).toBe(2);
+  });
+
+  it('rejects the filesystem root, the home directory and one-level roots', () => {
+    for (const root of ['/', '//', '~', '~/', '~/x', '/srv', '/srv/', '/opt', '/home', '/tmp']) {
+      expect(isValidIsolationRoot(root)).toBe(false);
     }
   });
 
-  it('rejects relative, escaping and shell-significant roots', () => {
-    const rejected = [
-      '',
-      'sandbox',
+  it('rejects traversal and structural representations', () => {
+    for (const root of [
       '~/.local/../secret',
       '/srv/../etc',
+      '~/a/./b',
+      '/srv//app',
+      '//srv/app',
+      '~/..',
+      '/..',
+      './relative',
+      'relative/path',
+      '~user/app',
+      '~/a/b/../../../etc',
+    ]) {
+      expect(isValidIsolationRoot(root)).toBe(false);
+    }
+  });
+
+  it('rejects shell-significant characters and non-strings', () => {
+    const rejected: unknown[] = [
+      '',
+      ' ',
       '/srv/a b',
       '/srv/$(id)',
       '/srv/`id`',
@@ -71,11 +97,18 @@ describe('isolation root validation', () => {
       'C:\\Users\\me',
       '/srv/a\nb',
       '/srv/a\tb',
-      `/${'a'.repeat(600)}`,
+      `/${'a'.repeat(600)}/b`,
       42,
       null,
+      undefined,
     ];
     for (const root of rejected) expect(isValidIsolationRoot(root)).toBe(false);
+  });
+
+  it('accepts a single trailing slash but hands out a canonical value', () => {
+    expect(isValidIsolationRoot('~/a/b/')).toBe(true);
+    expect(normalizeIsolationRoot('~/a/b/')).toBe('~/a/b');
+    expect(normalizeIsolationRoot('/srv/app//')).toBe('/srv/app');
   });
 
   it('accepts only absolute sandbox-free runtime binaries', () => {
@@ -108,8 +141,10 @@ describe('isolation plan', () => {
     expect(buildIsolationPlan({ enabled: true, root: '' }).root).toBe(ISOLATION_ROOT_DEFAULT);
   });
 
-  it('refuses to build an enabled plan from an unsafe root', () => {
-    expect(() => buildIsolationPlan({ enabled: true, root: '/srv/a;b' })).toThrow(/invalid-isolation-root/);
+  it('refuses to build an enabled plan from any unsafe root', () => {
+    for (const root of ['/', '~', '~/x', '/srv/a;b', '~/a/../b']) {
+      expect(() => buildIsolationPlan({ enabled: true, root })).toThrow(/invalid-isolation-root/);
+    }
     // A disabled plan never reaches the launcher, so nothing is validated there.
     expect(buildIsolationPlan({ enabled: false, root: '/srv/a;b' }).enabled).toBe(false);
   });
@@ -135,24 +170,30 @@ describe('isolation plan', () => {
 describe('launcher environment', () => {
   it('exports every isolation variable inside the distribution', () => {
     for (const line of [
-      'export DSH_HOME="$root/dsh-home"',
-      'export DSH_AGENTS_HOME="$root/agents"',
-      'export XDG_CACHE_HOME="$root/cache"',
-      'export TMPDIR="$root/tmp"',
-      'export WSL_WEB_SHELL_ISOLATION_ROOT="$root"',
+      'export DSH_HOME="$iroot/dsh-home"',
+      'export DSH_AGENTS_HOME="$iroot/agents"',
+      'export XDG_CACHE_HOME="$iroot/cache"',
+      'export TMPDIR="$iroot/tmp"',
+      'export WSL_WEB_SHELL_ISOLATION_ROOT="$iroot"',
     ]) {
       expect(START_WRAPPER_SCRIPT).toContain(line);
     }
     // The isolated runtime always wins the PATH prefix.
-    expect(START_WRAPPER_SCRIPT).toContain('export PATH="$root/runtime/bin:$(dirname "$node"):$PATH"');
+    expect(START_WRAPPER_SCRIPT).toContain('export PATH="$iroot/runtime/bin:$(dirname "$node"):$PATH"');
   });
 
-  it('expands ~ inside WSL and rejects anything that is not a POSIX path', () => {
-    expect(START_WRAPPER_SCRIPT).toContain('[ "$root" != "-" ]');
-    expect(START_WRAPPER_SCRIPT).toContain('root="$HOME/${root#"~/"}');
-    expect(START_WRAPPER_SCRIPT).toContain('exit 64');
-    // Nothing from Windows environment forwarding is trusted.
+  it('re-validates the root before exporting anything', () => {
+    expect(START_WRAPPER_SCRIPT).toContain('[ "$root" = "/" ]');
+    expect(START_WRAPPER_SCRIPT).toContain('exit 66');
+    expect(START_WRAPPER_SCRIPT).toContain('exit 67');
     expect(START_WRAPPER_SCRIPT).not.toContain('WSLENV');
+  });
+
+  it('enters the workspace with the shell instead of wsl.exe --cd', () => {
+    expect(START_WRAPPER_SCRIPT).toContain('cd "$ws" || exit 65');
+    expect(buildStartServerArgs(launchBase)).not.toContain('--cd');
+    // A tilde-prefixed subpath is expanded by bash, which is verifiable.
+    expect(START_WRAPPER_SCRIPT).toContain('ws="$HOME/${ws#"~/"}');
   });
 
   it('keeps values out of the script text and passes them as positional arguments', () => {
@@ -160,8 +201,6 @@ describe('launcher environment', () => {
     expect(argv).toEqual([
       '-d',
       'Ubuntu',
-      '--cd',
-      '~',
       '--exec',
       '/bin/bash',
       '-c',
@@ -171,6 +210,7 @@ describe('launcher environment', () => {
       '3080',
       ROOT,
       '/usr/bin/node',
+      '~',
     ]);
     for (const value of [ROOT, '/usr/bin/node', '3080', '/opt/wsl-web-shell/runtime/bin/dsh']) {
       expect(START_WRAPPER_SCRIPT).not.toContain(value);
@@ -179,15 +219,24 @@ describe('launcher environment', () => {
 
   it('marks isolation as disabled without any variable setup', () => {
     const argv = buildStartServerArgs({ ...launchBase, isolationRoot: ISOLATION_DISABLED, nodePath: null });
-    expect(argv.slice(-2)).toEqual([ISOLATION_DISABLED, ISOLATION_DISABLED]);
+    expect(argv.slice(-3)).toEqual([ISOLATION_DISABLED, ISOLATION_DISABLED, '~']);
   });
 
   it('rejects unsafe isolation values before any process is spawned', () => {
-    for (const isolationRoot of ['/srv/a b', '/srv/../x', 'relative', '/srv/a;id']) {
+    for (const isolationRoot of ['/', '~', '~/x', '/srv/a b', '/srv/../x', 'relative', '/srv/a;id']) {
       expect(() => buildStartServerArgs({ ...launchBase, isolationRoot })).toThrow(ArgumentError);
     }
     for (const nodePath of ['node', '/usr/bin/node -e x', '/usr/../bin/node']) {
       expect(() => buildStartServerArgs({ ...launchBase, nodePath })).toThrow(ArgumentError);
+    }
+  });
+
+  it('rejects workspace paths that could leave the intended project', () => {
+    for (const workspace of ['~/a/../..', '/srv/./x', '/srv//x', '~/../etc', 'relative/path', '/', '']) {
+      expect(() => buildStartServerArgs({ ...launchBase, workspace })).toThrow(ArgumentError);
+    }
+    for (const workspace of ['~', '~/', '~/projects/app', '/srv/app', '/home/me/work']) {
+      expect(() => buildStartServerArgs({ ...launchBase, workspace })).not.toThrow();
     }
   });
 
@@ -201,23 +250,32 @@ describe('launcher environment', () => {
 
 describe('environment preparation', () => {
   it('creates only the directories of the plan and nothing else', () => {
-    expect(PREPARE_ISOLATION_SCRIPT).toContain('for d in runtime/bin dsh-home agents cache tmp workspace; do mkdir -p "$root/$d"');
+    expect(PREPARE_ISOLATION_SCRIPT).toContain('for d in runtime/bin dsh-home agents cache tmp workspace; do');
     expect(PREPARE_ISOLATION_SCRIPT).toContain('umask 077');
-    expect(PREPARE_ISOLATION_SCRIPT).not.toMatch(/\b(apt|dpkg|npm|pnpm|pip|curl|wget|rm|mv|cp)\b/);
+    expect(PREPARE_ISOLATION_SCRIPT).not.toMatch(/\b(apt|dpkg|npm|pnpm|pip|curl|wget|rm|mv|cp|chmod|chown)\b/);
     expect(PREPARE_ISOLATION_SCRIPT).not.toContain('sudo');
+  });
+
+  it('checks for symlink redirection before and after every write', () => {
+    expect(PREPARE_ISOLATION_SCRIPT).toContain('if [ -L "$walked" ]');
+    expect(PREPARE_ISOLATION_SCRIPT).toContain('[ ! -L "$expected" ]');
+    // Each managed component is checked before `mkdir -p` can follow it.
+    expect(PREPARE_ISOLATION_SCRIPT).toContain('if [ -L "$cur" ]');
+    expect(PREPARE_ISOLATION_SCRIPT).toContain('[ "$(cd "$expected/$d" && pwd -P)" = "$expected/$d" ]');
   });
 
   it('validates the root before it reaches the shell', () => {
     const argv = buildPrepareIsolationArgs('Ubuntu', ROOT);
     expect(argv).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PREPARE_ISOLATION_SCRIPT, SCRIPT_ARGV0, ROOT]);
-    expect(() => buildPrepareIsolationArgs('Ubuntu', '~/a/../../etc')).toThrow(ArgumentError);
-    expect(() => buildPrepareIsolationArgs('Ubuntu', '/srv/a b')).toThrow(ArgumentError);
+    for (const root of ['/', '~', '~/x', '~/a/../../etc', '/srv/a b']) {
+      expect(() => buildPrepareIsolationArgs('Ubuntu', root)).toThrow(ArgumentError);
+    }
   });
 
   it('resolves dsh/node read-only and prefers the isolated runtime', () => {
     const argv = buildResolveRuntimeArgs('Ubuntu', ROOT);
     expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', RESOLVE_RUNTIME_SCRIPT]);
-    expect(argv.at(-1)).toBe(ROOT);
+    expect(argv.slice(-2)).toEqual([SCRIPT_ARGV0, ROOT]);
     const isolatedIndex = RESOLVE_RUNTIME_SCRIPT.indexOf('runtime/bin/dsh');
     const systemIndex = RESOLVE_RUNTIME_SCRIPT.indexOf('/usr/local/bin/dsh');
     expect(isolatedIndex).toBeGreaterThan(-1);
@@ -252,8 +310,6 @@ describe('supervisor isolation wiring', () => {
       nodePath: '/usr/bin/node',
       workspace: `${ROOT}/workspace`,
     });
-    // The isolated runtime is prepared before the backend is spawned.
-    expect(harness.wsl.isolationPreparations).toHaveLength(1);
     expect(harness.registry.read()).toMatchObject({ workspace: `${ROOT}/workspace` });
   });
 
@@ -274,15 +330,15 @@ describe('supervisor isolation wiring', () => {
   });
 
   it('honours a custom isolation root', async () => {
-    const harness = createHarness({ config: { runtimeRoot: '~/r02-sandbox' } });
+    const harness = createHarness({ config: { runtimeRoot: '~/r02/sandbox' } });
     const supervisor = new Supervisor(harness.deps);
 
     await supervisor.start();
 
-    expect(harness.wsl.isolationPreparations).toEqual(['~/r02-sandbox']);
+    expect(harness.wsl.isolationPreparations).toEqual(['~/r02/sandbox']);
     expect(harness.wsl.starts[0]).toMatchObject({
-      isolationRoot: '~/r02-sandbox',
-      workspace: '~/r02-sandbox/workspace',
+      isolationRoot: '~/r02/sandbox',
+      workspace: '~/r02/sandbox/workspace',
     });
   });
 
@@ -326,42 +382,58 @@ describe('isolation configuration', () => {
   });
 
   it('normalizes persisted values and rejects unsafe roots', () => {
-    const normalized = normalizeConfig({ isolateEnvironment: 'yes', runtimeRoot: '/srv/a;b' });
-    expect(normalized.isolateEnvironment).toBe(true);
-    expect(normalized.runtimeRoot).toBe(ISOLATION_ROOT_DEFAULT);
-
-    const off = normalizeConfig({ isolateEnvironment: false, runtimeRoot: '/srv/sandbox' });
+    for (const stored of ['/', '~', '~/x', '/srv/a;b', '~/a/../b']) {
+      const normalized = normalizeConfig({ isolateEnvironment: true, runtimeRoot: stored });
+      expect(normalized.runtimeRoot).toBe(ISOLATION_ROOT_DEFAULT);
+    }
+    const off = normalizeConfig({ isolateEnvironment: false, runtimeRoot: '/srv/sandbox/wsl-web-shell' });
     expect(off.isolateEnvironment).toBe(false);
-    expect(off.runtimeRoot).toBe('/srv/sandbox');
+    expect(off.runtimeRoot).toBe('/srv/sandbox/wsl-web-shell');
   });
 
   it('validates patches field by field', () => {
-    const bad = applyConfigPatch(DEFAULT_CONFIG, { isolateEnvironment: 'no' as unknown as boolean, runtimeRoot: '../x' });
+    const bad = applyConfigPatch(DEFAULT_CONFIG, { isolateEnvironment: 'no' as unknown as boolean, runtimeRoot: '/srv' });
     expect(bad.errors).toContain('isolateEnvironment: expected a boolean');
-    expect(bad.errors).toContain('runtimeRoot: expected a POSIX path such as ~/.local/share/wsl-web-shell');
+    expect(bad.errors).toContain('runtimeRoot: expected a dedicated POSIX path such as ~/.local/share/wsl-web-shell');
     expect(bad.changed).toBe(false);
 
-    const good = applyConfigPatch(DEFAULT_CONFIG, { runtimeRoot: '~/sandbox', isolateEnvironment: true });
+    const good = applyConfigPatch(DEFAULT_CONFIG, { runtimeRoot: '~/sandbox/app', isolateEnvironment: true });
     expect(good.errors).toEqual([]);
-    expect(good.config.runtimeRoot).toBe('~/sandbox');
+    expect(good.config.runtimeRoot).toBe('~/sandbox/app');
     expect(good.changed).toBe(true);
   });
 
   it('requires a backend restart when the environment changes', () => {
-    const next = applyConfigPatch(DEFAULT_CONFIG, { runtimeRoot: '~/other' }).config;
+    const next = applyConfigPatch(DEFAULT_CONFIG, { runtimeRoot: '~/other/app' }).config;
     expect(requiresRestart(DEFAULT_CONFIG, next)).toBe(true);
     expect(requiresRestart(DEFAULT_CONFIG, applyConfigPatch(DEFAULT_CONFIG, { openOnLaunch: false }).config)).toBe(false);
   });
 });
 
+/* -------------------------------------------------------------------------- */
+/* Real script execution inside a disposable sandbox                          */
+/* -------------------------------------------------------------------------- */
+
 const shellAvailable = process.platform !== 'win32' && existsSync('/bin/bash') && existsSync('/bin/sh');
+const isRootUser = typeof process.getuid === 'function' && process.getuid() === 0;
+
+function sandbox(): string {
+  return mkdtempSync(join(tmpdir(), 'wss-sbx-'));
+}
 
 /** Run a launcher script exactly as `wsl.exe --exec /bin/bash -c` would. */
-function runScript(script: string, args: string[], home: string) {
+function runScript(script: string, args: string[], home: string, cwd = home) {
   return spawnSync('/bin/bash', ['-c', script, ...args], {
     encoding: 'utf8',
+    cwd,
     env: { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: home },
   });
+}
+
+function writeStub(path: string, body: string): string {
+  writeFileSync(path, body);
+  chmodSync(path, 0o755);
+  return path;
 }
 
 describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
@@ -373,15 +445,18 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
     }
   });
 
-  it('prepares exactly the planned directories below a temporary home', () => {
-    const home = mkdtempSync(join(tmpdir(), 'wss-prep-'));
+  it('creates exactly the planned tree inside the sandbox home', () => {
+    const home = sandbox();
     try {
       const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
       expect(result.stderr).toBe('');
       expect(result.status).toBe(0);
       const root = join(home, '.local/share/wsl-web-shell');
+      expect(result.stdout.trim()).toBe(root);
       expect(readdirSync(root).sort()).toEqual(['agents', 'cache', 'dsh-home', 'runtime', 'tmp', 'workspace']);
       expect(readdirSync(join(root, 'runtime'))).toEqual(['bin']);
+      expect(statSync(root).mode & 0o777).toBe(0o700);
+      expect(statSync(join(root, 'dsh-home')).mode & 0o777).toBe(0o700);
       // Nothing outside the root was created.
       expect(readdirSync(home)).toEqual(['.local']);
     } finally {
@@ -389,25 +464,132 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
     }
   });
 
-  it('refuses a non-POSIX root argument without creating anything', () => {
-    const home = mkdtempSync(join(tmpdir(), 'wss-prep-bad-'));
+  it('honours a custom absolute root inside the sandbox', () => {
+    const home = sandbox();
     try {
-      const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, 'relative/root'], home);
-      expect(result.status).toBe(64);
-      expect(readdirSync(home)).toEqual([]);
+      const root = join(home, 'custom/app-root');
+      const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, root], home);
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe(root);
+      expect(existsSync(join(root, 'dsh-home'))).toBe(true);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it('delivers the isolated environment to the backend process', () => {
-    const home = mkdtempSync(join(tmpdir(), 'wss-start-'));
+  it('preserves pre-existing content and never removes anything', () => {
+    const home = sandbox();
     try {
-      const stub = join(home, 'dsh-stub');
-      writeFileSync(
-        stub,
+      const root = join(home, '.local/share/wsl-web-shell');
+      mkdirSync(join(root, 'dsh-home'), { recursive: true });
+      writeFileSync(join(root, 'dsh-home', 'keep.yaml'), 'user data\n');
+      writeFileSync(join(root, 'notes.txt'), 'notes\n');
+
+      const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
+      expect(result.status).toBe(0);
+      expect(readFileSync(join(root, 'dsh-home', 'keep.yaml'), 'utf8')).toBe('user data\n');
+      expect(readFileSync(join(root, 'notes.txt'), 'utf8')).toBe('notes\n');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects root-like, traversal and malformed roots without writing anything', () => {
+    const cases: { root: string; code: number }[] = [
+      { root: '/', code: 66 },
+      { root: '~', code: 66 },
+      { root: '~/', code: 66 },
+      { root: '~/x', code: 66 },
+      { root: 'relative/root', code: 64 },
+      { root: '/srv/bad root', code: 64 },
+      { root: '/srv/a;rm -rf /', code: 64 },
+      { root: '~/.local/../secret', code: 66 },
+      { root: '/srv/./app', code: 66 },
+      { root: '/srv//app', code: 66 },
+    ];
+    for (const testCase of cases) {
+      const home = sandbox();
+      try {
+        const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, testCase.root], home);
+        expect(result.status, `root=${testCase.root}`).toBe(testCase.code);
+        expect(readdirSync(home), `root=${testCase.root}`).toEqual([]);
+        if (!isRootUser) {
+          // The filesystem-level guard never runs: nothing was created outside.
+          expect(existsSync('/runtime')).toBe(false);
+          expect(existsSync('/dsh-home')).toBe(false);
+        }
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('refuses a symlinked isolation root', () => {
+    const home = sandbox();
+    try {
+      const outside = join(home, 'outside');
+      mkdirSync(outside);
+      const root = join(home, '.local/share/wsl-web-shell');
+      mkdirSync(join(home, '.local/share'), { recursive: true });
+      symlinkSync(outside, root);
+
+      const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
+      expect(result.status).toBe(67);
+      expect(readdirSync(outside)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a symlink anywhere between the home and the root', () => {
+    const home = sandbox();
+    try {
+      const outside = join(home, 'outside');
+      mkdirSync(outside);
+      mkdirSync(join(home, '.local'));
+      symlinkSync(outside, join(home, '.local/share'));
+
+      const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
+      expect(result.status).toBe(67);
+      expect(readdirSync(outside)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a symlinked managed subdirectory instead of writing through it', () => {
+    for (const managed of ['agents', 'dsh-home', 'cache', 'tmp', 'workspace', 'runtime']) {
+      const home = sandbox();
+      try {
+        const outside = join(home, 'outside');
+        mkdirSync(outside);
+        const root = join(home, '.local/share/wsl-web-shell');
+        mkdirSync(root, { recursive: true });
+        symlinkSync(outside, join(root, managed));
+
+        const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
+        expect(result.status, `managed=${managed}`).toBe(67);
+        expect(readdirSync(outside), `managed=${managed}`).toEqual([]);
+        // Other managed directories are still absent: the run stopped early.
+        expect(existsSync(join(root, 'workspace'))).toBe(managed === 'workspace');
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('delivers the isolated environment and the working directory to the backend', () => {
+    const home = sandbox();
+    try {
+      expect(runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home).status).toBe(0);
+      const project = join(home, 'projects/demo');
+      mkdirSync(project, { recursive: true });
+
+      const stub = writeStub(
+        join(home, 'dsh-stub'),
         [
           '#!/bin/sh',
+          'printf "PWD=%s\\n" "$PWD"',
           'printf "DSH_HOME=%s\\n" "$DSH_HOME"',
           'printf "DSH_AGENTS_HOME=%s\\n" "$DSH_AGENTS_HOME"',
           'printf "XDG_CACHE_HOME=%s\\n" "$XDG_CACHE_HOME"',
@@ -417,9 +599,12 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
           'printf "ARGS=%s\\n" "$*"',
         ].join('\n'),
       );
-      chmodSync(stub, 0o755);
 
-      const result = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ROOT, '/usr/bin/node'], home);
+      const result = runScript(
+        START_WRAPPER_SCRIPT,
+        [stub, '127.0.0.1', '3080', ROOT, '/usr/bin/node', '~/projects/demo'],
+        home,
+      );
       expect(result.stderr).toBe('');
       expect(result.status).toBe(0);
 
@@ -427,49 +612,137 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
       const lines = result.stdout.trim().split('\n');
       expect(lines[0]).toContain('__dsh_web_shell_pid__');
       const env = Object.fromEntries(lines.slice(1).map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+      expect(env.PWD).toBe(project);
       expect(env.DSH_HOME).toBe(join(root, 'dsh-home'));
       expect(env.DSH_AGENTS_HOME).toBe(join(root, 'agents'));
       expect(env.XDG_CACHE_HOME).toBe(join(root, 'cache'));
       expect(env.TMPDIR).toBe(join(root, 'tmp'));
       expect(env.ISOLATION_ROOT).toBe(root);
-      // Isolated runtime first, then the resolved node directory.
       expect(env.PATH?.startsWith(`${join(root, 'runtime/bin')}:/usr/bin:`)).toBe(true);
-      // The backend still receives the documented web arguments.
       expect(env.ARGS).toBe('web --host 127.0.0.1 --port 3080 --no-open');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
 
-  it('leaves the environment untouched when isolation is disabled', () => {
-    const home = mkdtempSync(join(tmpdir(), 'wss-start-off-'));
+  it('enters the isolated workspace when the configured workspace is ~', () => {
+    const home = sandbox();
     try {
-      const stub = join(home, 'dsh-stub');
-      writeFileSync(stub, '#!/bin/sh\nprintf "DSH_HOME=%s|ROOT=%s|PATH=%s\\n" "${DSH_HOME:-unset}" "${WSL_WEB_SHELL_ISOLATION_ROOT:-unset}" "$PATH"');
-      chmodSync(stub, 0o755);
+      expect(runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home).status).toBe(0);
+      const stub = writeStub(join(home, 'dsh-stub'), '#!/bin/sh\npwd\n');
+      const result = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ROOT, '-', '~'], home);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(join(home, '.local/share/wsl-web-shell/workspace'));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
-      const result = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ISOLATION_DISABLED, ISOLATION_DISABLED], home);
+  it('refuses to start in a missing or non-directory workspace', () => {
+    const home = sandbox();
+    try {
+      expect(runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home).status).toBe(0);
+      const marker = join(home, 'backend-started');
+      const stub = writeStub(join(home, 'dsh-stub'), `#!/bin/sh\n: > "${marker}"\n`);
+
+      const missing = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ROOT, '-', '~/nope'], home);
+      expect(missing.status).toBe(65);
+      expect(missing.stderr).toContain('workspace directory not found');
+      expect(existsSync(marker)).toBe(false);
+
+      writeFileSync(join(home, 'afile'), 'x');
+      const notDir = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ROOT, '-', '~/afile'], home);
+      expect(notDir.status).toBe(65);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a malformed workspace argument', () => {
+    const home = sandbox();
+    try {
+      const stub = writeStub(join(home, 'dsh-stub'), '#!/bin/sh\nexit 0\n');
+      const result = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ISOLATION_DISABLED, '-', 'relative/dir'], home);
+      expect(result.status).toBe(64);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to launch when the isolated environment is missing or a symlink', () => {
+    const home = sandbox();
+    try {
+      const stub = writeStub(join(home, 'dsh-stub'), '#!/bin/sh\nexit 0\n');
+
+      const missing = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ROOT, '-', '~'], home);
+      expect(missing.status).toBe(67);
+
+      expect(runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home).status).toBe(0);
+      const root = join(home, '.local/share/wsl-web-shell');
+      rmSync(join(root, 'agents'), { recursive: true, force: true });
+      const outside = join(home, 'outside');
+      mkdirSync(outside);
+      symlinkSync(outside, join(root, 'agents'));
+
+      const linked = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ROOT, '-', '~'], home);
+      expect(linked.status).toBe(67);
+      expect(readdirSync(outside)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an unsafe isolation root before starting the backend', () => {
+    const home = sandbox();
+    try {
+      const marker = join(home, 'backend-started');
+      const stub = writeStub(join(home, 'dsh-stub'), `#!/bin/sh\n: > "${marker}"\n`);
+      for (const [root, code] of [
+        ['/', 66],
+        ['~', 66],
+        ['~/x', 66],
+        ['/srv/../etc', 66],
+        ['relative', 64],
+      ] as [string, number][]) {
+        const result = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', root, '-', '~'], home);
+        expect(result.status, `root=${root}`).toBe(code);
+      }
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves the environment untouched when isolation is disabled', () => {
+    const home = sandbox();
+    try {
+      const stub = writeStub(
+        join(home, 'dsh-stub'),
+        '#!/bin/sh\nprintf "DSH_HOME=%s|ROOT=%s|PWD=%s\\n" "${DSH_HOME:-unset}" "${WSL_WEB_SHELL_ISOLATION_ROOT:-unset}" "$PWD"',
+      );
+      const result = runScript(START_WRAPPER_SCRIPT, [stub, '127.0.0.1', '3080', ISOLATION_DISABLED, '-', '~'], home);
       expect(result.status).toBe(0);
       const line = result.stdout.trim().split('\n')[1] ?? '';
       expect(line).toContain('DSH_HOME=unset');
       expect(line).toContain('ROOT=unset');
-      expect(line).not.toContain(join(home, '.local'));
+      expect(line).toContain(`PWD=${home}`);
+      expect(line).not.toContain('wsl-web-shell/dsh-home');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   });
 
   it('resolves the isolated dsh before any system install', () => {
-    const home = mkdtempSync(join(tmpdir(), 'wss-resolve-'));
+    const home = sandbox();
     try {
       const root = join(home, '.local/share/wsl-web-shell');
       const isolatedDsh = join(root, 'runtime/bin/dsh');
       const systemDsh = join(home, '.local/bin/dsh');
-      spawnSync('mkdir', ['-p', join(root, 'runtime/bin'), join(home, '.local/bin')]);
-      writeFileSync(isolatedDsh, '#!/bin/sh\nexit 0\n');
-      writeFileSync(systemDsh, '#!/bin/sh\nexit 0\n');
-      chmodSync(isolatedDsh, 0o755);
-      chmodSync(systemDsh, 0o755);
+      mkdirSync(join(root, 'runtime/bin'), { recursive: true });
+      mkdirSync(join(home, '.local/bin'), { recursive: true });
+      writeStub(isolatedDsh, '#!/bin/sh\nexit 0\n');
+      writeStub(systemDsh, '#!/bin/sh\nexit 0\n');
 
       const result = runScript(RESOLVE_RUNTIME_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
       expect(result.status).toBe(0);
@@ -487,19 +760,10 @@ describe.skipIf(!shellAvailable)('single-argument scripts receive their paramete
     const argv = buildProbeProcessArgs('Ubuntu', process.pid);
     const tail = argv.slice(argv.indexOf(PROBE_PROCESS_SCRIPT) + 1);
     expect(tail).toEqual([SCRIPT_ARGV0, String(process.pid)]);
-    // Run the exact script against this very process.
     const result = spawnSync('/bin/sh', ['-c', PROBE_PROCESS_SCRIPT, ...tail], { encoding: 'utf8' });
     expect(result.status).toBe(0);
     const probe = parseProcessProbe(result.stdout);
     expect(probe?.startTime).toMatch(/^\d+$/);
     expect(probe?.cmdline.trim().length).toBeGreaterThan(0);
-  });
-
-  it('passes the isolation root after the fixed $0 label', () => {
-    const argv = buildPrepareIsolationArgs('Ubuntu', ROOT);
-    expect(argv.slice(-2)).toEqual([SCRIPT_ARGV0, ROOT]);
-    const resolveArgv = buildResolveRuntimeArgs('Ubuntu', ROOT);
-    expect(resolveArgv.slice(-2)).toEqual([SCRIPT_ARGV0, ROOT]);
-    expect(buildResolveRuntimeArgs('Ubuntu', null).at(-1)).toBe(ISOLATION_DISABLED);
   });
 });

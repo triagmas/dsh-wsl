@@ -18,40 +18,45 @@ export const WSL_EXE = 'wsl.exe';
  * Prints the Linux PID that will own the web server, then replaces itself with
  * the server process (same PID), so the PID we record stays valid.
  *
- * `$0` = resolved dsh path, `$1` = host, `$2` = port,
- * `$3` = isolation root (or `-`), `$4` = resolved node binary (or `-`).
+ * `$0` = resolved dsh path, `$1` = host, `$2` = port, `$3` = isolation root
+ * (or `-`), `$4` = resolved node binary (or `-`), `$5` = workspace.
  *
- * The isolation block runs inside the distribution, so `~` is expanded by the
- * Linux shell and no variable depends on `WSLENV` forwarding from Windows.
- * Every exported value is a validated positional argument, never interpolated
+ * Everything path-related happens here, inside the distribution: `~` expands
+ * against the Linux home and the working directory is entered by the shell, so
+ * the launch does not depend on `wsl.exe --cd` understanding a tilde-prefixed
+ * subpath. Every value is a validated positional argument, never interpolated
  * shell text.
+ *
+ * Exit codes: 64 malformed argument, 65 unusable workspace, 66 unsafe isolation
+ * root, 67 symlinked or missing isolation directory.
  */
 export const START_WRAPPER_SCRIPT = [
-  'root="$3"; node="$4";',
+  'dsh="$0"; host="$1"; port="$2"; root="$3"; node="$4"; ws="$5"; iroot="";',
   'if [ "$root" != "-" ]; then',
-  'case "$root" in "~") root="$HOME";; "~/"*) root="$HOME/${root#"~/"}";; /*) ;; *) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
-  'export DSH_HOME="$root/dsh-home";',
-  'export DSH_AGENTS_HOME="$root/agents";',
-  'export XDG_CACHE_HOME="$root/cache";',
-  'export TMPDIR="$root/tmp";',
-  'export WSL_WEB_SHELL_ISOLATION_ROOT="$root";',
-  'if [ "$node" != "-" ]; then export PATH="$root/runtime/bin:$(dirname "$node"):$PATH"; else export PATH="$root/runtime/bin:$PATH"; fi;',
+  'case "$root" in "~"|"~/") echo "wsl-web-shell: isolation root must be a dedicated subtree" >&2; exit 66;;',
+  '"~/"*) rz="${root#"~/"}"; rbase="$HOME";;',
+  '/*) [ "$root" = "/" ] && { echo "wsl-web-shell: isolation root must not be the filesystem root" >&2; exit 66; }; rz="${root#/}"; rbase="";;',
+  '*) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
+  'case "$rz" in *[!A-Za-z0-9._~/@+-]*) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
+  'case "/$rz/" in *"/../"*|*"/./"*|*"//"*) echo "wsl-web-shell: rejected isolation root" >&2; exit 66;; esac;',
+  'case "$rz" in */*) ;; *) echo "wsl-web-shell: isolation root must be a dedicated subtree" >&2; exit 66;; esac;',
+  'if [ -n "$rbase" ]; then iroot="$HOME/$rz"; else iroot="/$rz"; fi;',
+  '[ -d "$iroot" ] && [ ! -L "$iroot" ] || { echo "wsl-web-shell: isolation root is missing or a symlink" >&2; exit 67; };',
+  'for d in dsh-home agents cache tmp workspace; do [ -d "$iroot/$d" ] && [ ! -L "$iroot/$d" ] || { echo "wsl-web-shell: isolation directory is missing or a symlink" >&2; exit 67; }; done;',
+  'fi;',
+  'case "$ws" in "~") if [ -n "$iroot" ]; then ws="$iroot/workspace"; else ws="$HOME"; fi;; "~/"*) ws="$HOME/${ws#"~/"}";; /*) ;; *) echo "wsl-web-shell: rejected workspace" >&2; exit 64;; esac;',
+  '[ -d "$ws" ] || { echo "wsl-web-shell: workspace directory not found" >&2; exit 65; };',
+  'cd "$ws" || exit 65;',
+  'if [ -n "$iroot" ]; then',
+  'export DSH_HOME="$iroot/dsh-home";',
+  'export DSH_AGENTS_HOME="$iroot/agents";',
+  'export XDG_CACHE_HOME="$iroot/cache";',
+  'export TMPDIR="$iroot/tmp";',
+  'export WSL_WEB_SHELL_ISOLATION_ROOT="$iroot";',
+  'if [ "$node" != "-" ]; then export PATH="$iroot/runtime/bin:$(dirname "$node"):$PATH"; else export PATH="$iroot/runtime/bin:$PATH"; fi;',
   'fi;',
   'printf "%s %s\\n" "__dsh_web_shell_pid__" "$$";',
-  'exec "$0" web --host "$1" --port "$2" --no-open',
-].join(' ');
-
-/**
- * Create the isolated environment (private runtime, DSH_HOME, agents home,
- * caches, temp, workspace) before the backend starts. `mkdir -p` only touches
- * directories below the validated root; nothing is installed or removed.
- */
-export const PREPARE_ISOLATION_SCRIPT = [
-  'root="$1";',
-  'case "$root" in "~") root="$HOME";; "~/"*) root="$HOME/${root#"~/"}";; /*) ;; *) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
-  'umask 077;',
-  'for d in runtime/bin dsh-home agents cache tmp workspace; do mkdir -p "$root/$d" || exit 70; done;',
-  'printf "%s\\n" "$root"',
+  'exec "$dsh" web --host "$host" --port "$port" --no-open',
 ].join(' ');
 
 export const PID_MARKER = '__dsh_web_shell_pid__';
@@ -62,6 +67,50 @@ export const PID_MARKER = '__dsh_web_shell_pid__';
  * its real parameters from `$1`, `$2`, ...
  */
 export const SCRIPT_ARGV0 = 'wsl-web-shell';
+
+/**
+ * Create the isolated environment (private runtime, DSH_HOME, agents home,
+ * caches, temp, workspace) before the backend starts.
+ *
+ * Safety rules, all enforced before the first write:
+ * - the root must be a dedicated subtree (`/`, `~`, `~/`, `~/x`, `/x` are
+ *   rejected) with no `.`/`..`/empty segments;
+ * - no component from the home (or filesystem root) down to the root may be a
+ *   symlink, so `mkdir -p` can never be redirected outside the configured tree;
+ * - every managed subdirectory is re-checked after creation for symlinks and
+ *   canonical placement;
+ * - only `mkdir -p` is used: pre-existing content is neither changed nor
+ *   removed.
+ *
+ * Exit codes: 64 malformed argument, 66 unsafe root, 67 symlink or non-canonical
+ * placement, 70 creation failed.
+ */
+export const PREPARE_ISOLATION_SCRIPT = [
+  'root="$1";',
+  'case "$root" in',
+  '"~"|"~/") echo "wsl-web-shell: isolation root must be a dedicated subtree" >&2; exit 66;;',
+  '"~/"*) rel="${root#"~/"}"; base="$HOME";;',
+  '/*) if [ "$root" = "/" ]; then echo "wsl-web-shell: isolation root must not be the filesystem root" >&2; exit 66; fi; rel="${root#/}"; base="";;',
+  '*) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
+  'case "$root" in *[!A-Za-z0-9._~/@+-]*) echo "wsl-web-shell: rejected isolation root" >&2; exit 64;; esac;',
+  'case "/$rel/" in *"/../"*|*"/./"*|*"//"*) echo "wsl-web-shell: rejected isolation root" >&2; exit 66;; esac;',
+  'case "$rel" in */*) ;; *) echo "wsl-web-shell: isolation root must be a dedicated subtree" >&2; exit 66;; esac;',
+  'if [ -n "$base" ]; then home_real=$(cd "$HOME" && pwd -P) || exit 67; walked="$HOME"; expected="$home_real/$rel"; else walked=""; expected="/$rel"; fi;',
+  'for seg in $(printf "%s" "$rel" | tr "/" " "); do walked="$walked/$seg"; if [ -L "$walked" ]; then echo "wsl-web-shell: symlink in isolation path" >&2; exit 67; fi; done;',
+  'if [ -n "$base" ]; then [ "$expected" = "$home_real" ] && { echo "wsl-web-shell: isolation root must not be the home directory" >&2; exit 66; }; fi;',
+  'umask 077;',
+  'mkdir -p "$expected" || exit 70;',
+  '[ ! -L "$expected" ] || { echo "wsl-web-shell: isolation root is a symlink" >&2; exit 67; };',
+  'real=$(cd "$expected" && pwd -P) || exit 67;',
+  '[ "$real" = "$expected" ] || { echo "wsl-web-shell: isolation root resolves outside its configured path" >&2; exit 67; };',
+  'for d in runtime/bin dsh-home agents cache tmp workspace; do',
+  'cur="$expected"; for seg in $(printf "%s" "$d" | tr "/" " "); do cur="$cur/$seg"; if [ -L "$cur" ]; then echo "wsl-web-shell: isolation directory is a symlink" >&2; exit 67; fi; done;',
+  'mkdir -p "$expected/$d" || exit 70;',
+  '[ ! -L "$expected/$d" ] || { echo "wsl-web-shell: isolation directory is a symlink" >&2; exit 67; };',
+  '[ "$(cd "$expected/$d" && pwd -P)" = "$expected/$d" ] || { echo "wsl-web-shell: isolation directory resolves outside its configured path" >&2; exit 67; };',
+  'done;',
+  'printf "%s\\n" "$expected"',
+].join(' ');
 
 /**
  * Locate the backend executable and a node runtime inside the distribution.
@@ -129,11 +178,25 @@ export function assertPort(port: number): number {
   return port;
 }
 
+/**
+ * Workspace validation. The shell expands `~` and enters the directory, so the
+ * value must be `~`, `~/...` or absolute, with no structural or empty segments:
+ * a `..` inside a workspace path could reach outside the intended project.
+ */
 export function assertWorkspace(workspace: string): string {
   if (typeof workspace !== 'string' || workspace.length > 4096 || !POSIX_PATH_PATTERN.test(workspace)) {
     throw new ArgumentError('invalid-workspace-path');
   }
   if (workspace.includes('\\')) throw new ArgumentError('invalid-workspace-path');
+  if (/[\0\r\n\t]/.test(workspace)) throw new ArgumentError('invalid-workspace-path');
+  if (workspace === '~' || workspace === '~/') return '~';
+  const relative = workspace.startsWith('~/') ? workspace.slice(2) : workspace.startsWith('/') ? workspace.slice(1) : null;
+  if (relative === null) throw new ArgumentError('invalid-workspace-path');
+  if (relative === '') throw new ArgumentError('invalid-workspace-path');
+  const segments = relative.split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+    throw new ArgumentError('invalid-workspace-path');
+  }
   return workspace;
 }
 
@@ -193,8 +256,6 @@ export function buildStartServerArgs(options: StartServerOptions): string[] {
   return [
     '-d',
     assertDistroName(options.distro),
-    '--cd',
-    assertWorkspace(options.workspace),
     '--exec',
     '/bin/bash',
     '-c',
@@ -204,6 +265,7 @@ export function buildStartServerArgs(options: StartServerOptions): string[] {
     String(assertPort(options.port)),
     options.isolationRoot,
     options.nodePath ?? ISOLATION_DISABLED,
+    assertWorkspace(options.workspace),
   ];
 }
 

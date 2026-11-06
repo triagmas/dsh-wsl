@@ -37,8 +37,6 @@ describe('start command construction', () => {
     expect(argv).toEqual([
       '-d',
       'Ubuntu',
-      '--cd',
-      '~',
       '--exec',
       '/bin/bash',
       '-c',
@@ -48,7 +46,10 @@ describe('start command construction', () => {
       '3080',
       '-',
       '-',
+      '~',
     ]);
+    // The working directory is entered by the shell, not by `wsl.exe --cd`.
+    expect(argv).not.toContain('--cd');
     // Per-launch values never appear inside the script text.
     expect(START_WRAPPER_SCRIPT).not.toContain('3080');
     expect(START_WRAPPER_SCRIPT).not.toContain('Ubuntu');

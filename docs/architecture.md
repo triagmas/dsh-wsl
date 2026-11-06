@@ -48,21 +48,48 @@ below it (`src/main/core/isolation.ts`):
 | `<root>/cache`, `<root>/tmp` | `XDG_CACHE_HOME`, `TMPDIR` |
 | `<root>/workspace` | test workspace used when the configured workspace is the bare `~` |
 
-Directory preparation (`mkdir -p`, `umask 077`) is the only write the shell ever
-performs inside the distribution, and it is confined to the root. The root is
-validated against a strict charset (no spaces, quotes, `$`, `;`, `|`, `..`), so a
-value can never be re-parsed by `wsl.exe`, `env` or a shell as another command.
+**Root rules.** The root must be a dedicated, application-owned subtree at least
+two components deep. `/`, `~`, `~/`, `~/x`, `/srv`, `~user/...`, empty or
+repeated separators, `.`/`..` segments and any shell-significant character
+(space, quote, `$`, `;`, `|`, `&`, backslash) are rejected in the TypeScript
+validator **and** again inside the distribution before the first write. A root
+equal to the home directory is rejected as well. Trailing slashes are normalised
+away so the launcher and the plan always see the same string.
 
-Variables are exported **inside** the distribution by the start wrapper, so
-`~` expands against the Linux home and nothing depends on `WSLENV` forwarding
-from Windows. The wrapper also prefixes `PATH` with the isolated runtime and the
-resolved `node` binary, which makes resolution deterministic instead of
-inheriting whatever the user's shell profile happens to contain. `dsh` is
-resolved read-only in the same pass, preferring `<root>/runtime/bin/dsh` over
-system installs; an explicit `dshPath` still wins, and a missing `dsh` stays a
-hard `ERROR` (the app never installs packages).
+**Symlink rules.** Before anything is created, every component from the home
+directory (or from `/` for absolute roots) down to the root is checked with
+`-L`; the root itself and every managed subdirectory are re-checked before and
+after `mkdir -p`, and each created directory must canonicalise to its expected
+path (`cd … && pwd -P`). A symlink anywhere in that chain fails the launch with
+its own exit code instead of silently redirecting writes outside the tree.
 
-### Window and tray state
+**Preparation** (`mkdir -p`, `umask 077`) is the only write the shell performs
+inside the distribution, it is confined to the validated root, and it never
+changes or removes pre-existing content — an existing `dsh-home` keeps its files
+and modes.
+
+**Environment delivery.** Variables are exported *inside* the distribution by the
+start wrapper, so `~` expands against the Linux home and nothing depends on
+`WSLENV` forwarding from Windows. `PATH` is prefixed with the isolated runtime and
+the resolved `node`, making resolution deterministic instead of inheriting an
+arbitrary shell profile. The wrapper re-validates the root and re-checks the four
+managed directories, so it can never launch against a root that changed after
+preparation.
+
+**Working directory.** `wsl.exe --cd` is not used: whether it expands a
+tilde-prefixed subpath depends on the WSL build, and the shell has to resolve
+`~` anyway. The wrapper enters the workspace itself (`cd`), treating `~` as the
+isolated workspace when isolation is on, and fails with a distinct message when
+the directory is missing or is not a directory. Workspace values with `.`/`..`
+segments or empty components are rejected.
+
+**Limits — this is not an OS sandbox.** Isolation covers environment variables,
+the npm prefix, caches and temp files. npm lifecycle scripts, `dsh` tools and any
+command the WebUI user starts still run with the owner's Linux user permissions;
+nothing prevents such a process from writing elsewhere in the distribution. The
+guarantee is scoped to what this app itself creates and launches.
+
+### Window and tray state### Window and tray state
 
 Window `show`/`hide` events feed `Supervisor.markHidden()`, so `READY` and
 `HIDDEN_IN_TRAY` always reflect what the user sees; closing the window (X) moves

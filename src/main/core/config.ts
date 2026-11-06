@@ -92,7 +92,7 @@ export function applyConfigPatch(current: AppConfig, patch: ConfigPatch): PatchR
   }
   if (patch.runtimeRoot !== undefined) {
     if (isValidIsolationRoot(patch.runtimeRoot)) next.runtimeRoot = patch.runtimeRoot;
-    else errors.push('runtimeRoot: expected a POSIX path such as ~/.local/share/wsl-web-shell');
+    else errors.push('runtimeRoot: expected a dedicated POSIX path such as ~/.local/share/wsl-web-shell');
   }
   if (patch.openOnLaunch !== undefined) {
     if (typeof patch.openOnLaunch === 'boolean') next.openOnLaunch = patch.openOnLaunch;

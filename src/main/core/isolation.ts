@@ -21,12 +21,57 @@ export const ISOLATION_DISABLED = '-';
  */
 const SAFE_PATH = /^[A-Za-z0-9._~/@+-]+$/;
 
+/**
+ * Every isolation root must be a dedicated, application-owned subtree, so at
+ * least this many path components below `~` or below `/`. This rejects `/`,
+ * `~`, `~/`, `~/x` and `/srv`, which would place `runtime/`, `dsh-home/` and
+ * `agents/` next to unrelated data.
+ */
+export const ISOLATION_ROOT_MIN_DEPTH = 2;
+
+/** Segments that are structural rather than literal directory names. */
+const RESERVED_SEGMENTS = new Set(['.', '..']);
+
+interface RootPath {
+  /** `home` for `~`-relative values, `absolute` for `/...`. */
+  base: 'home' | 'absolute';
+  /** Literal segments, never empty. */
+  segments: string[];
+}
+
+function parseRoot(value: unknown): RootPath | null {
+  if (typeof value !== 'string') return null;
+  if (value.length < 1 || value.length > 512) return null;
+  const trimmed = value.length > 1 && value.endsWith('/') ? value.replace(/\/+$/, '') : value;
+  if (trimmed === '' || !SAFE_PATH.test(trimmed)) return null;
+
+  if (trimmed === '~') return { base: 'home', segments: [] };
+  if (trimmed.startsWith('~/')) {
+    const segments = trimmed.slice(2).split('/');
+    if (segments.some((segment) => segment === '' || RESERVED_SEGMENTS.has(segment))) return null;
+    return { base: 'home', segments };
+  }
+  if (!trimmed.startsWith('/')) return null;
+  const segments = trimmed.split('/').filter((segment) => segment !== '');
+  if (segments.some((segment) => RESERVED_SEGMENTS.has(segment))) return null;
+  // Reject `//` anywhere: a redundant separator must not hide a component.
+  if (trimmed.startsWith('//') || /\/\//.test(trimmed)) return null;
+  return { base: 'absolute', segments };
+}
+
+/**
+ * A usable isolation root: a dedicated subtree at least {@link
+ * ISOLATION_ROOT_MIN_DEPTH} levels deep, without structural or empty segments.
+ * `/`, `~`, `~/`, `~/x`, `/srv` and any `..`/`.`/`//` form are rejected.
+ */
 export function isValidIsolationRoot(value: unknown): value is string {
-  if (typeof value !== 'string') return false;
-  if (value.length < 1 || value.length > 512) return false;
-  if (!(value === '~' || value.startsWith('~/') || value.startsWith('/'))) return false;
-  if (!SAFE_PATH.test(value)) return false;
-  return !value.split('/').includes('..');
+  const parsed = parseRoot(value);
+  return parsed !== null && parsed.segments.length >= ISOLATION_ROOT_MIN_DEPTH;
+}
+
+/** Canonical form used by the launcher (trailing slashes removed). */
+export function normalizeIsolationRoot(value: string): string {
+  return value.length > 1 ? value.replace(/\/+$/, '') : value;
 }
 
 /** Absolute POSIX path, same charset rules. Used for the resolved node binary. */
@@ -60,12 +105,8 @@ export interface IsolationPlan {
   workspace: string;
 }
 
-function trimRoot(root: string): string {
-  return root.length > 1 && root.endsWith('/') ? root.slice(0, -1) : root;
-}
-
 export function buildIsolationPlan(options: { enabled: boolean; root: string }): IsolationPlan {
-  const root = trimRoot(options.root === '' ? ISOLATION_ROOT_DEFAULT : options.root);
+  const root = normalizeIsolationRoot(options.root === '' ? ISOLATION_ROOT_DEFAULT : options.root);
   if (options.enabled && !isValidIsolationRoot(root)) {
     throw new Error('invalid-isolation-root');
   }
