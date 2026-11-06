@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import type { Logger } from '../core/logger.js';
 import type { ShellStatus } from '../../shared/types.js';
 import { decideNavigation, decidePermission, decideWindowOpen } from '../core/navigation.js';
+import type { WindowEventContext, WindowEventName, WindowSurface } from '../core/diagnostics.js';
 
 export const PARTITION = 'persist:wsl-web-shell';
 
@@ -24,6 +25,14 @@ export interface WindowsOptions {
   onExternalLink(url: string): void;
   /** Window shown/hidden by the user (close to tray, tray open). */
   onVisibilityChanged(visible: boolean): void;
+  /**
+   * Visibility/close events of the app-owned windows, already reduced to
+   * booleans and enumerated causes so they can be logged without page content.
+   */
+  onWindowEvent?(context: Omit<WindowEventContext, 'quitting' | 'sessionEnding'> & {
+    surface: WindowSurface;
+    event: WindowEventName;
+  }): void;
 }
 
 export interface SplashOptions {
@@ -114,18 +123,29 @@ export class Windows {
     });
 
     window.on('close', (event) => {
+      this.reportWindowEvent('main', 'close-requested', window);
       // Close always hides to tray; only the explicit Quit path destroys it.
       if (this.quitting) return;
       event.preventDefault();
       window.hide();
     });
-    window.on('show', () => this.options.onVisibilityChanged(true));
-    window.on('hide', () => this.options.onVisibilityChanged(false));
+    // Windows only: logoff/shutdown is announced before windows are closed, so
+    // an OS-initiated close can be told apart from a user click on X.
+    window.on('session-end', () => this.reportWindowEvent('main', 'session-end', window));
+    window.on('show', () => {
+      this.reportWindowEvent('main', 'shown', window);
+      this.options.onVisibilityChanged(true);
+    });
+    window.on('hide', () => {
+      this.reportWindowEvent('main', 'hidden', window);
+      this.options.onVisibilityChanged(false);
+    });
     window.on('minimize', () => {
       // Minimised is not "hidden in tray": supervision state must not change.
       this.options.log.debug('window minimized');
     });
     window.on('closed', () => {
+      this.reportWindowEvent('main', 'closed', window);
       this.main = null;
     });
     this.main = window;
@@ -229,10 +249,30 @@ export class Windows {
       if (options.activate) window.show();
       if (this.status !== null) this.publishStatus(this.status);
     });
+    window.on('show', () => this.reportWindowEvent('splash', 'shown', window));
+    window.on('hide', () => this.reportWindowEvent('splash', 'hidden', window));
+    window.on('close', () => this.reportWindowEvent('splash', 'close-requested', window));
     window.on('closed', () => {
+      this.reportWindowEvent('splash', 'closed', window);
       this.splash = null;
     });
     this.splash = window;
+  }
+
+  /** Diagnostics only: never throws, never carries window content. */
+  private reportWindowEvent(
+    surface: WindowSurface,
+    event: WindowEventName,
+    window: BrowserWindow,
+  ): void {
+    const report = this.options.onWindowEvent;
+    if (report === undefined) return;
+    try {
+      if (window.isDestroyed()) return;
+      report({ surface, event, visible: window.isVisible(), focused: window.isFocused() });
+    } catch {
+      // Diagnostics must never affect window behaviour.
+    }
   }
 
   /** Hide the overlay without destroying it (window sent to tray). */

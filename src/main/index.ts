@@ -7,6 +7,13 @@
 import { app, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
 import { join } from 'node:path';
 import { applyConfigPatch, requiresRestart } from './core/config.js';
+import {
+  CLEAN_SHUTDOWN_MARKER,
+  describeChildProcessGone,
+  describeError,
+  describeWindowEvent,
+  summarizePreviousSession,
+} from './core/diagnostics.js';
 import { createLogger } from './core/logger.js';
 import { probePort } from './core/port.js';
 import { createFileRegistry } from './core/registry.js';
@@ -39,7 +46,40 @@ async function bootstrap(): Promise<void> {
   const userData = app.getPath('userData');
   const logPath = join(userData, 'logs', 'app.log');
   const log = createLogger(logPath);
+  // Read the tail before this run writes anything: it is the previous run's
+  // last words. A missing shutdown marker means it did not exit through the
+  // app's own quit path (external kill, power loss, native fault).
+  const previousSession = summarizePreviousSession(log.tail(10).split('\n'));
   log.info(`wsl-web-shell ${app.getVersion()} starting (pid=${process.pid})`);
+  if (previousSession.lastEvent !== '') {
+    log.info(
+      previousSession.clean
+        ? `previous session: clean shutdown (last event: ${previousSession.lastEvent})`
+        : `previous session: ended without a clean shutdown (last event: ${previousSession.lastEvent})`,
+    );
+  }
+
+  /**
+   * Fatal main-process faults used to end the app silently. The outcome stays
+   * fatal on purpose; only the cause is now recorded (message only — never a
+   * stack, a token or a user path).
+   */
+  const reportFatal = (kind: string, error: unknown): void => {
+    log.error(`${kind}: ${describeError(error)}`);
+    process.exit(1);
+  };
+  process.on('uncaughtException', (error: unknown) => reportFatal('uncaught exception', error));
+  process.on('unhandledRejection', (reason: unknown) => reportFatal('unhandled rejection', reason));
+  app.on('child-process-gone', (_event, details) => {
+    log.error(describeChildProcessGone(details));
+  });
+  app.on('quit', (_event, exitCode) => {
+    log.info(`app quit (exit code=${exitCode})`);
+  });
+
+  // Windows announces logoff/shutdown on the window before closing it: without
+  // this flag an OS-initiated close would look like the user clicking X.
+  let sessionEnding = false;
 
   const configStore = createConfigStore(join(userData, 'config.json'));
   let config: AppConfig = configStore.load();
@@ -73,6 +113,14 @@ async function bootstrap(): Promise<void> {
       // The splash is an overlay of this window: it leaves with it.
       if (!visible) windows.hideSplash();
       tray?.update(supervisor.getStatus(), visible);
+    },
+    onWindowEvent: (context) => {
+      if (context.event === 'session-end') {
+        sessionEnding = true;
+        log.info('system session end announced');
+        return;
+      }
+      log.info(describeWindowEvent({ ...context, quitting, sessionEnding }));
     },
   });
 
@@ -170,6 +218,8 @@ async function bootstrap(): Promise<void> {
         log.error(`shutdown failed: ${error instanceof Error ? error.message : 'unknown'}`);
       })
       .finally(() => {
+        // Marker read by the next start to separate a clean exit from a kill.
+        log.info(CLEAN_SHUTDOWN_MARKER);
         windows.destroyAll();
         app.quit();
       });
