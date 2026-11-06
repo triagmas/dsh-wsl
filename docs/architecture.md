@@ -89,7 +89,7 @@ command the WebUI user starts still run with the owner's Linux user permissions;
 nothing prevents such a process from writing elsewhere in the distribution. The
 guarantee is scoped to what this app itself creates and launches.
 
-### Window and tray state### Window and tray state
+### Window and tray state
 
 Window `show`/`hide` events feed `Supervisor.markHidden()`, so `READY` and
 `HIDDEN_IN_TRAY` always reflect what the user sees; closing the window (X) moves
