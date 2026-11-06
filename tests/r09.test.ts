@@ -135,6 +135,19 @@ describe('main process wiring', () => {
     expect(block).toContain('windows.openExternal');
   });
 
+  it('pushes status to every window that renders it, including the popover', () => {
+    const block = windowsSource.slice(
+      windowsSource.indexOf('publishStatus(status: ShellStatus)'),
+      windowsSource.indexOf('publishVersions'),
+    );
+    for (const surface of ['this.main', 'this.splash', 'this.settings', 'this.popover']) {
+      expect(block).toContain(surface);
+    }
+    // The popover renders `shell:status` through its preload, so a status that is
+    // published while it is open must reach it.
+    expect(preloadPopover).toContain("'shell:status'");
+  });
+
   it('never downloads, installs or upgrades DSH', () => {
     for (const source of [indexSource, windowsSource, read('src/main/backend/github-versions.ts')]) {
       expect(source).not.toMatch(/npm install/);

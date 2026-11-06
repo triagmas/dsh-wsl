@@ -50,6 +50,11 @@ jobs:
           sudo apt-get install -y -qq xvfb
           npm run chrome:smoke
 
+      # Builds the real Windows/WebContentsView composition against a local test
+      # server: bar geometry, WebUI bounds, resize and session continuity.
+      - name: Composition smoke (real window + view)
+        run: npm run composition:smoke
+
       - name: Upload build output
         uses: actions/upload-artifact@v4
         with:

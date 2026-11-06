@@ -55,6 +55,15 @@ goes through the unchanged `settings:save` handler, so `applyConfigPatch` valida
 restart-required detection and canonical re-rendering are the same as before. The
 popover keeps no state of its own: after a save it re-reads `settings:load`.
 
+## Live status in the popover
+
+The popover is a separate window, so it receives `shell:status` like the main and
+splash windows: `Windows.publishStatus` fans out to `main`, `splash`, `settings`
+and `popover`. Without the popover in that list it kept the state it read at open
+time — a backend that went `RECOVERING` while the popover was open still said
+"Connected". `tests/r09.test.ts` pins the fan-out list and
+`npm run composition:smoke` proves it against a real open popover window.
+
 ## Where the workspace rule lives
 
 Settings and the launcher share `src/main/core/workspace.ts` (issue #8):
@@ -83,6 +92,16 @@ Settings and the launcher share `src/main/core/workspace.ts` (issue #8):
 - `npm run chrome:smoke` — renders the shipped footer and popover under Xvfb and
   asserts 19 observable facts (labels, tone, arrow, release click, bar height,
   groups, pre-filled values, save round-trip, close). Runs in CI.
+- `npm run composition:smoke` — builds the **real** `Windows` class and drives it
+  the way the app does: a `BrowserWindow` with the footer page, the
+  `WebContentsView` on the production partition, the production preloads and
+  `computeViewBounds`. A local HTTP server stands in for `dsh web` (issues a
+  session cookie on the first request, answers 401 on a wrong one). It asserts 28
+  facts: bar height and position, distro/port/state/version labels, view origin
+  and full-width bounds ending exactly where the bar starts, no overlap, layout
+  after growing and shrinking the window, cookie stored in the app partition, a
+  forced reload reusing that cookie with no 401, and a status change reaching an
+  already open settings popover. Runs in CI.
 
 ## Deliberately out of scope
 

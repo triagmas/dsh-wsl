@@ -42,6 +42,7 @@ export default tseslint.config(
         require: 'readonly',
         module: 'writable',
         __dirname: 'readonly',
+        URL: 'readonly',
         setTimeout: 'readonly',
       },
     },

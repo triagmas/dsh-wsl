@@ -509,8 +509,11 @@ export class Windows {
 
   publishStatus(status: ShellStatus): void {
     this.status = status;
-    for (const window of [this.main, this.splash, this.settings]) {
-      if (window === null || window.isDestroyed()) continue;
+    // Every window that renders `shell:status` must be in this list, otherwise a
+    // window opened while the backend changes state keeps showing a stale label.
+    // The settings popover is a separate window and subscribes to the same channel.
+    for (const window of [this.main, this.splash, this.settings, this.popover]) {
+      if (window === null || window.isDestroyed() || window.webContents.isDestroyed()) continue;
       window.webContents.send('shell:status', status);
     }
   }
