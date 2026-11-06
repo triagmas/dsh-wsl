@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { Supervisor } from '../src/main/core/supervisor.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
 import { sanitizeForDisplay, sanitizeOptional, MAX_DISPLAY_LENGTH } from '../src/main/core/display.js';
-import { decideReadyVisibility, decideTrayOpen, shouldActivateSplash } from '../src/main/core/visibility.js';
+import { decideReadyVisibility, decideSplashPresentation, decideTrayOpen } from '../src/main/core/visibility.js';
 import { backendProbe, createHarness, lastStatus, BACKEND_PID, BACKEND_START_TIME, PORT } from './helpers.js';
 import type { OwnedServerRecord } from '../src/main/core/ownership.js';
 
@@ -26,20 +26,30 @@ const settle = (ms = 30): Promise<unknown> => new Promise((resolve) => setTimeou
 
 describe('visibility policy', () => {
   it('shows the window on the first ready state when configured', () => {
-    expect(decideReadyVisibility({ openOnLaunch: true, everShown: false, visible: false })).toBe('show');
+    expect(
+      decideReadyVisibility({ openOnLaunch: true, everShown: false, visible: false, mode: 'interactive' }),
+    ).toBe('show');
   });
 
   it('never re-shows a window the user hid', () => {
-    expect(decideReadyVisibility({ openOnLaunch: true, everShown: true, visible: false })).toBe('keep-hidden');
+    expect(
+      decideReadyVisibility({ openOnLaunch: true, everShown: true, visible: false, mode: 'interactive' }),
+    ).toBe('keep-hidden');
   });
 
   it('never hides or re-focuses an already visible window', () => {
-    expect(decideReadyVisibility({ openOnLaunch: false, everShown: true, visible: true })).toBe('keep-hidden');
+    expect(
+      decideReadyVisibility({ openOnLaunch: false, everShown: true, visible: true, mode: 'interactive' }),
+    ).toBe('keep-hidden');
   });
 
-  it('activates the splash only when the app window is on screen', () => {
-    expect(shouldActivateSplash(true)).toBe(true);
-    expect(shouldActivateSplash(false)).toBe(false);
+  it('never takes focus for a reconnect overlay, only for a user action', () => {
+    const base = { reason: 'blocked' as const, mode: 'interactive' as const, mainVisible: true };
+    expect(decideSplashPresentation({ ...base, userRequested: false })).toBe('overlay');
+    expect(decideSplashPresentation({ ...base, userRequested: true })).toBe('user');
+    expect(
+      decideSplashPresentation({ ...base, mainVisible: false, userRequested: false }),
+    ).toBe('hidden');
   });
 
   it('routes tray Open to the overlay when there is nothing loadable', () => {

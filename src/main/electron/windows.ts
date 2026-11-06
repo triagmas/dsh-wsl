@@ -11,6 +11,7 @@ import type { Logger } from '../core/logger.js';
 import type { ShellStatus } from '../../shared/types.js';
 import { decideNavigation, decidePermission, decideWindowOpen } from '../core/navigation.js';
 import type { WindowEventContext, WindowEventName, WindowSurface } from '../core/diagnostics.js';
+import { splashWindowAttributes, type SplashPresentation } from '../core/visibility.js';
 
 export const PARTITION = 'persist:wsl-web-shell';
 
@@ -33,11 +34,6 @@ export interface WindowsOptions {
     surface: WindowSurface;
     event: WindowEventName;
   }): void;
-}
-
-export interface SplashOptions {
-  /** Focus the overlay; false keeps it behind the desktop while hidden. */
-  activate: boolean;
 }
 
 export interface LoadBackendOptions {
@@ -205,20 +201,29 @@ export class Windows {
 
   /**
    * Splash doubles as the reconnect overlay while the backend recovers.
-   * When the app is hidden it is created without activation, so an always-on-top
-   * window never pops over the desktop uninvited.
+   *
+   * `user` means the user asked for the app in this action: the surface is shown
+   * and focused. `overlay` draws inside our own visible window and is shown with
+   * `showInactive()`, so a reconnect never steals focus. `hidden` creates nothing
+   * and hides a leftover overlay: a background start or a tray-mode reconnect must
+   * not put a window over the desktop.
    */
-  showSplash(options: SplashOptions): void {
+  showSplash(presentation: SplashPresentation): void {
+    if (presentation === 'hidden') {
+      this.hideSplash();
+      return;
+    }
     if (this.splash !== null && !this.splash.isDestroyed()) {
-      if (options.activate) {
+      if (presentation === 'user') {
         this.splash.show();
         this.splash.focus();
       } else {
-        this.splash.hide();
+        this.splash.showInactive();
       }
       if (this.status !== null) this.publishStatus(this.status);
       return;
     }
+    const attributes = splashWindowAttributes();
     const window = new BrowserWindow({
       width: 440,
       height: 320,
@@ -228,8 +233,8 @@ export class Windows {
       minimizable: false,
       maximizable: false,
       fullscreenable: false,
-      alwaysOnTop: true,
-      skipTaskbar: true,
+      alwaysOnTop: attributes.alwaysOnTop,
+      skipTaskbar: attributes.skipTaskbar,
       show: false,
       backgroundColor: '#0b0f16',
       title: 'WSL Web Shell',
@@ -246,7 +251,8 @@ export class Windows {
       this.options.log.error(`splash load failed: ${error instanceof Error ? error.message : 'unknown'}`);
     });
     window.once('ready-to-show', () => {
-      if (options.activate) window.show();
+      if (presentation === 'user') window.show();
+      else window.showInactive();
       if (this.status !== null) this.publishStatus(this.status);
     });
     window.on('show', () => this.reportWindowEvent('splash', 'shown', window));

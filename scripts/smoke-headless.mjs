@@ -49,7 +49,15 @@ const basePath = (process.env.PATH ?? '')
 
 const child = spawn('xvfb-run', ['-a', electronBinary, '--no-sandbox', '.'], {
   cwd: root,
-  env: { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, '.config'), PATH: basePath.join(':') },
+  // Automation mode: the app must not create or show a single window, so the
+  // smoke run can never put a surface over somebody's desktop.
+  env: {
+    ...process.env,
+    HOME: home,
+    XDG_CONFIG_HOME: join(home, '.config'),
+    PATH: basePath.join(':'),
+    WSL_WEB_SHELL_AUTOMATION: '1',
+  },
   stdio: ['ignore', 'pipe', 'pipe'],
   detached: true,
 });
@@ -112,6 +120,9 @@ const checks = [
   ['no unhandled rejection', !/UnhandledPromiseRejection/.test(output)],
   ['no uncaught exception', !/\b(TypeError|ReferenceError|SyntaxError):/.test(output)],
   ['shutdown path was reachable', /quit requested|stopping owned backend/.test(log) || result.signal === 'SIGTERM'],
+  // Issue #7: no window may appear over the desktop in an automated run.
+  ['automation mode announced', /automation mode: no windows will be shown/.test(log)],
+  ['no window was shown', !/window (main|splash) shown/.test(log)],
 ];
 
 let failed = false;
