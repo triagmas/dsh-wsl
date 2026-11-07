@@ -108,7 +108,15 @@ Start-up reading has three outcomes: **no journal** — a normal start; **a vali
 journal** — repair it; **a journal that exists but is corrupt or unreadable** —
 the record is kept, DeepSeek Harness is not started and the app opens in a
 terminal blocked state that names the file, because nothing can vouch for the
-runtime after an unknown transaction.
+runtime after an unknown transaction. "Exists" is decided with `lstat`, so a
+record behind a directory the app cannot traverse (`EACCES`/`EPERM`), a link whose
+target is gone and any other entry that cannot be inspected all count as
+unreadable, never as absent; only `ENOENT`/`ENOTDIR` mean there is no journal.
+
+A planned real integration run (success, install failure, rollback, interrupted
+update, relaunch) with its own runtime, app profile and port is described in
+[update-integration-test.md](update-integration-test.md). It has not been executed
+and requires explicit owner approval.
 
 ## Terminal window
 

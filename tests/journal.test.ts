@@ -6,8 +6,9 @@
  * tests use the real file-backed store: a write has to be durable and readable
  * back, and an impossible write has to throw instead of being logged away.
  */
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { lstat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createJournalStore, recoverInterruptedUpdate } from '../src/main/core/update-recovery.js';
@@ -122,6 +123,63 @@ describe('journal store', () => {
     }
   });
 
+  it('throws for a record whose parent directory cannot be read', async () => {
+    // Root ignores directory permissions, so this can only be asserted unprivileged.
+    const privileged = typeof process.getuid === 'function' && process.getuid() === 0;
+    const directory = await scratch();
+    const profile = join(directory, 'profile');
+    await mkdir(profile);
+    const path = join(profile, 'update-journal.json');
+    await writeFile(path, JSON.stringify(journal()), 'utf8');
+    await chmod(profile, 0o000);
+    try {
+      if (privileged) return;
+      const store = createJournalStore(path, createNullLogger());
+      // The record exists but cannot be inspected: never "absent".
+      let thrown: unknown = null;
+      try {
+        store.read();
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(UpdateJournalError);
+      expect((thrown as UpdateJournalError).reason).toBe('unreadable');
+      expect((thrown as UpdateJournalError).message).toContain('EACCES');
+    } finally {
+      await chmod(profile, 0o700);
+    }
+  });
+
+  it('throws for a link whose target is missing', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'update-journal.json');
+    await symlink(join(directory, 'gone.json'), path);
+
+    const store = createJournalStore(path, createNullLogger());
+    let thrown: unknown = null;
+    try {
+      store.read();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(UpdateJournalError);
+    expect((thrown as UpdateJournalError).reason).toBe('unreadable');
+    expect((thrown as UpdateJournalError).message).toContain('linked file does not exist');
+    // The link is kept: it is evidence of what happened in the profile.
+    expect((await lstat(path)).isSymbolicLink()).toBe(true);
+  });
+
+  it('reads a record through a valid link', async () => {
+    const directory = await scratch();
+    const target = join(directory, 'real-journal.json');
+    await writeFile(target, JSON.stringify(journal({ phase: 'staging' })), 'utf8');
+    const path = join(directory, 'update-journal.json');
+    await symlink(target, path);
+
+    const store = createJournalStore(path, createNullLogger());
+    expect(store.read()?.phase).toBe('staging');
+  });
+
   it('throws for an unreadable record', async () => {
     const directory = await scratch();
     const path = join(directory, 'update-journal.json');
@@ -194,6 +252,43 @@ describe('start-up handling of the journal states (R12.3)', () => {
     // DeepSeek Harness is never started and nothing is inspected or restored.
     expect(calls).toEqual([]);
     expect((await stat(path)).isFile()).toBe(true);
+  });
+
+  it('blocks the start when the journal sits behind an unreadable directory', async () => {
+    const privileged = typeof process.getuid === 'function' && process.getuid() === 0;
+    const directory = await scratch();
+    const profile = join(directory, 'profile');
+    await mkdir(profile);
+    const path = join(profile, 'update-journal.json');
+    await writeFile(path, JSON.stringify(journal()), 'utf8');
+    await chmod(profile, 0o000);
+    try {
+      if (privileged) return;
+      const calls: string[] = [];
+      const result = await recoverInterruptedUpdate(
+        deps(createJournalStore(path, createNullLogger()), calls),
+      );
+      expect(result.action).toBe('blocked');
+      expect(result.message).toContain('unreadable');
+      expect(calls).toEqual([]);
+    } finally {
+      await chmod(profile, 0o700);
+    }
+  });
+
+  it('blocks the start when the journal is a broken link', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'update-journal.json');
+    await symlink(join(directory, 'gone.json'), path);
+    const calls: string[] = [];
+
+    const result = await recoverInterruptedUpdate(
+      deps(createJournalStore(path, createNullLogger()), calls),
+    );
+    expect(result.action).toBe('blocked');
+    expect(result.message).toContain('linked file does not exist');
+    expect(result.message).toContain('was not started');
+    expect(calls).toEqual([]);
   });
 
   it('blocks the start and keeps the file when the journal is unreadable', async () => {

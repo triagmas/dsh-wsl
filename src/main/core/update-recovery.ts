@@ -15,7 +15,7 @@
  * The decision itself is pure (`decideRecovery` in `update.ts`); this module adds
  * the file-backed journal and the small orchestration around it.
  */
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Logger } from './logger.js';
 import type { UpdateTransition, WslGateway } from './supervisor.js';
@@ -35,6 +35,20 @@ export interface UpdateRecoveryResult {
   message: string | null;
 }
 
+function errorCode(error: unknown): string | null {
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string') return code;
+  }
+  return null;
+}
+
+function detailOf(error: unknown): string {
+  const code = errorCode(error);
+  const message = error instanceof Error ? error.message : 'unknown error';
+  return code === null ? message : `${code}: ${message}`;
+}
+
 /**
  * Journal persisted as JSON in the app profile.
  *
@@ -51,14 +65,35 @@ export interface UpdateRecoveryResult {
 export function createJournalStore(path: string, log: Logger): UpdateJournalStore {
   return {
     read(): UpdateJournal | null {
-      // Absent file: nothing to repair, this is a normal start.
-      if (!existsSync(path)) return null;
+      // `existsSync` would answer `false` for a journal behind an unreadable
+      // directory, so the entry is checked with lstat and the errno is inspected:
+      // only a genuinely missing entry may be read as "no journal".
+      try {
+        lstatSync(path);
+      } catch (error) {
+        const code = errorCode(error);
+        if (code === 'ENOENT' || code === 'ENOTDIR') {
+          // No entry, or a parent that cannot hold one: a normal start.
+          log.debug(`update journal absent (${code})`);
+          return null;
+        }
+        // EACCES/EPERM/ELOOP/... — the record may exist and cannot be inspected.
+        const detail = detailOf(error);
+        log.error(`update journal cannot be inspected: ${detail}`);
+        throw new UpdateJournalError('unreadable', path, detail);
+      }
 
       let raw: string;
       try {
         raw = readFileSync(path, 'utf8');
       } catch (error) {
-        const detail = error instanceof Error ? error.message : 'unknown error';
+        const code = errorCode(error);
+        if (code === 'ENOENT') {
+          // The entry is a link whose target is gone: the state is unknown.
+          log.error('update journal is a link to a missing file');
+          throw new UpdateJournalError('unreadable', path, 'linked file does not exist');
+        }
+        const detail = detailOf(error);
         log.error(`update journal exists but cannot be read: ${detail}`);
         throw new UpdateJournalError('unreadable', path, detail);
       }
