@@ -50,6 +50,10 @@ export class Windows {
   private main: BrowserWindow | null = null;
   /** Remote WebUI rendered above the app-owned footer bar. */
   private backendView: WebContentsView | null = null;
+  /** Geometry is reported once per window: it is the first thing to check when
+   * the remote surface looks empty (issue #11). */
+  private layoutLogged = false;
+  private displayWatchInstalled = false;
   private splash: BrowserWindow | null = null;
   private settings: BrowserWindow | null = null;
   private popover: BrowserWindow | null = null;
@@ -116,6 +120,9 @@ export class Windows {
     window.on('show', () => {
       this.reportWindowEvent('main', 'shown', window);
       this.options.onVisibilityChanged(true);
+      // A view added while the window was hidden may still have no compositor
+      // surface; re-assert it every time the window becomes visible.
+      this.syncBackendView();
     });
     window.on('hide', () => {
       this.reportWindowEvent('main', 'hidden', window);
@@ -136,6 +143,11 @@ export class Windows {
     window.on('restore', () => this.layoutMain());
     window.on('enter-full-screen', () => this.layoutMain());
     window.on('leave-full-screen', () => this.layoutMain());
+    window.on('ready-to-show', () => this.syncBackendView());
+    // The footer page can finish loading after the view was attached, which
+    // re-orders the window's own surface above the child view on some systems.
+    window.webContents.on('did-finish-load', () => this.syncBackendView());
+    this.watchDisplays();
     window.on('closed', () => {
       this.reportWindowEvent('main', 'closed', window);
       this.closeSettingsPopover();
@@ -143,9 +155,12 @@ export class Windows {
       this.main = null;
     });
     this.main = window;
+    this.layoutLogged = false;
     this.loadFooter(window);
+    // The view may already exist (created by an earlier WebUI load): attaching
+    // it here is what makes the remote page visible in this window.
     this.ensureBackendView();
-    this.layoutMain();
+    this.syncBackendView();
     return window;
   }
 
@@ -166,7 +181,10 @@ export class Windows {
    */
   private ensureBackendView(): WebContentsView {
     const existing = this.backendView;
-    if (existing !== null && !existing.webContents.isDestroyed()) return existing;
+    if (existing !== null && !existing.webContents.isDestroyed()) {
+      this.attachBackendView(existing);
+      return existing;
+    }
     const view = new WebContentsView({
       webPreferences: {
         partition: PARTITION,
@@ -225,13 +243,14 @@ export class Windows {
 
     this.backendView = view;
     this.options.log.info('webui surface created');
-    this.mainWindow?.contentView.addChildView(view);
+    this.attachBackendView(view);
     return view;
   }
 
   private destroyBackendView(): void {
     const view = this.backendView;
     this.backendView = null;
+    this.layoutLogged = false;
     if (view === null) return;
     try {
       this.mainWindow?.contentView.removeChildView(view);
@@ -250,6 +269,65 @@ export class Windows {
     const bounds = computeViewBounds(size[0] ?? 0, size[1] ?? 0);
     if (bounds.width === 0 || bounds.height === 0) return;
     view.setBounds(bounds);
+    if (!this.layoutLogged) {
+      this.layoutLogged = true;
+      this.options.log.info(
+        `webui layout: ${bounds.width}x${bounds.height} at ${bounds.x},${bounds.y} (content ${size[0]}x${size[1]})`,
+      );
+    }
+  }
+
+  /**
+   * Attach the remote surface to the current window.
+   *
+   * The view can exist before its window does: the READY path loads the WebUI
+   * before it shows anything, so the window is created afterwards. Attaching on
+   * both paths is what keeps the remote page inside the window at all (issue
+   * #11) - otherwise the window stays empty and the app-owned page shows.
+   */
+  private attachBackendView(view: WebContentsView): void {
+    const window = this.mainWindow;
+    if (window === null || view.webContents.isDestroyed()) return;
+    if (window.contentView.children.includes(view)) return;
+    window.contentView.addChildView(view);
+    this.layoutMain();
+  }
+
+  /**
+   * Re-assert the remote surface after it may have lost its compositor frame.
+   *
+   * A view that was attached while the window was still hidden, or a window
+   * whose own page finished loading afterwards, can keep an empty surface.
+   * Re-attaching makes the view the top-most child again and asks for a frame.
+   */
+  private syncBackendView(): void {
+    this.layoutMain();
+    const window = this.mainWindow;
+    const view = this.backendView;
+    if (window === null || view === null || view.webContents.isDestroyed()) return;
+    const children = window.contentView.children;
+    if (!children.includes(view)) {
+      window.contentView.addChildView(view);
+      this.layoutMain();
+      return;
+    }
+    if (children[children.length - 1] === view) return;
+    window.contentView.removeChildView(view);
+    window.contentView.addChildView(view);
+    this.layoutMain();
+  }
+
+  /**
+   * Docking a laptop or moving the window across displays with different scale
+   * factors changes the content geometry without a resize event on Windows.
+   */
+  private watchDisplays(): void {
+    if (this.displayWatchInstalled) return;
+    this.displayWatchInstalled = true;
+    const relayout = (): void => this.syncBackendView();
+    screen.on('display-metrics-changed', relayout);
+    screen.on('display-added', relayout);
+    screen.on('display-removed', relayout);
   }
 
   get settingsPopoverOpen(): boolean {

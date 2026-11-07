@@ -166,6 +166,16 @@ so no remote content ever shares a document with app chrome. The bar is never
 `alwaysOnTop`, never overlays the page and injects nothing into it
 (`docs/footer.md`).
 
+The view has a lifetime independent of the window: `READY` loads the WebUI
+before anything is shown, so on a cold start the view exists while no window
+does. `ensureBackendView()` therefore attaches the view whenever a window is
+present *and* `ensureMain()` re-attaches an already existing view, and every
+"visible again" path (show, ready-to-show, footer load, display change) calls
+`syncBackendView()`, which re-attaches missing views, keeps the WebUI the
+top-most child and re-applies `computeViewBounds`. Skipping any of those steps
+leaves a loaded but unattached surface: the backend is healthy, the bar renders
+and the window shows only the app-owned page (issue #11).
+
 Backend view: `nodeIntegration:false`, `contextIsolation:true`,
 `sandbox:true`, `webSecurity:true`, no preload, `webviewTag:false`, menu bar
 hidden, devtools available only to the developer. The main window adds no

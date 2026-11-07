@@ -107,7 +107,11 @@ npm run chrome:smoke    # Linux/WSL: render the footer and settings popover with
                         # fixed test data and assert what they show (no WSL)
 npm run screenshots     # same render, writes docs/media/*.png
 npm run composition:smoke  # real BrowserWindow + WebContentsView composition
-                        # against a local test server: bar, bounds, resize, session
+                        # against a local test server: bar, bounds, resize, session,
+                        # cold-start attach order
+npm run paint:probe     # real screen pixels of a composed window: the remote
+                        # WebUI must be visible above the bar (needs a display;
+                        # CI uses xvfb on Linux and a desktop session on Windows)
 ```
 
 Windows packaging (x64, portable EXE):

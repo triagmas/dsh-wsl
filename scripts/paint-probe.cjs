@@ -29,7 +29,6 @@ const { app, BrowserWindow, WebContentsView, desktopCapturer, ipcMain, screen } 
 
 const WEBUI_COLOR = [0, 192, 192];
 const TOLERANCE = 24;
-const SETTLE_MS = 2500;
 
 const variantArg = readArg('--variant') ?? 'all';
 const outDir = readArg('--out') ?? 'paint-probe';
@@ -68,9 +67,13 @@ async function captureScreen() {
   const image = source.thumbnail;
   const size = image.getSize();
   const bitmap = image.getBitmap();
+  // Sample points are DIP; the captured image is in device pixels.
+  const scale = display.scaleFactor;
   return {
     size,
+    scale,
     pixel(x, y) {
+      // `thumbnailSize` is requested in DIP, so sample points stay in DIP.
       const px = Math.round(x);
       const py = Math.round(y);
       if (px < 0 || py < 0 || px >= size.width || py >= size.height) return null;
@@ -108,8 +111,8 @@ function stubIpc() {
   }
 }
 
-/** Sample the pixels that matter for one window and classify the result. */
-async function inspectWindow(window, label) {
+/** Read the pixels that matter for one window (no side effects). */
+async function sampleWindow(window) {
   const content = window.getContentBounds();
   const childViews = window.contentView.children.map((child) => {
     try {
@@ -124,48 +127,72 @@ async function inspectWindow(window, label) {
     topLeft: [Math.round(content.x + 6), Math.round(content.y + 6)],
     outside: [Math.round(content.x / 2), Math.round(content.y / 2)],
   };
+  const base = { content, childViews, samples };
   let shot;
   try {
     shot = await captureScreen();
   } catch (error) {
-    return {
-      label,
-      capture: 'unavailable',
-      error: error instanceof Error ? error.message : String(error),
-      content,
-      childViews,
-      samples,
-    };
+    return { ...base, error: error instanceof Error ? error.message : String(error) };
   }
-  if (shot === null) return { label, capture: 'unavailable', content, samples, webuiPixels: null, barPixels: null };
+  if (shot === null) return { ...base, error: 'no screen source' };
   const webuiPixels = shot.pixel(samples.webui[0], samples.webui[1]);
   const barPixels = shot.pixel(samples.bar[0], samples.bar[1]);
-  const probePixels = {
-    topLeft: shot.pixel(samples.topLeft[0], samples.topLeft[1]),
-    outside: shot.pixel(samples.outside[0], samples.outside[1]),
-  };
-  if (outDir !== null) {
-    mkdirSync(outDir, { recursive: true });
-    writeFileSync(join(outDir, `${label}.png`), shot.source.thumbnail.toPNG());
-    writeFileSync(join(outDir, `${label}-window.png`), (await window.capturePage()).toPNG());
-  }
-  const webuiVisible = near(webuiPixels, WEBUI_COLOR);
-  // The bar sample proves the capture itself works (the app-owned page paints).
-  const captureWorks = barPixels !== null && !near(barPixels, WEBUI_COLOR);
   return {
-    label,
-    capture: captureWorks ? 'ok' : 'suspicious',
-    content,
-    childViews,
-    samples,
-    probePixels,
+    ...base,
+    shot,
     screen: shot.size,
+    scale: shot.scale,
+    probePixels: {
+      topLeft: shot.pixel(samples.topLeft[0], samples.topLeft[1]),
+      outside: shot.pixel(samples.outside[0], samples.outside[1]),
+    },
     webuiPixels,
     barPixels,
-    webuiVisible,
-    pass: webuiVisible && captureWorks,
+    webuiVisible: near(webuiPixels, WEBUI_COLOR),
+    // The bar sample proves the capture itself works (the app-owned page paints).
+    captureWorks: barPixels !== null && !near(barPixels, WEBUI_COLOR),
   };
 }
+
+/**
+ * Wait until the remote surface is really on screen.
+ *
+ * A software-composited first window can need seconds for its first frame
+ * (shader warm-up), so a fixed delay produces false negatives.
+ */
+async function waitForPaint(window, label, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  let sample = await sampleWindow(window);
+  while (sample.error === undefined && sample.webuiVisible !== true && Date.now() < deadline) {
+    await settle(500);
+    sample = await sampleWindow(window);
+  }
+  if (outDir !== null && sample.error === undefined) {
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, `${label}.png`), sample.shot.source.thumbnail.toPNG());
+    try {
+      writeFileSync(join(outDir, `${label}-window.png`), (await window.capturePage()).toPNG());
+    } catch {
+      // Window-surface capture is unavailable in some environments; the screen
+      // pixels above are the authoritative evidence.
+    }
+  }
+  return {
+    label,
+    capture: sample.error !== undefined ? 'unavailable' : sample.captureWorks === true ? 'ok' : 'suspicious',
+    error: sample.error,
+    content: sample.content,
+    childViews: sample.childViews,
+    samples: sample.samples,
+    probePixels: sample.probePixels,
+    screen: sample.screen,
+    scale: sample.scale,
+    webuiPixels: sample.webuiPixels ?? null,
+    barPixels: sample.barPixels ?? null,
+    pass: sample.error === undefined && sample.webuiVisible === true && sample.captureWorks === true,
+  };
+}
+
 
 /** Fit a window into the current screen so every sample point stays on-screen. */
 function fitToScreen(window) {
@@ -198,6 +225,38 @@ function buildBaseline({ dist, origin }) {
     cleanup: () => {
       windows.destroyAll();
       if (!window.isDestroyed()) window.destroy();
+    },
+  };
+}
+
+/**
+ * Production order on a cold start: READY loads the WebUI before the window is
+ * shown, so the view is created while no window exists yet.
+ */
+function buildColdStart({ dist, origin }) {
+  const { Windows } = require(join(dist, 'test', 'composition.cjs'));
+  const windows = new Windows({
+    rendererDir: dist,
+    preloadDir: join(dist, 'preload'),
+    log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, path: () => '', tail: () => '' },
+    origin: () => origin,
+    devToolsEnabled: true,
+    onRendererGone: () => {},
+    onExternalLink: () => {},
+    onVisibilityChanged: () => {},
+  });
+  windows.configureSession();
+  return {
+    // getter stays lazy: the view must exist before any window does
+    ready: async () => {
+      await windows.loadBackend(origin);
+      const window = windows.ensureMain();
+      fitToScreen(window);
+      windows.showMain();
+      return window;
+    },
+    cleanup: () => {
+      windows.destroyAll();
     },
   };
 }
@@ -259,7 +318,14 @@ function buildSibling({ origin }) {
   };
 }
 
-const VARIANTS = { baseline: buildBaseline, reapply: buildReapply, sibling: buildSibling };
+const VARIANTS = {
+  coldStart: buildColdStart,
+  baseline: buildBaseline,
+  // Second identical window: distinguishes a compositor warm-up from a bug.
+  baseline2: buildBaseline,
+  reapply: buildReapply,
+  sibling: buildSibling,
+};
 
 app.on('window-all-closed', () => undefined);
 
@@ -277,9 +343,8 @@ app.whenReady().then(async () => {
     }
     try {
       const built = builder({ dist, origin: server.origin });
-      await built.ready();
-      await settle(SETTLE_MS);
-      results.push(await inspectWindow(built.window, name));
+      const window = (await built.ready()) ?? built.window;
+      results.push(await waitForPaint(window, name));
       built.cleanup();
       await settle(600);
     } catch (error) {
@@ -294,7 +359,7 @@ app.whenReady().then(async () => {
     console.log(
       `${status} ${result.label}: capture=${result.capture ?? 'n/a'} webuiPixel=${JSON.stringify(result.webuiPixels ?? null)} ` +
         `barPixel=${JSON.stringify(result.barPixels ?? null)} probes=${JSON.stringify(result.probePixels ?? null)} ` +
-        `screen=${JSON.stringify(result.screen ?? null)} views=${JSON.stringify(result.childViews ?? null)} ` +
+        `screen=${JSON.stringify(result.screen ?? null)} scale=${result.scale ?? 'n/a'} views=${JSON.stringify(result.childViews ?? null)} ` +
         `content=${JSON.stringify(result.content ?? null)}${result.error === undefined ? '' : ` error=${result.error}`}`,
     );
   }

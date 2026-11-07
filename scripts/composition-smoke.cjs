@@ -180,6 +180,12 @@ async function main() {
   // --- composition ----------------------------------------------------------
   const view = backendView(window);
   check('the window hosts exactly one child view for the WebUI', view !== null);
+  // Issue #11: the remote surface must stay the top-most child of the window,
+  // otherwise the app-owned page is what the user sees.
+  const children = window.contentView.children;
+  check('the WebUI is the top-most child view after the window is shown',
+    children.length > 0 && children[children.length - 1] === view,
+    `${children.length} children`);
   check('the window itself shows the app-owned bar, not the remote page',
     window.webContents.getURL().endsWith('/chrome/index.html'), window.webContents.getURL());
   check('the bar and the WebUI are separate web contents', view?.webContents !== window.webContents);
@@ -296,6 +302,32 @@ async function main() {
     check('a status change reaches the open popover', updated !== null, String(updated));
     windows.closeSettingsPopover();
   }
+
+  // --- cold start order (issue #11) -----------------------------------------
+  // Production loads the WebUI on READY, before any window exists. The view must
+  // end up inside the window that is created afterwards, otherwise the user
+  // only ever sees the app-owned page.
+  const cold = new Windows({
+    rendererDir: dist,
+    preloadDir: join(dist, 'preload'),
+    log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {}, path: () => '', tail: () => '' },
+    origin: () => origin,
+    devToolsEnabled: true,
+    onRendererGone: () => undefined,
+    onExternalLink: () => undefined,
+    onVisibilityChanged: () => undefined,
+  });
+  await cold.loadBackend(origin);
+  const coldWindow = cold.ensureMain();
+  await settle(300);
+  const coldChildren = coldWindow.contentView.children;
+  check('a view created before its window is attached when the window appears',
+    coldChildren.length === 1, `${coldChildren.length} children`);
+  check('the cold-start window shows the remote page',
+    coldChildren[0]?.webContents?.getURL() === `${origin}/`, String(coldChildren[0]?.webContents?.getURL()));
+  cold.setQuitting();
+  coldWindow.destroy();
+  await settle(100);
 
   // --- shutdown -------------------------------------------------------------
   windows.setQuitting();

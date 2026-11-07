@@ -148,6 +148,33 @@ describe('main process wiring', () => {
     expect(preloadPopover).toContain("'shell:status'");
   });
 
+  it('re-asserts the remote surface whenever the window becomes visible (issue #11)', () => {
+    // Geometry and stacking can both look right while the view keeps an empty
+    // compositor surface, so every "visible again" path must re-apply them.
+    expect(windowsSource).toContain('private syncBackendView(');
+    expect(windowsSource).toContain("window.on('show'");
+    expect(windowsSource).toContain("window.on('ready-to-show'");
+    expect(windowsSource).toContain("window.webContents.on('did-finish-load'");
+    expect(windowsSource).toContain("screen.on('display-metrics-changed'");
+    const showBlock = windowsSource.slice(
+      windowsSource.indexOf("window.on('show'"),
+      windowsSource.indexOf("window.on('hide'"),
+    );
+    expect(showBlock).toContain('this.syncBackendView()');
+    const syncBlock = windowsSource.slice(
+      windowsSource.indexOf('private syncBackendView('),
+      windowsSource.indexOf('private watchDisplays('),
+    );
+    expect(syncBlock).toContain('removeChildView');
+    expect(syncBlock).toContain('addChildView');
+    expect(syncBlock).toContain('this.layoutMain()');
+  });
+
+  it('reports the resolved WebUI geometry once per window (issue #11)', () => {
+    expect(windowsSource).toContain('webui layout:');
+    expect(windowsSource).toContain('this.layoutLogged = false');
+  });
+
   it('never downloads, installs or upgrades DSH', () => {
     for (const source of [indexSource, windowsSource, read('src/main/backend/github-versions.ts')]) {
       expect(source).not.toMatch(/npm install/);
