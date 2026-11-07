@@ -219,13 +219,36 @@ export function buildDshPathCheckArgs(distro: string, dshPath: string): string[]
 }
 
 /**
+ * Version probe wrapper.
+ *
+ * `wsl.exe --exec` starts the executable directly with the distribution's
+ * minimal PATH. An npm-installed `dsh` is a shell shim whose first line is
+ * `#!/usr/bin/env node`, so the kernel needs `node` on PATH and fails with
+ * `env: 'node': No such file or directory` (exit 127) when the runtime lives in
+ * `~/.local/bin`. The launcher already resolves that Node.js binary for the
+ * backend start, so the probe puts its directory in front of PATH the same way
+ * the start wrapper does, instead of trusting an interactive profile.
+ *
+ * `$0` = executable, `$1` = resolved node binary (or `-`).
+ */
+export const VERSION_PROBE_SCRIPT = [
+  'dsh="$0"; node="$1";',
+  'if [ -n "$node" ] && [ "$node" != "-" ]; then export PATH="$(dirname "$node"):$PATH"; fi;',
+  'exec "$dsh" --version',
+].join(' ');
+
+/**
  * Ask the selected executable for its version.
  *
  * `--version` is read-only and never touches a project, a session or the network.
- * The path is validated like every other launcher argument.
+ * Both paths are validated like every other launcher argument.
  */
-export function buildDshVersionArgs(distro: string, dshPath: string): string[] {
-  return ['-d', assertDistroName(distro), '--exec', assertDshPath(dshPath), '--version'];
+export function buildDshVersionArgs(distro: string, dshPath: string, nodePath: string | null = null): string[] {
+  const name = assertDistroName(distro);
+  const dsh = assertDshPath(dshPath);
+  if (nodePath === null) return ['-d', name, '--exec', dsh, '--version'];
+  if (!isValidRuntimeBinary(nodePath)) throw new ArgumentError('invalid-runtime-binary');
+  return ['-d', name, '--exec', '/bin/sh', '-c', VERSION_PROBE_SCRIPT, dsh, nodePath];
 }
 
 export interface StartServerOptions {

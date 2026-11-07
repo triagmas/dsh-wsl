@@ -25,7 +25,9 @@
     "screenshots": "npm run build && xvfb-run -a electron scripts/screenshot-ui.cjs --no-sandbox --write-images",
     "chrome:smoke": "npm run build && xvfb-run -a electron scripts/screenshot-ui.cjs --no-sandbox",
     "composition:build": "node scripts/build-composition.mjs",
-    "composition:smoke": "npm run build && npm run composition:build && xvfb-run -a electron scripts/composition-smoke.cjs --no-sandbox"
+    "composition:smoke": "npm run build && npm run composition:build && xvfb-run -a electron scripts/composition-smoke.cjs --no-sandbox",
+    "paint:probe": "npm run build && npm run composition:build && electron scripts/paint-probe.cjs",
+    "paint:probe:xvfb": "npm run build && npm run composition:build && xvfb-run -a electron scripts/paint-probe.cjs --no-sandbox"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

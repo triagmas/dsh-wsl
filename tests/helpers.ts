@@ -107,10 +107,10 @@ export class FakeWsl implements WslGateway {
 
   /** Version queried from the selected executable (issue #9 footer). */
   dshVersionValue: string | null = '0.2.1-rc.5';
-  readonly versionQueries: { distro: string; dshPath: string }[] = [];
+  readonly versionQueries: { distro: string; dshPath: string; nodePath: string | null }[] = [];
 
-  async dshVersion(distro: string, dshPath: string): Promise<string | null> {
-    this.versionQueries.push({ distro, dshPath });
+  async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {
+    this.versionQueries.push({ distro, dshPath, nodePath });
     return this.dshVersionValue;
   }
 

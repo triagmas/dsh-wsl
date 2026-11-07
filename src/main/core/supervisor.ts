@@ -61,7 +61,7 @@ export interface WslGateway {
   startServer(request: StartServerRequest): ServerHandle;
   probeProcess(distro: string, pid: number): Promise<ProcessProbe | null>;
   /** `dsh --version` of the selected executable; `null` when it cannot be read. */
-  dshVersion(distro: string, dshPath: string): Promise<string | null>;
+  dshVersion(distro: string, dshPath: string, nodePath: string | null): Promise<string | null>;
   signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
 }
 
@@ -382,7 +382,7 @@ export class Supervisor {
         config.dshPath,
         plan.enabled ? plan.root : null,
       );
-      await this.refreshDshVersion(config.distro, runtime.dshPath);
+      await this.refreshDshVersion(config.distro, runtime.dshPath, runtime.nodePath);
 
       const portState = await this.deps.probePort(config.port);
       let reassessed = portState;
@@ -440,9 +440,9 @@ export class Supervisor {
    * Read-only and fail-soft: an unhelpful CLI must not turn a working backend
    * into an error, so the footer simply shows "unknown".
    */
-  private async refreshDshVersion(distro: string, dshPath: string): Promise<void> {
+  private async refreshDshVersion(distro: string, dshPath: string, nodePath: string | null): Promise<void> {
     try {
-      const version = await this.deps.wsl.dshVersion(distro, dshPath);
+      const version = await this.deps.wsl.dshVersion(distro, dshPath, nodePath);
       if (version === this.dshVersion) return;
       this.dshVersion = version;
       this.status = this.buildStatus(this.status.state, this.status.detail);

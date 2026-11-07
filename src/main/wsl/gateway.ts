@@ -256,10 +256,13 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       };
     },
 
-    async dshVersion(distro: string, dshPath: string): Promise<string | null> {
-      const result = await run(buildDshVersionArgs(distro, dshPath), 15_000);
+    async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {
+      const result = await run(buildDshVersionArgs(distro, dshPath, nodePath), 15_000);
       if (result.code !== 0) {
-        options.log.warn('dsh --version did not report a version');
+        options.log.warn(`dsh --version did not report a version (code=${result.code ?? 'null'})`);
+        // One stderr line is enough to tell a missing runtime from a bad CLI.
+        const tail = (result.stderr || result.stdout).trim().split('\n').pop();
+        if (tail !== undefined && tail !== '') options.log.debug(`dsh --version output: ${tail}`);
         return null;
       }
       const parsed = parseDshVersion(`${result.stdout}\n${result.stderr}`);
