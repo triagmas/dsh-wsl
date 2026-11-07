@@ -36,6 +36,14 @@ const journal = (overrides: Partial<UpdateJournal> = {}): UpdateJournal => ({
 
 const directories: string[] = [];
 
+/**
+ * POSIX directory permissions are only enforced off Windows and for a normal user
+ * (root bypasses them). Elsewhere the unreadable-parent cases cannot be created;
+ * an unreadable record is still covered by the EISDIR and dangling-link tests.
+ */
+const canDenyDirectoryAccess =
+  process.platform !== 'win32' && !(typeof process.getuid === 'function' && process.getuid() === 0);
+
 async function scratch(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), 'wss-journal-'));
   directories.push(directory);
@@ -123,9 +131,7 @@ describe('journal store', () => {
     }
   });
 
-  it('throws for a record whose parent directory cannot be read', async () => {
-    // Root ignores directory permissions, so this can only be asserted unprivileged.
-    const privileged = typeof process.getuid === 'function' && process.getuid() === 0;
+  it.skipIf(!canDenyDirectoryAccess)('throws for a record whose parent directory cannot be read', async () => {
     const directory = await scratch();
     const profile = join(directory, 'profile');
     await mkdir(profile);
@@ -133,7 +139,6 @@ describe('journal store', () => {
     await writeFile(path, JSON.stringify(journal()), 'utf8');
     await chmod(profile, 0o000);
     try {
-      if (privileged) return;
       const store = createJournalStore(path, createNullLogger());
       // The record exists but cannot be inspected: never "absent".
       let thrown: unknown = null;
@@ -254,8 +259,9 @@ describe('start-up handling of the journal states (R12.3)', () => {
     expect((await stat(path)).isFile()).toBe(true);
   });
 
-  it('blocks the start when the journal sits behind an unreadable directory', async () => {
-    const privileged = typeof process.getuid === 'function' && process.getuid() === 0;
+  it.skipIf(!canDenyDirectoryAccess)(
+    'blocks the start when the journal sits behind an unreadable directory',
+    async () => {
     const directory = await scratch();
     const profile = join(directory, 'profile');
     await mkdir(profile);
@@ -263,7 +269,6 @@ describe('start-up handling of the journal states (R12.3)', () => {
     await writeFile(path, JSON.stringify(journal()), 'utf8');
     await chmod(profile, 0o000);
     try {
-      if (privileged) return;
       const calls: string[] = [];
       const result = await recoverInterruptedUpdate(
         deps(createJournalStore(path, createNullLogger()), calls),
@@ -274,7 +279,8 @@ describe('start-up handling of the journal states (R12.3)', () => {
     } finally {
       await chmod(profile, 0o700);
     }
-  });
+    },
+  );
 
   it('blocks the start when the journal is a broken link', async () => {
     const directory = await scratch();
