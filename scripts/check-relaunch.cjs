@@ -4,7 +4,14 @@
  *
  * Reads the markers written by `--relaunch-probe` in a packaged Windows build and
  * proves that the relaunch target was the portable EXE, not the temporary
- * extraction directory Electron runs from:
+ * extraction directory Electron runs from.
+ *
+ * Note on what the child reports: a portable build always starts from a fresh
+ * extraction directory, so `child.execPath` is *not* the portable EXE — that is
+ * exactly why relaunching `process.execPath` is wrong. The portable launcher
+ * re-establishes the origin, so the discriminating check is that the child still
+ * reports `PORTABLE_EXECUTABLE_FILE` as the portable EXE. Relaunching the inner
+ * copy instead would leave that variable empty.
  *
  *   node scripts/check-relaunch.cjs <marker-dir> <portable-exe> [timeout-seconds]
  *
@@ -74,8 +81,15 @@ if (child === null) {
   check('the relaunched instance starts', false, 'child.json is missing');
 } else {
   check('the relaunched instance starts', true);
-  check('it runs from the portable EXE, not the extraction directory', samePath(child.execPath, portable), String(child.execPath));
-  check('the relaunched instance still knows its portable origin', samePath(child.portable, portable), String(child.portable));
+  check('it is a new process, not the probe that relaunched it', child.pid !== parent?.pid, `${child.pid} vs ${parent?.pid}`);
+  // The portable launcher re-extracts and starts the inner copy, so `execPath`
+  // is a temp path by design; a child started from the inner copy directly would
+  // have no portable origin at all.
+  check(
+    'it was started by the portable EXE, not by the inner extraction copy',
+    samePath(child.portable, portable),
+    `portable=${String(child.portable)} execPath=${String(child.execPath)}`,
+  );
 }
 
 const failed = results.filter((result) => !result.ok);

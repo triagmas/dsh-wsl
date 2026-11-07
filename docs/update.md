@@ -125,8 +125,14 @@ node scripts/check-relaunch.cjs <dir> <portable-exe>
 
 The parent records its own paths, decides the target with the same function the
 update uses and relaunches through `app.relaunch`; the child records the
-executable it was started from. The check fails unless the child runs from the
-portable EXE itself.
+executable it was started from.
+
+A portable build always starts from a fresh extraction directory, so the child's
+`process.execPath` is *not* the portable EXE — which is exactly why relaunching
+`process.execPath` would be wrong. The portable launcher re-establishes the
+origin, so the check asserts that the child still reports
+`PORTABLE_EXECUTABLE_FILE` as the portable EXE (a child started from the inner
+copy would report nothing) and that it is a new process.
 
 ## Windows and IPC
 
