@@ -6,13 +6,18 @@
  * tests use the real file-backed store: a write has to be durable and readable
  * back, and an impossible write has to throw instead of being logged away.
  */
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createJournalStore } from '../src/main/core/update-recovery.js';
+import { createJournalStore, recoverInterruptedUpdate } from '../src/main/core/update-recovery.js';
 import { createNullLogger } from '../src/main/core/logger.js';
-import { parseUpdateJournal, type UpdateJournal } from '../src/main/core/update.js';
+import {
+  UpdateJournalError,
+  parseUpdateJournal,
+  type RuntimeObservation,
+  type UpdateJournal,
+} from '../src/main/core/update.js';
 
 const journal = (overrides: Partial<UpdateJournal> = {}): UpdateJournal => ({
   version: 1,
@@ -80,21 +85,128 @@ describe('journal store', () => {
     expect(store.read()).toBeNull();
   });
 
-  it('ignores a corrupt record but reports it', async () => {
+  it('returns null only when there is no journal at all', async () => {
+    const directory = await scratch();
+    const store = createJournalStore(join(directory, 'missing', 'update-journal.json'), createNullLogger());
+    expect(store.read()).toBeNull();
+  });
+
+  it('throws for a corrupt record and keeps the file', async () => {
     const directory = await scratch();
     const path = join(directory, 'update-journal.json');
     await writeFile(path, '{ not json', 'utf8');
-    const messages: string[] = [];
-    const store = createJournalStore(path, {
-      info: () => undefined,
-      warn: (message: string) => messages.push(message),
-      error: (message: string) => messages.push(message),
-      debug: () => undefined,
-      tail: () => '',
-      path: () => path,
-    });
+    const store = createJournalStore(path, createNullLogger());
 
-    expect(store.read()).toBeNull();
-    expect(messages.join(' ')).toContain('could not be read');
+    expect(() => store.read()).toThrow(UpdateJournalError);
+    try {
+      store.read();
+    } catch (error) {
+      expect((error as UpdateJournalError).reason).toBe('corrupt');
+      expect((error as UpdateJournalError).path).toBe(path);
+    }
+    // The evidence is never deleted by a read.
+    expect((await stat(path)).isFile()).toBe(true);
+  });
+
+  it('throws for a record that is valid JSON but not a journal', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'update-journal.json');
+    await writeFile(path, JSON.stringify({ version: 1, phase: 'activating' }), 'utf8');
+    const store = createJournalStore(path, createNullLogger());
+
+    expect(() => store.read()).toThrow(UpdateJournalError);
+    try {
+      store.read();
+    } catch (error) {
+      expect((error as UpdateJournalError).reason).toBe('corrupt');
+    }
+  });
+
+  it('throws for an unreadable record', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'update-journal.json');
+    // A directory where the file should be: the file exists but cannot be read.
+    await mkdir(path);
+
+    const store = createJournalStore(path, createNullLogger());
+    let thrown: unknown = null;
+    try {
+      store.read();
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(UpdateJournalError);
+    expect((thrown as UpdateJournalError).reason).toBe('unreadable');
+  });
+});
+
+describe('start-up handling of the journal states (R12.3)', () => {
+  const observation: RuntimeObservation = {
+    runtimePresent: true,
+    runtimeVersion: '0.2.1-rc.5',
+    previous: null,
+    stage: null,
+  };
+
+  function deps(store: ReturnType<typeof createJournalStore>, calls: string[]) {
+    return {
+      wsl: {
+        async inspectRuntime() {
+          calls.push('inspect');
+          return observation;
+        },
+        async restoreRuntime() {
+          calls.push('restore');
+          return { code: 0, tail: 'update: rollout reverted' };
+        },
+      },
+      journal: store,
+      resume: async () => {
+        calls.push('resume');
+        return { ok: true, message: null };
+      },
+      log: createNullLogger(),
+    };
+  }
+
+  it('starts normally when no journal exists', async () => {
+    const directory = await scratch();
+    const store = createJournalStore(join(directory, 'update-journal.json'), createNullLogger());
+    const calls: string[] = [];
+    const result = await recoverInterruptedUpdate(deps(store, calls));
+    expect(result).toEqual({ handled: false, action: null, message: null });
+    expect(calls).toEqual([]);
+  });
+
+  it('blocks the start and keeps the file when the journal is corrupt', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'update-journal.json');
+    await writeFile(path, 'garbage', 'utf8');
+    const store = createJournalStore(path, createNullLogger());
+    const calls: string[] = [];
+
+    const result = await recoverInterruptedUpdate(deps(store, calls));
+    expect(result.handled).toBe(true);
+    expect(result.action).toBe('blocked');
+    expect(result.message).toContain('corrupt');
+    expect(result.message).toContain(path);
+    expect(result.message).toContain('was not started');
+    // DeepSeek Harness is never started and nothing is inspected or restored.
+    expect(calls).toEqual([]);
+    expect((await stat(path)).isFile()).toBe(true);
+  });
+
+  it('blocks the start and keeps the file when the journal is unreadable', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'update-journal.json');
+    await mkdir(path);
+    const store = createJournalStore(path, createNullLogger());
+    const calls: string[] = [];
+
+    const result = await recoverInterruptedUpdate(deps(store, calls));
+    expect(result.action).toBe('blocked');
+    expect(result.message).toContain('unreadable');
+    expect(result.message).toContain('was not started');
+    expect(calls).toEqual([]);
   });
 });

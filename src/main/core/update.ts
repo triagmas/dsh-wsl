@@ -428,7 +428,33 @@ export function parseUpdateJournal(raw: unknown): UpdateJournal | null {
   };
 }
 
-/** Persistence for the transaction journal (a file in the app profile). */
+/**
+ * The journal file exists but cannot be used.
+ *
+ * A missing file is a normal start; an unreadable or corrupt file is not: the app
+ * cannot know whether a swap happened, so it must not start anything.
+ */
+export class UpdateJournalError extends Error {
+  constructor(
+    readonly reason: 'corrupt' | 'unreadable',
+    readonly path: string,
+    detail: string,
+  ) {
+    super(
+      `The update journal at ${path} is ${reason === 'corrupt' ? 'corrupt' : 'unreadable'}${detail === '' ? '' : ` (${detail})`}`,
+    );
+    this.name = 'UpdateJournalError';
+  }
+}
+
+/**
+ * Persistence for the transaction journal (a file in the app profile).
+ *
+ * `read()` returns `null` **only** when there is no journal at all. A file that
+ * exists but cannot be read or validated throws `UpdateJournalError`: treating
+ * that as "nothing happened" would start DeepSeek Harness on top of a runtime
+ * whose state is unknown.
+ */
 export interface UpdateJournalStore {
   read(): UpdateJournal | null;
   write(journal: UpdateJournal): void;

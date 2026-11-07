@@ -20,6 +20,7 @@ import { dirname } from 'node:path';
 import type { Logger } from './logger.js';
 import type { UpdateTransition, WslGateway } from './supervisor.js';
 import {
+  UpdateJournalError,
   decideRecovery,
   parseUpdateJournal,
   type RuntimeObservation,
@@ -35,28 +36,47 @@ export interface UpdateRecoveryResult {
 }
 
 /**
- * Journal persisted as JSON in the app profile. Corrupt content means "none".
+ * Journal persisted as JSON in the app profile.
  *
  * `write()` is deliberately fail-loud: the caller must not replace a runtime it
  * cannot repair after a crash. The content is flushed, renamed into place and
  * read back, so a full or read-only profile stops the update instead of leaving
  * a silent gap.
+ *
+ * `read()` distinguishes the three states a profile can be in: no journal (a
+ * normal start), a valid journal (repair it) and a journal that exists but is
+ * corrupt or unreadable — that last one throws, because ignoring it would start
+ * the backend on a runtime nobody can vouch for.
  */
 export function createJournalStore(path: string, log: Logger): UpdateJournalStore {
   return {
     read(): UpdateJournal | null {
+      // Absent file: nothing to repair, this is a normal start.
+      if (!existsSync(path)) return null;
+
+      let raw: string;
       try {
-        if (!existsSync(path)) return null;
-        const parsed = parseUpdateJournal(JSON.parse(readFileSync(path, 'utf8')) as unknown);
-        if (parsed === null) {
-          log.warn('update journal is not readable and is ignored');
-          return null;
-        }
-        return parsed;
+        raw = readFileSync(path, 'utf8');
       } catch (error) {
-        log.warn(`update journal could not be read: ${error instanceof Error ? error.message : 'unknown'}`);
-        return null;
+        const detail = error instanceof Error ? error.message : 'unknown error';
+        log.error(`update journal exists but cannot be read: ${detail}`);
+        throw new UpdateJournalError('unreadable', path, detail);
       }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        log.error('update journal exists but is not valid JSON');
+        throw new UpdateJournalError('corrupt', path, 'not valid JSON');
+      }
+
+      const journal = parseUpdateJournal(parsed);
+      if (journal === null) {
+        log.error('update journal exists but its content is not a valid record');
+        throw new UpdateJournalError('corrupt', path, 'unexpected content');
+      }
+      return journal;
     },
     write(journal: UpdateJournal): void {
       const directory = dirname(path);
@@ -121,7 +141,19 @@ export interface UpdateRecoveryDeps {
  * and a rollback comes back with a working WebUI.
  */
 export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promise<UpdateRecoveryResult> {
-  const journal = deps.journal.read();
+  let journal: UpdateJournal | null;
+  try {
+    journal = deps.journal.read();
+  } catch (error) {
+    // The file exists but cannot be trusted. Keep it (it is the only evidence of
+    // what may have happened) and refuse to start DeepSeek Harness.
+    const message =
+      error instanceof UpdateJournalError
+        ? `${error.message}. DeepSeek Harness was not started: repair or remove that file to continue.`
+        : `The update journal could not be read (${error instanceof Error ? error.message : 'unknown error'}). DeepSeek Harness was not started.`;
+    deps.log.error(`update recovery: ${message}`);
+    return { handled: true, action: 'blocked', message };
+  }
   if (journal === null) return { handled: false, action: null, message: null };
 
   deps.log.warn(

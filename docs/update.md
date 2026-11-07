@@ -104,6 +104,12 @@ into a terminal blocked state and blocks further starts until a repair succeeds.
 A stop that cannot be confirmed releases the update lock and is reported as an
 explicit error, so the app never sits in a silent soft-lock.
 
+Start-up reading has three outcomes: **no journal** — a normal start; **a valid
+journal** — repair it; **a journal that exists but is corrupt or unreadable** —
+the record is kept, DeepSeek Harness is not started and the app opens in a
+terminal blocked state that names the file, because nothing can vouch for the
+runtime after an unknown transaction.
+
 ## Terminal window
 
 The main process keeps a rolling buffer of 400 lines and publishes `dropped`
