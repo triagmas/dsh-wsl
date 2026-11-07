@@ -119,6 +119,25 @@ behind it belongs to a dead backend session. Navigations are serialized through 
 single in-flight promise, so a recovery burst cannot race two loads; no substitute
 UI and no injected styles are involved, and DSH session state stays server-side.
 
+### One-click update (issue #12)
+
+The updater is the only component allowed to change what runs inside the isolation
+root, so it is split the same way as the launcher:
+
+- `src/main/core/update.ts` — pure: exact-version check, `isInsideIsolatedRuntime`,
+  `planUpdate()` (rejects global installs, custom executables, foreign runtimes,
+  unsafe roots), terminal buffer, phase model;
+- `src/main/wsl/update-args.ts` — argv construction and the two `/bin/sh` scripts;
+- `src/main/core/update-runner.ts` — the fixed sequence (npm lookup → staged
+  install → verify → swap → done) with no retries and no parallel runs;
+- `src/update/*` + `src/preload/update.ts` — the confirmation and terminal
+  windows, rendering only state pushed by the main process.
+
+The plan is recomputed in the main process for `update:start`; the confirmation
+window cannot start something `planUpdate()` rejected. Success takes the same
+graceful shutdown path as Quit and then relaunches the portable executable, so the
+new runtime is picked up by a normal start.
+
 ## Ownership
 
 A server counts as app-owned only when all of the following hold:
@@ -273,6 +292,12 @@ Issue #9 added `tests/footer.test.ts` (bar model, geometry, anchor validation),
 policy, offline fail-soft) and `tests/r09.test.ts` (composition guards). The
 workspace contract moved to `src/main/core/workspace.ts` so Settings and the
 launcher cannot disagree about a trailing slash (issue #8).
+
+Issue #12 added `tests/update.test.ts` (guards, terminal buffer, phase model,
+runner order/failures) and `tests/wsl-update-args.test.ts`, which runs the shipped
+update script under `/bin/sh` in a throw-away directory with a fake npm: a real
+staged install, an npm failure, and a wrong-version stage that must roll back. No
+test starts WSL or touches an installation.
 
 Configuration gained two fields: `isolateEnvironment` (default on) and
 `runtimeRoot`. Both require a backend restart, so the tray decision stays

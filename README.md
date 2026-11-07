@@ -75,6 +75,16 @@ render smoke (`npm run chrome:smoke`) and the screenshots in
 
 ![Footer bar over a mock upstream surface](docs/media/footer-bar.png)
 
+When GitHub reports a newer release, the bar also offers a one-click update of the
+isolated runtime: the exact published version is installed below the app's own
+runtime root, the previous installation is kept for rollback, and the app restarts
+itself. The global `dsh`, the official Windows Harness and the projects are never
+touched. Details in [docs/update.md](docs/update.md).
+
+| Before | During / after |
+|---|---|
+| ![Update confirmation](docs/media/update-confirm.png) | ![Update terminal](docs/media/update-terminal.png) |
+
 ### Diagnostics for support
 
 When a window disappears or the app exits, the log now distinguishes the cause
@@ -103,8 +113,9 @@ npm run build         # esbuild -> dist/ (main, preloads, local pages, icons)
 npm start             # build + run Electron on the current platform
 npm run smoke:headless  # Linux/WSL: launch the built app under Xvfb with a
                         # sanitised PATH/HOME; must reach a clean terminal error
-npm run chrome:smoke    # Linux/WSL: render the footer and settings popover with
-                        # fixed test data and assert what they show (no WSL)
+npm run chrome:smoke    # Linux/WSL: render the footer, settings popover and the
+                        # update windows with fixed test data and assert what
+                        # they show (no WSL)
 npm run screenshots     # same render, writes docs/media/*.png
 npm run composition:smoke  # real BrowserWindow + WebContentsView composition
                         # against a local test server: bar, bounds, resize, session,
@@ -156,6 +167,7 @@ are never presented as a real Windows/WSL acceptance PASS.
 - [Architecture / implementation notes](docs/architecture.md)
 - [Upstream `dsh web` contract and unknowns](docs/upstream-dsh-web.md)
 - [Footer bar, versions and settings popover](docs/footer.md)
+- [One-click update of the isolated runtime](docs/update.md)
 - [Issue #9 evidence (build, checks, artifact)](docs/evidence/r09.md)
 - [M1 issue](https://github.com/triagmas/wsl-web-shell/issues/1) and [agent guidance](AGENTS.md)
 
