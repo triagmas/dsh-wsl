@@ -250,6 +250,34 @@ describe('supervisor update quiesce (issue #12)', () => {
     expect(supervisor.state).toBe('ERROR');
   });
 
+  it('releases the lock and reports an explicit error when the stop fails (P1-C)', async () => {
+    const harness = createHarness();
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    expect(supervisor.state).toBe('READY');
+
+    // The ownership probe fails: whether the backend is alive is now unknown.
+    const wsl = harness.deps.wsl as unknown as { probeProcess: () => Promise<unknown> };
+    const original = wsl.probeProcess;
+    wsl.probeProcess = async () => {
+      throw new Error('wsl.exe is not responding');
+    };
+    const paused = await supervisor.pauseForUpdate();
+    wsl.probeProcess = original;
+
+    expect(paused.ok).toBe(false);
+    // No silent soft-lock: the flag is cleared and the state is explicit.
+    expect(supervisor.updateInProgress).toBe(false);
+    expect(supervisor.state).toBe('ERROR');
+    expect(lastStatus(harness.statuses).detail).toContain('could not be stopped');
+
+    // The app is not stuck: a retry starts the backend again.
+    harness.wsl.servers.length = 0;
+    await supervisor.retry();
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(2);
+  });
+
   it('exposes a terminal state for a runtime that cannot be recovered', () => {
     const harness = createHarness();
     const supervisor = new Supervisor(harness.deps);

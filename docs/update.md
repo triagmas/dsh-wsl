@@ -80,8 +80,11 @@ The backend is **not** stopped before it has to be:
    exchange, authenticated request). Success is only reported after this, so a
    new version that cannot serve the WebUI is a failed update, not a green one.
 
-A journal (`<userData>/update-journal.json`, written atomically before the swap)
-records transaction id, phase, target and canonical root. If the app, the process
+A journal (`<userData>/update-journal.json`) records transaction id, phase, target
+and canonical root. Writing it is **fail-loud**: the content is flushed with
+`fsync`, renamed into place and read back, and a write that cannot be confirmed
+stops the update before the backend is touched — a runtime that cannot be
+repaired after a crash is never replaced. If the app, the process
 or Windows dies between the two renames, the next start repairs it:
 
 | Observed state | Action |
@@ -93,7 +96,13 @@ or Windows dies between the two renames, the next start repairs it:
 | runtime missing, nothing to restore | `blocked` — the app refuses to start a half-swapped tree and explains it |
 
 Every failure path restores the previous installation, starts the old backend and
-reports `rolled-back` ("previous version restored"), never `done`.
+reports `rolled-back` ("previous version restored"), never `done`. The journal is
+cleared **only** by that proven outcome (restore succeeded *and* the old backend
+serves the WebUI again) or by a verified new version: a failed rollback, or a
+restored runtime whose backend does not start, keeps the journal, puts the app
+into a terminal blocked state and blocks further starts until a repair succeeds.
+A stop that cannot be confirmed releases the update lock and is reported as an
+explicit error, so the app never sits in a silent soft-lock.
 
 ## Terminal window
 

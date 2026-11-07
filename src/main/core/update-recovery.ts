@@ -15,7 +15,7 @@
  * The decision itself is pure (`decideRecovery` in `update.ts`); this module adds
  * the file-backed journal and the small orchestration around it.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Logger } from './logger.js';
 import type { UpdateTransition, WslGateway } from './supervisor.js';
@@ -34,7 +34,14 @@ export interface UpdateRecoveryResult {
   message: string | null;
 }
 
-/** Journal persisted as JSON in the app profile. Corrupt content means "none". */
+/**
+ * Journal persisted as JSON in the app profile. Corrupt content means "none".
+ *
+ * `write()` is deliberately fail-loud: the caller must not replace a runtime it
+ * cannot repair after a crash. The content is flushed, renamed into place and
+ * read back, so a full or read-only profile stops the update instead of leaving
+ * a silent gap.
+ */
 export function createJournalStore(path: string, log: Logger): UpdateJournalStore {
   return {
     read(): UpdateJournal | null {
@@ -52,15 +59,39 @@ export function createJournalStore(path: string, log: Logger): UpdateJournalStor
       }
     },
     write(journal: UpdateJournal): void {
+      const directory = dirname(path);
+      const temporary = `${path}.tmp`;
+      // Errors are not swallowed: the updater must stop before it touches the
+      // runtime when its recovery record cannot be stored.
+      mkdirSync(directory, { recursive: true });
+      const descriptor = openSync(temporary, 'w');
       try {
-        mkdirSync(dirname(path), { recursive: true });
-        // Write-then-rename: a crash never leaves a half-written journal behind.
-        const temporary = `${path}.tmp`;
-        writeFileSync(temporary, `${JSON.stringify(journal, null, 2)}\n`, 'utf8');
-        renameSync(temporary, path);
-      } catch (error) {
-        log.error(`update journal could not be written: ${error instanceof Error ? error.message : 'unknown'}`);
+        writeSync(descriptor, `${JSON.stringify(journal, null, 2)}\n`);
+        // Flush the content before the rename: a crash then leaves either the old
+        // journal or the new one, never an empty file.
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
       }
+      renameSync(temporary, path);
+      try {
+        // Best effort: make the rename itself durable. Not supported everywhere.
+        const directoryDescriptor = openSync(directory, 'r');
+        try {
+          fsyncSync(directoryDescriptor);
+        } finally {
+          closeSync(directoryDescriptor);
+        }
+      } catch {
+        // Directory fsync is unavailable on some platforms; the rename is atomic.
+      }
+      // Read the record back: only a journal that can be parsed again protects
+      // the next start, so a write that produced anything else is a failure.
+      const persisted = parseUpdateJournal(JSON.parse(readFileSync(path, 'utf8')) as unknown);
+      if (persisted === null || persisted.transaction !== journal.transaction || persisted.phase !== journal.phase) {
+        throw new Error('the update journal could not be verified after writing');
+      }
+      log.info(`update journal written (tx=${journal.transaction}, phase=${journal.phase})`);
     },
     clear(): void {
       try {
@@ -127,12 +158,46 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
   }
 
   if (decision.action === 'finalize') {
-    deps.journal.clear();
     const resumed = await deps.resume();
+    if (resumed.ok) {
+      // Proven: the new runtime is active and serves the WebUI.
+      deps.journal.clear();
+      return { handled: true, action: 'finalize', message: null };
+    }
+    // The new runtime is in place but does not serve: restore the previous one and
+    // keep the journal until that is proven as well.
+    deps.log.warn(`update recovery: the updated version did not start (${resumed.message ?? 'unknown'})`);
+    const fallback = await deps.wsl
+      .restoreRuntime(
+        {
+          distro: journal.distro,
+          isolationRoot: journal.runtimeRoot,
+          transaction: journal.transaction,
+          nodePath: null,
+        },
+        (line) => deps.log.info(`update recovery: ${line}`),
+      )
+      .catch((error: unknown) => ({ code: null, tail: error instanceof Error ? error.message : 'unknown' }));
+    if (fallback.code !== 0) {
+      return {
+        handled: true,
+        action: 'blocked',
+        message: `The updated version did not start (${resumed.message ?? 'unknown error'}) and the previous installation could not be restored (${fallback.tail}). The journal was kept.`,
+      };
+    }
+    const recovered = await deps.resume();
+    if (!recovered.ok) {
+      return {
+        handled: true,
+        action: 'blocked',
+        message: `The previous installation was restored, but its backend did not start (${recovered.message ?? 'unknown error'}). The journal was kept.`,
+      };
+    }
+    deps.journal.clear();
     return {
       handled: true,
-      action: 'finalize',
-      message: resumed.ok ? null : (resumed.message ?? 'The updated backend did not start.'),
+      action: 'rollback',
+      message: `The updated version did not start (${resumed.message ?? 'unknown error'}); the previous installation was restored and is running again.`,
     };
   }
 
@@ -157,13 +222,17 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
         message: `The previous installation could not be restored: ${restored.tail}`,
       };
     }
-    deps.journal.clear();
     const resumed = await deps.resume();
-    return {
-      handled: true,
-      action: 'rollback',
-      message: resumed.ok ? null : (resumed.message ?? 'The restored backend did not start.'),
-    };
+    if (!resumed.ok) {
+      // Keep the record: the next start must be able to try again.
+      return {
+        handled: true,
+        action: 'blocked',
+        message: `The previous installation was restored, but its backend did not start (${resumed.message ?? 'unknown error'}). The journal was kept.`,
+      };
+    }
+    deps.journal.clear();
+    return { handled: true, action: 'rollback', message: null };
   }
 
   return {

@@ -353,8 +353,20 @@ export class Supervisor {
         this.deps.log.info('update: app-owned backend stopped');
         return { ok: true, message: null };
       } catch (error) {
-        this.deps.log.error(`update: stopping the backend failed (${describe(error)})`);
-        return { ok: false, message: `The app-owned backend could not be stopped: ${describe(error)}` };
+        // The process state is now unknown. Release the lock so the app cannot get
+        // stuck in a silent soft-lock, and say so in the UI: a retry has to decide
+        // what to do with a backend that may still be alive.
+        const detail = describe(error);
+        this.deps.log.error(`update: stopping the backend failed (${detail})`);
+        this.releaseUpdateLock();
+        this.fail(
+          new ShellError(
+            'backend-lost',
+            'The app-owned backend could not be stopped for the update, so nothing was replaced.',
+            `Check the WSL distribution and retry. ${detail}`,
+          ),
+        );
+        return { ok: false, message: `The app-owned backend could not be stopped: ${detail}` };
       }
     });
   }

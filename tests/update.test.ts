@@ -457,6 +457,83 @@ describe('recovery orchestration', () => {
     expect(store.current()).toBeNull();
   });
 
+  it('keeps the journal when finalize cannot start the new version (P0-B)', async () => {
+    // The swap completed, but the new runtime does not serve: the journal must
+    // survive so the next start can still roll back.
+    const store = memoryJournal(journal({ phase: 'verifying-backend' }));
+    const calls: string[] = [];
+    const result = await recoverInterruptedUpdate({
+      wsl: {
+        inspectRuntime: async () =>
+          observation({ runtimeVersion: '0.2.2-rc.1', previous: 'previous-x' }),
+        restoreRuntime: async () => {
+          calls.push('restore');
+          return { code: 74, tail: 'update: nothing to restore' };
+        },
+      },
+      journal: store,
+      resume: async () => {
+        calls.push('resume');
+        return { ok: false, message: 'auth-failed: 401' };
+      },
+      log: createNullLogger(),
+    });
+    expect(result.action).toBe('blocked');
+    expect(calls).toEqual(['resume', 'restore']);
+    expect(store.current()).not.toBeNull();
+    expect(result.message).toContain('journal was kept');
+  });
+
+  it('rolls back a finalize whose new version does not start', async () => {
+    const store = memoryJournal(journal({ phase: 'verifying-backend' }));
+    let resumes = 0;
+    const result = await recoverInterruptedUpdate({
+      wsl: {
+        inspectRuntime: async () => observation({ runtimeVersion: '0.2.2-rc.1', previous: 'previous-x' }),
+        restoreRuntime: async () => ({ code: 0, tail: 'update: rollout reverted' }),
+      },
+      journal: store,
+      resume: async () => {
+        resumes += 1;
+        return resumes === 1 ? { ok: false, message: 'auth-failed: 401' } : { ok: true, message: null };
+      },
+      log: createNullLogger(),
+    });
+    expect(result.action).toBe('rollback');
+    expect(result.message).toContain('previous installation was restored');
+    expect(store.current()).toBeNull();
+  });
+
+  it('keeps the journal when the restored backend does not start, and retries on the next start', async () => {
+    const store = memoryJournal(journal());
+    const failing = await recoverInterruptedUpdate({
+      wsl: {
+        inspectRuntime: async () =>
+          observation({ runtimePresent: false, runtimeVersion: null, previous: 'previous-x' }),
+        restoreRuntime: async () => ({ code: 0, tail: 'update: rollout reverted' }),
+      },
+      journal: store,
+      resume: async () => ({ ok: false, message: 'backend-lost: nothing listening' }),
+      log: createNullLogger(),
+    });
+    expect(failing.action).toBe('blocked');
+    expect(store.current()).not.toBeNull();
+
+    // A second start still has the record and repairs it once the backend works.
+    const repaired = await recoverInterruptedUpdate({
+      wsl: {
+        inspectRuntime: async () =>
+          observation({ runtimePresent: false, runtimeVersion: null, previous: 'previous-x' }),
+        restoreRuntime: async () => ({ code: 0, tail: 'update: rollout reverted' }),
+      },
+      journal: store,
+      resume: async () => ({ ok: true, message: null }),
+      log: createNullLogger(),
+    });
+    expect(repaired.action).toBe('rollback');
+    expect(store.current()).toBeNull();
+  });
+
   it('keeps the journal when the restore fails, so the next start retries', async () => {
     const deps = baseDeps();
     const store = memoryJournal(journal());
@@ -491,8 +568,10 @@ interface Harness {
     pauseForUpdate(): Promise<UpdateTransition>;
     resumeAfterUpdate(): Promise<UpdateTransition>;
     releaseUpdateLock(): void;
+    blockForRuntime(message: string): void;
     updateInProgress: boolean;
   };
+  blocked: string[];
   journal: UpdateJournalStore & { current(): UpdateJournal | null };
   published: string[];
   lines: string[];
@@ -513,6 +592,9 @@ function harness(
     restore?: UpdateRunResult;
     pause?: UpdateTransition;
     resume?: UpdateTransition[];
+    pauseThrows?: boolean;
+    journalWriteError?: string;
+    journalPhases?: string[];
   } = {},
 ): Harness {
   const state: Harness = {
@@ -526,11 +608,17 @@ function harness(
     activates: 0,
     restores: 0,
     journal: memoryJournal(null),
+    blocked: [],
     lifecycle: {
       updateInProgress: false,
+      blockForRuntime(message: string) {
+        state.blocked.push(message);
+        state.order.push('block');
+      },
       async pauseForUpdate() {
         state.paused += 1;
         state.order.push('pause');
+        if (options.pauseThrows === true) throw new Error('stop failed');
         return options.pause ?? { ok: true, message: null };
       },
       async resumeAfterUpdate() {
@@ -648,7 +736,7 @@ describe('update runner transaction', () => {
     expect(h.restores).toBe(1);
     expect(h.order.slice(-2)).toEqual(['restore', 'resume']);
     expect(outcome.state.phase).toBe('rolled-back');
-    expect(outcome.state.detail).toContain('The previous installation was restored.');
+    expect(outcome.state.detail).toContain('was restored and the previous version is running again');
     expect(h.journal.current()).toBeNull();
   });
 
@@ -703,6 +791,117 @@ describe('update runner transaction', () => {
     expect(writes).toContain('activating');
     // The journal write happened before activation, so the next start can repair.
     expect(writes.indexOf('activating')).toBeLessThan(writes.length);
+  });
+
+  it('refuses to install anything when the staging journal cannot be written (P0-A)', async () => {
+    const h = harness();
+    const cleared: string[] = [];
+    h.journal = {
+      read: () => null,
+      write: () => {
+        throw new Error('EACCES: permission denied, open update-journal.json');
+      },
+      clear: () => {
+        cleared.push('clear');
+      },
+      current: () => null,
+    };
+    const outcome = await runner(h).run(accepted.plan, context);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.state.phase).toBe('failed');
+    expect(outcome.state.detail).toContain('journal could not be written');
+    expect(outcome.state.detail).toContain('nothing was installed');
+    // Nothing ran inside WSL: no npm install, no stop, no swap.
+    expect(h.stages).toBe(0);
+    expect(h.paused).toBe(0);
+    expect(h.activates).toBe(0);
+    expect(cleared).toEqual([]);
+  });
+
+  it('does not stop or swap the runtime when the activating journal cannot be written (P0-A)', async () => {
+    let writes = 0;
+    const cleared: string[] = [];
+    const h = harness();
+    h.journal = {
+      read: () => null,
+      write: () => {
+        writes += 1;
+        // The staging record is written, the activating one fails: exactly the
+        // window the runtime must not be touched in.
+        if (writes > 1) throw new Error('ENOSPC: no space left on device');
+      },
+      clear: () => {
+        cleared.push('clear');
+      },
+      current: () => null,
+    };
+    const outcome = await runner(h).run(accepted.plan, context);
+    expect(outcome.ok).toBe(false);
+    // The stage is prepared but the backend keeps running and nothing is swapped.
+    expect(h.stages).toBe(1);
+    expect(h.paused).toBe(0);
+    expect(h.activates).toBe(0);
+    expect(outcome.state.detail).toContain('nothing was replaced');
+  });
+
+  it('keeps the journal and blocks the app when the rollback itself fails (P0-B)', async () => {
+    const h = harness({
+      activate: { code: 73, tail: 'update: activation failed, restoring the previous install' },
+      restore: { code: 74, tail: 'update: nothing to restore' },
+    });
+    const outcome = await runner(h).run(accepted.plan, { ...context });
+    // Activation fails, the previous install cannot be restored.
+    expect(outcome.ok).toBe(false);
+    expect(h.restores).toBe(1);
+    expect(h.blocked).toHaveLength(1);
+    expect(outcome.state.phase).toBe('failed');
+    expect(outcome.state.detail).toContain('could not be restored');
+    expect(outcome.state.detail).toContain('journal was kept');
+    // The record survives and the old backend is not claimed to be running.
+    expect(h.journal.current()).not.toBeNull();
+    expect(h.resumed).toBe(0);
+  });
+
+  it('keeps the journal when the restored backend does not start (P0-B)', async () => {
+    const h = harness({ resume: [{ ok: false, message: 'backend-lost: nothing listening' }] });
+    const outcome = await runner(h).run(accepted.plan, context);
+    expect(outcome.ok).toBe(false);
+    expect(h.restores).toBe(1);
+    expect(h.blocked).toHaveLength(1);
+    expect(outcome.state.phase).toBe('failed');
+    expect(outcome.state.detail).toContain('journal was kept');
+    expect(h.journal.current()).not.toBeNull();
+  });
+
+  it('keeps the journal after a failed restore in the exception path', async () => {
+    const h = harness({ restore: { code: 74, tail: 'update: nothing to restore' } });
+    h.wsl.activateRuntime = async () => {
+      throw Object.assign(new Error('process gone'), { name: 'ProcessGone' });
+    };
+    const outcome = await runner(h).run(accepted.plan, context);
+    expect(outcome.ok).toBe(false);
+    expect(h.blocked).toHaveLength(1);
+    expect(h.journal.current()).not.toBeNull();
+  });
+
+  it('releases the update lock when the backend cannot be stopped (P1-C)', async () => {
+    const h = harness({ pause: { ok: false, message: 'The app-owned backend could not be stopped: denied' } });
+    const outcome = await runner(h).run(accepted.plan, context);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.state.detail).toContain('could not be stopped');
+    expect(h.order).toContain('release');
+    expect(h.activates).toBe(0);
+    expect(h.journal.current()).toBeNull();
+  });
+
+  it('releases the update lock when stopping the backend throws (P1-C)', async () => {
+    const h = harness({ pauseThrows: true });
+    const outcome = await runner(h).run(accepted.plan, context);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.state.phase).toBe('failed');
+    expect(h.order).toContain('release');
+    expect(h.activates).toBe(0);
+    expect(h.journal.current()).toBeNull();
   });
 
   it('does not run twice at the same time', async () => {

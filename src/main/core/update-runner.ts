@@ -40,6 +40,8 @@ export interface UpdateLifecycle {
   pauseForUpdate(): Promise<UpdateTransition>;
   resumeAfterUpdate(): Promise<UpdateTransition>;
   releaseUpdateLock(): void;
+  /** Terminal state for a runtime that must not be started (failed rollback). */
+  blockForRuntime(message: string): void;
   updateInProgress: boolean;
 }
 
@@ -108,24 +110,108 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
     return publish({ phase, message: describeUpdatePhase(phase), detail });
   };
 
-  const journal = (
+  /**
+   * Persist the journal before the step that needs it.
+   *
+   * A journal that cannot be written is a hard stop: without it an interruption
+   * during the swap would be unrecoverable, so the caller must not continue.
+   */
+  const writeJournal = (
     plan: UpdatePlan,
     context: UpdateContext,
     phase: UpdateJournalPhase,
     startedAt: string,
-  ): void => {
-    deps.journal.write({
-      version: 1,
-      transaction: context.transaction,
-      phase,
-      distro: plan.distro,
-      runtimeRoot: plan.runtimeRoot,
-      canonicalRoot: plan.canonicalRoot,
-      target: plan.version,
-      installed: plan.installedVersion,
-      startedAt,
-      updatedAt: deps.now(),
-    });
+  ): boolean => {
+    try {
+      deps.journal.write({
+        version: 1,
+        transaction: context.transaction,
+        phase,
+        distro: plan.distro,
+        runtimeRoot: plan.runtimeRoot,
+        canonicalRoot: plan.canonicalRoot,
+        target: plan.version,
+        installed: plan.installedVersion,
+        startedAt,
+        updatedAt: deps.now(),
+      });
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      deps.log.error(`update: the ${phase} journal could not be written: ${message}`);
+      terminal.append(`update: the update journal could not be written (${phase}): ${message}`);
+      return false;
+    }
+  };
+
+  /**
+   * Remove the journal when the runtime was provably not touched.
+   *
+   * Used only before the swap: after a swap the journal is the recovery record
+   * and is cleared exclusively by a proven success or a proven rollback.
+   */
+  const clearUnswappedJournal = (): void => {
+    deps.journal.clear();
+  };
+
+  /**
+   * Undo a swap after a failure.
+   *
+   * The journal is the only record of what happened, so it is removed only when
+   * the previous installation was restored *and* the previous backend provably
+   * serves the WebUI again. Any other outcome keeps the journal and puts the app
+   * into a terminal state: starting from a half-swapped runtime would hide it.
+   */
+  const rollback = async (
+    plan: UpdatePlan,
+    context: UpdateContext,
+    reason: string,
+    where: string,
+  ): Promise<UpdateOutcome> => {
+    const restored = await deps.wsl
+      .restoreRuntime(
+        {
+          distro: plan.distro,
+          isolationRoot: plan.runtimeRoot,
+          transaction: context.transaction,
+          nodePath: context.nodePath,
+        },
+        append,
+      )
+      .catch((error: unknown) => ({
+        code: null,
+        tail: error instanceof Error ? error.message : 'unknown error',
+      }));
+
+    if (restored.code !== 0) {
+      const message = `${reason} The previous installation could not be restored (${restored.tail}).`;
+      deps.log.error(`update: rollback failed after ${where}; journal kept and further starts blocked`);
+      deps.lifecycle.blockForRuntime(message);
+      return {
+        ok: false,
+        state: fail(
+          `${message} The app will not start from this runtime: the update journal was kept and the next start tries to restore it again.`,
+          'failed',
+        ),
+      };
+    }
+
+    const resumed = await deps.lifecycle.resumeAfterUpdate();
+    if (!resumed.ok) {
+      const message = `${reason} The previous installation was restored, but its backend did not start (${resumed.message ?? 'unknown error'}).`;
+      deps.log.error('update: restart after rollback failed; journal kept and further starts blocked');
+      deps.lifecycle.blockForRuntime(message);
+      return { ok: false, state: fail(`${message} The update journal was kept.`, 'failed') };
+    }
+
+    deps.journal.clear();
+    return {
+      ok: false,
+      state: fail(
+        `${reason} The previous installation was restored and the previous version is running again.`,
+        'rolled-back',
+      ),
+    };
   };
 
   return {
@@ -145,6 +231,9 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
       deps.log.info(`update: checking ${plan.version} on npm (distro=${plan.distro})`);
       const startedAt = deps.now();
       let activated = false;
+      // True from the moment the swap is attempted: if the call itself throws we
+      // do not know whether the two renames ran, so the journal must survive.
+      let swapStarted = false;
 
       try {
         const check = await deps.wsl.checkPublishedVersion({
@@ -162,8 +251,16 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
           };
         }
 
-        // 1. Stage the new version next to the running one.
-        journal(plan, context, 'staging', startedAt);
+        // 1. Stage the new version next to the running one. The journal must
+        //    exist before anything can be installed or swapped.
+        if (!writeJournal(plan, context, 'staging', startedAt)) {
+          return {
+            ok: false,
+            state: fail(
+              'The update journal could not be written, so nothing was installed. Check free space and write access of the app profile, then try again.',
+            ),
+          };
+        }
         publish({ phase: 'installing', message: describeUpdatePhase('installing') });
         const request = {
           distro: plan.distro,
@@ -175,83 +272,64 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         };
         const staged = await deps.wsl.stageRuntime(request, append);
         if (staged.code !== 0) {
-          deps.journal.clear();
+          // Nothing was swapped, so the journal can go: the runtime was untouched.
+          clearUnswappedJournal();
           const detail =
             staged.tail === '' ? `The updater exited with code ${staged.code ?? 'unknown'}.` : staged.tail;
           return { ok: false, state: fail(detail) };
         }
         terminal.append(`update: ${plan.version} staged and verified`);
 
-        // 2. Quiesce: pause recovery, stop only the app-owned backend.
+        // 2. The activating journal is written *before* the backend is touched: a
+        //    journal that cannot be persisted means the swap must not happen.
+        if (!writeJournal(plan, context, 'activating', startedAt)) {
+          clearUnswappedJournal();
+          return {
+            ok: false,
+            state: fail(
+              'The update journal could not be written, so nothing was replaced. Check free space and write access of the app profile, then try again.',
+            ),
+          };
+        }
+
+        // 3. Quiesce: pause recovery, stop only the app-owned backend.
         publish({ phase: 'stopping', message: describeUpdatePhase('stopping') });
         const paused = await deps.lifecycle.pauseForUpdate();
         if (!paused.ok) {
-          deps.journal.clear();
+          // Nothing was swapped. Release the lock so the app cannot get stuck and
+          // drop the journal, which no longer describes a pending transaction.
+          deps.lifecycle.releaseUpdateLock();
+          clearUnswappedJournal();
           return {
             ok: false,
             state: fail(paused.message ?? 'The app-owned backend could not be stopped, so nothing was replaced.'),
           };
         }
 
-        // 3. Swap. The journal already says "activating": a crash from here on is
-        //    repaired by the recovery path on the next start.
-        journal(plan, context, 'activating', startedAt);
+        // 4. Swap.
+        swapStarted = true;
         const swap = await deps.wsl.activateRuntime(request, append);
         activated = swap.code === 0;
         if (!activated) {
-          // The script restores the previous install itself; do it again (it is
-          // idempotent) in case the swap died halfway through.
-          const restored = await deps.wsl.restoreRuntime(
-            {
-              distro: plan.distro,
-              isolationRoot: plan.runtimeRoot,
-              transaction: context.transaction,
-              nodePath: context.nodePath,
-            },
-            append,
-          );
-          const resumed = await deps.lifecycle.resumeAfterUpdate();
-          deps.journal.clear();
           const detail =
             swap.tail === '' ? `Activation failed with code ${swap.code ?? 'unknown'}.` : swap.tail;
-          const extra = [
-            restored.code === 0 ? 'The previous installation was restored.' : 'The previous installation could not be restored automatically.',
-            resumed.ok ? 'The previous version is running again.' : (resumed.message ?? 'The backend did not start again.'),
-          ].join(' ');
-          return { ok: false, state: fail(`${detail} ${extra}`, 'rolled-back') };
+          return await rollback(plan, context, detail, 'activation');
         }
 
-        // 4. Prove the new version actually serves the WebUI.
-        journal(plan, context, 'verifying-backend', startedAt);
+        // 5. Prove the new version actually serves the WebUI.
+        if (!writeJournal(plan, context, 'verifying-backend', startedAt)) {
+          // The previous record still describes the swap, so a crash here stays
+          // recoverable: continue instead of throwing the transaction away.
+          terminal.append('update: the journal phase could not be updated; the previous record is kept');
+        }
         publish({ phase: 'starting', message: describeUpdatePhase('starting') });
         const resumed = await deps.lifecycle.resumeAfterUpdate();
         if (!resumed.ok) {
           terminal.append('update: the new version did not start, restoring the previous installation');
-          const restored = await deps.wsl.restoreRuntime(
-            {
-              distro: plan.distro,
-              isolationRoot: plan.runtimeRoot,
-              transaction: context.transaction,
-              nodePath: context.nodePath,
-            },
-            append,
-          );
-          const recovered = await deps.lifecycle.resumeAfterUpdate();
-          deps.journal.clear();
-          const extra = [
-            restored.code === 0
-              ? 'The previous installation was restored.'
-              : 'The previous installation could not be restored automatically.',
-            recovered.ok
-              ? 'The previous version is running again.'
-              : (recovered.message ?? 'The previous version could not be started either.'),
-          ].join(' ');
-          return {
-            ok: false,
-            state: fail(`${resumed.message ?? 'The new version did not start.'} ${extra}`, 'rolled-back'),
-          };
+          return await rollback(plan, context, resumed.message ?? 'The new version did not start.', 'start');
         }
 
+        // Only a new backend that really served the WebUI clears the journal.
         deps.journal.clear();
         terminal.append(`update: ${plan.version} is serving the WebUI`);
         const done = publish({
@@ -263,24 +341,13 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         return { ok: true, state: done };
       } catch (error) {
         const detail = error instanceof Error ? `${error.name}: ${error.message}` : 'unknown error';
-        if (activated) {
-          // The swap happened, so never leave the lock or the journal behind.
-          await deps.wsl
-            .restoreRuntime(
-              {
-                distro: plan.distro,
-                isolationRoot: plan.runtimeRoot,
-                transaction: context.transaction,
-                nodePath: context.nodePath,
-              },
-              append,
-            )
-            .catch(() => undefined);
-          deps.journal.clear();
-          await deps.lifecycle.resumeAfterUpdate().catch(() => undefined);
-        } else {
-          deps.lifecycle.releaseUpdateLock();
+        if (swapStarted || activated) {
+          // The swap may have happened: only a proven rollback may clear the
+          // journal, otherwise it stays and the app refuses to start.
+          return await rollback(plan, context, detail, 'exception');
         }
+        deps.lifecycle.releaseUpdateLock();
+        clearUnswappedJournal();
         return { ok: false, state: fail(detail) };
       } finally {
         busy = false;
