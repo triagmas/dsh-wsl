@@ -202,6 +202,63 @@ describe('supervisor recovery', () => {
   });
 });
 
+describe('supervisor update quiesce (issue #12)', () => {
+  it('stops the owned backend and blocks recovery while an update runs', async () => {
+    let alive = true;
+    const harness = createHarness({ wsl: { probe: (pid) => (alive && pid === BACKEND_PID ? backendProbe() : null) } });
+    harness.wsl.signalHook = () => {
+      alive = false;
+    };
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+
+    const paused = await supervisor.pauseForUpdate();
+    expect(paused.ok).toBe(true);
+    expect(harness.wsl.signals).toHaveLength(1);
+    expect(harness.wsl.signals[0]).toMatchObject({ pid: BACKEND_PID, signal: 'TERM' });
+    expect(supervisor.updateInProgress).toBe(true);
+
+    // An exit or a health failure during the swap must not start a new backend.
+    harness.wsl.servers[0]?.exit();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await supervisor.healthTick();
+    expect(harness.wsl.starts).toHaveLength(1);
+
+    // A manual restart or retry is refused as well.
+    await supervisor.restart();
+    await supervisor.retry();
+    expect(harness.wsl.starts).toHaveLength(1);
+
+    // The update installed a new runtime: the next start uses a new process.
+    alive = true;
+    const resumed = await supervisor.resumeAfterUpdate();
+    expect(resumed.ok).toBe(true);
+    expect(supervisor.updateInProgress).toBe(false);
+    expect(harness.wsl.starts).toHaveLength(2);
+    expect(supervisor.state).toBe('READY');
+  });
+
+  it('reports a failed resume instead of claiming success', async () => {
+    const harness = createHarness({ web: { bootstrapStatus: 401 } });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.pauseForUpdate();
+
+    // The new runtime cannot serve the WebUI: the resume has to say so.
+    const resumed = await supervisor.resumeAfterUpdate();
+    expect(resumed.ok).toBe(false);
+    expect(resumed.message).toContain('rejected the startup token');
+    expect(supervisor.state).toBe('ERROR');
+  });
+
+  it('exposes a terminal state for a runtime that cannot be recovered', () => {
+    const harness = createHarness();
+    const supervisor = new Supervisor(harness.deps);
+    supervisor.blockForRuntime('nothing to restore');
+    expect(supervisor.state).toBe('ERROR');
+    expect(lastStatus(harness.statuses).detail).toContain('nothing to restore');
+  });
+});
+
 describe('supervisor shutdown', () => {
   it('stops only the owned process and clears its record', async () => {
     let alive = true;

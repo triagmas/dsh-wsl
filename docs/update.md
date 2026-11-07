@@ -8,8 +8,9 @@ official Windows DeepSeek Harness and the user's projects are never touched.
 ```
 footer pill (only while an update exists)
    -> confirmation window  (facts + Update/Cancel)
-   -> terminal window      (streamed updater output, Close only when finished)
-   -> app relaunches itself and starts the new version
+   -> terminal window      (streamed output; Close only when the run finished)
+   -> backend stopped, runtime swapped, new version started and auth-checked
+   -> app relaunches the portable EXE (or says it cannot)
 ```
 
 ## When the offer appears
@@ -26,72 +27,136 @@ version that does not exist. The bar stays 32 px tall and unchanged otherwise.
 | Reason | Condition |
 | --- | --- |
 | `invalid-version` | target is not an exact release (`^0.2.2`, `latest`, `…; rm -rf /`) |
-| `same-or-older` | `compareSemver(target, installed) <= 0` |
-| `unknown-installed` | `dsh --version` did not report a parsable version |
+| `not-newer` | `compareSemver(target, installed) <= 0` |
+| `installed-unknown` | `dsh --version` did not report a parsable version |
 | `global-installation` | `isolateEnvironment` is off — the app would replace a global DSH |
 | `custom-executable` | a custom `dshPath` is pinned in Settings |
-| `unsafe-root` | `runtimeRoot` is not a dedicated subtree (`~`, `/`, `.`) |
-| `foreign-runtime` | the executable in use is not `<root>/runtime/bin/dsh` |
+| `unsafe-root` | the configured root is not a dedicated subtree, or WSL reported no canonical root |
+| `foreign-runtime` | the executable in use is not **exactly** `<canonical root>/runtime/bin/dsh` |
 
-`isInsideIsolatedRuntime()` matches `~/.local/...` as a path suffix as well as an
-absolute prefix, because the config stores a tilde while WSL reports
-`/home/<user>/…`.
+Ownership is an exact comparison against the root WSL itself reported
+(`RESOLVE_RUNTIME_SCRIPT` prints `root=…` after `cd … && pwd -P`), so a configured
+`~/…` root is never matched as a substring: another user's home, a
+similarly-named directory, a nested copy or `runtime/bin/dsh.tmp` are all
+rejected. Versions are compared with `isSameVersion()` (SemVer equality), never
+with `startsWith`/`includes`.
 
-## The updater script (`src/main/wsl/update-args.ts`)
+## The updater scripts (`src/main/wsl/update-args.ts`)
 
-Both steps run through `wsl.exe -d <distro> --exec /bin/sh -c <script> <args…>`
-with every operand validated (`isExactVersion`, `isValidIsolationRoot`,
-`isValidRuntimeBinary`), never through an interpolated command string.
+Every step runs through `wsl.exe -d <distro> --exec /bin/sh -c <script> <args…>`
+with validated operands (version, root, transaction id, binaries) — no
+interpolated command strings. All five scripts share one prologue:
 
-1. **npm lookup** (`NPM_VIEW_SCRIPT`, read-only): resolves npm with the same
-   `PATH` the backend uses and reports `<marker><npm path>`, then
-   `npm view @deepseek-ai/dsh@<version> version`. A version npm does not publish
-   stops the run before any install.
-2. **install** (`UPDATE_SCRIPT`):
-   - `npm install --global --prefix <root>/update/stage-<ts> --cache <root>/cache/npm @deepseek-ai/dsh@<version>`;
-   - the staged `bin/dsh --version` must report the target version (`exit 71`);
-   - `runtime` → `update/previous-<ts>`, `stage-<ts>` → `runtime`;
-   - the activated `runtime/bin/dsh --version` is verified again; on failure the
-     previous tree is moved back and the stage removed (`exit 72`);
-   - exactly one `previous-*` is kept (the rollback copy), older ones are pruned;
-   - the stage directory is always removed on the way out.
+- a configured `~/…` root is expanded against `$HOME` **inside the script** (a
+  quoted tilde passed as a positional argument is not expanded by the shell) and
+  then canonicalised with `pwd -P`;
+- path traversal, `//`, `/.`, unexpected characters and anything less than a
+  dedicated subtree are rejected;
+- the root and the `runtime`, `update`, `cache` components must not be symlinks,
+  so nothing is written through a link that points outside the root;
+- npm always uses the **private cache** `<root>/cache/npm` (`--cache` plus
+  `npm_config_cache`), never `~/.npm`.
 
-The script never writes outside `<root>` and never installs globally.
+| Step | Script | What it does |
+| --- | --- | --- |
+| npm lookup | `NPM_VIEW_SCRIPT` | read-only `npm view @deepseek-ai/dsh@<ver> version`; an unpublished version stops the run |
+| stage | `STAGE_SCRIPT` | `npm install --global --prefix <root>/update/stage-<tx> --cache <root>/cache/npm`, then the staged `dsh --version` must equal the target **exactly** (`exit 71` otherwise). The running runtime is untouched |
+| activate | `ACTIVATE_SCRIPT` | re-verifies the stage, `runtime` → `update/previous-<tx>`, stage → `runtime`, re-verifies the activated executable; on mismatch it restores the previous tree (`exit 72`/`73`/`74`) and keeps exactly one `previous-*` |
+| restore | `RESTORE_SCRIPT` | idempotent rollback used by the failure path and by journal recovery (`runtime` missing + `previous` present, or a wrong active version) |
+| inspect | `INSPECT_SCRIPT` | read-only report: `runtime=present|missing`, `version=…`, the newest `previous-*` and `stage-*` names |
 
-## Restart
+## Transaction: quiesce, swap, verify, recover
 
-On `phase: 'done'` the main process takes the same graceful path as Quit
-(owned backend stopped, windows destroyed, `shutdown complete` written) and then
-relaunches the portable executable — `PORTABLE_EXECUTABLE_FILE` when present, since
-a portable build runs from a temporary extraction directory. A failed run leaves
-the current installation in place and the app untouched; the terminal window stays
-open with the error and the rollback path.
+The backend is **not** stopped before it has to be:
+
+1. `checking` — the exact version exists on npm;
+2. `installing` — staged next to the running runtime (the backend keeps serving);
+3. `verifying` — the staged executable reports exactly the target version;
+4. `stopping` — the update lock is set (auto-recovery, health checks, tray
+   restart/retry and Quit are refused), then only the **app-owned** backend is
+   stopped through the normal ownership-checked path;
+5. `activating` — the swap, with the previous installation kept;
+6. `starting` — a full backend start (distribution, runtime resolution, token
+   exchange, authenticated request). Success is only reported after this, so a
+   new version that cannot serve the WebUI is a failed update, not a green one.
+
+A journal (`<userData>/update-journal.json`, written atomically before the swap)
+records transaction id, phase, target and canonical root. If the app, the process
+or Windows dies between the two renames, the next start repairs it:
+
+| Observed state | Action |
+| --- | --- |
+| runtime present and reporting the target | `finalize` — the update had finished; start normally |
+| runtime present with another version, previous available | `rollback` — restore the previous installation |
+| runtime missing, previous available | `rollback` |
+| runtime missing, nothing but the stage | `rollback` (stage is activated) |
+| runtime missing, nothing to restore | `blocked` — the app refuses to start a half-swapped tree and explains it |
+
+Every failure path restores the previous installation, starts the old backend and
+reports `rolled-back` ("previous version restored"), never `done`.
+
+## Terminal window
+
+The main process keeps a rolling buffer of 400 lines and publishes `dropped`
+(how many lines fell off the front). The renderer rebuilds the buffer when that
+number changes and appends otherwise, so the stream keeps moving past 400 lines
+instead of freezing. Output is sanitized (`ANSI`/control characters stripped,
+secrets redacted, 320 characters per line) and written with `textContent`.
+
+While a run is active the window is not closable (`setClosable(false)` plus a
+`close` guard) and tray Quit is refused, so a quit cannot interrupt the swap. A
+finished or rolled-back run is closable.
+
+## Relaunch
+
+`resolveRelaunchTarget()` (pure) only accepts `PORTABLE_EXECUTABLE_FILE` when it
+is an existing `.exe`, because a portable build runs from a temporary extraction
+directory and relaunching `process.execPath` would start a copy that is deleted
+right after exit. When no portable path is available the app **does not** claim
+to restart itself: the terminal window explains that the update succeeded and
+the app has to be started again.
+
+The Windows CI job proves this on the packaged build:
+
+```powershell
+WSL-Web-Shell-0.1.0-x64.exe --relaunch-probe=<dir>
+node scripts/check-relaunch.cjs <dir> <portable-exe>
+```
+
+The parent records its own paths, decides the target with the same function the
+update uses and relaunches through `app.relaunch`; the child records the
+executable it was started from. The check fails unless the child runs from the
+portable EXE itself.
 
 ## Windows and IPC
 
 | Surface | File | Notes |
 | --- | --- | --- |
 | confirmation | `src/update/confirm.html` | 560×460, modal, `sandbox: true`, CSP `default-src 'none'` |
-| terminal | `src/update/progress.html` | 720×520, resizable, `aria-live` pre, text via `textContent` |
+| terminal | `src/update/progress.html` | 720×520, resizable, `aria-live` pre |
 | bridge | `src/preload/update.ts` | `probe/start/state/onState/close` only |
 
 Channels: `footer:open-update`, `update:probe`, `update:start`, `update:state`,
-`update:close` (main) and the `update:state` event (renderer). All are registered
-through the existing `isTrustedSender` guard. The renderer never performs network
-I/O: it only renders state pushed by the main process.
+`update:close` (main) and the `update:state` event. All are registered through the
+existing `isTrustedSender` guard; the renderer performs no network I/O.
 
 ## Verification
 
-- `tests/update.test.ts` — guards, terminal buffer, phase model, runner order and
-  failure paths (28 tests).
-- `tests/wsl-update-args.test.ts` — argument construction/validation plus a real
-  `/bin/sh` end-to-end run of the shipped `UPDATE_SCRIPT` in a throwaway
-  directory with a fake npm: success, npm failure (`exit 7`) and a
-  wrong-version stage (`exit 71`, runtime untouched) (8 tests).
-- `npm run chrome:smoke` — renders the pill, the confirmation window and the
-  terminal window with their shipped preloads and asserts 34 behaviours.
-- `npm run screenshots` — writes `docs/media/update-confirm.png` and
-  `docs/media/update-terminal.png`.
+- `tests/update.test.ts` — guards, exact version equality, ownership paths,
+  terminal buffer and rolling-cap streaming, phase model, journal round-trip,
+  every recovery decision, the full runner transaction (order, rollback on
+  activation failure, rollback when the new version does not start, journal
+  before the swap), portable relaunch decisions and the window/shutdown wiring.
+- `tests/wsl-update-args.test.ts` — argument validation plus a real `/bin/sh`
+  end-to-end run with a fake `$HOME` and a fake npm: `~/` expansion, private
+  cache, symlinked root/runtime refusal, substring version refusal, staging,
+  activation, rollback and recovery from an interruption at both swap boundaries.
+- `tests/supervisor.test.ts` — quiesce stops only the owned backend and blocks
+  recovery/restart/retry while locked, a failed resume is reported, and a blocked
+  runtime becomes a terminal error.
+- `npm run chrome:smoke` — renders the pill, the confirmation and the terminal
+  window and asserts 38 behaviours, including streaming past 400 lines.
+- Windows CI — packaged relaunch check (above) on a real runner.
 
-All of this is isolated: no test starts WSL, npm, or the owner's desktop.
+All of this is isolated: no test starts WSL, npm, or a desktop session.
 A real update on the owner's machine is a separate, explicitly approved step.

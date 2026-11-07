@@ -76,10 +76,12 @@ render smoke (`npm run chrome:smoke`) and the screenshots in
 ![Footer bar over a mock upstream surface](docs/media/footer-bar.png)
 
 When GitHub reports a newer release, the bar also offers a one-click update of the
-isolated runtime: the exact published version is installed below the app's own
-runtime root, the previous installation is kept for rollback, and the app restarts
-itself. The global `dsh`, the official Windows Harness and the projects are never
-touched. Details in [docs/update.md](docs/update.md).
+isolated runtime: the exact published version is staged below the app's own runtime
+root, the app-owned backend is stopped only for the swap, the previous installation
+is kept for rollback and an interrupted swap is repaired on the next start. The new
+version is reported as successful only after it served the WebUI, and the portable
+EXE then restarts itself. The global `dsh`, the official Windows Harness and the
+projects are never touched. Details in [docs/update.md](docs/update.md).
 
 | Before | During / after |
 |---|---|
@@ -120,6 +122,10 @@ npm run screenshots     # same render, writes docs/media/*.png
 npm run composition:smoke  # real BrowserWindow + WebContentsView composition
                         # against a local test server: bar, bounds, resize, session,
                         # cold-start attach order
+node scripts/check-relaunch.cjs <dir> <exe>
+                        # Windows CI only: verifies that the packaged EXE
+                        # relaunches itself from the portable file, not from the
+                        # temporary extraction directory
 npm run paint:probe     # real screen pixels of a composed window: the remote
                         # WebUI must be visible above the bar (needs a display;
                         # CI uses xvfb on Linux and a desktop session on Windows)

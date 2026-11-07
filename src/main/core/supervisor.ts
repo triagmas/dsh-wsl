@@ -15,6 +15,7 @@ import { verifyOwnership, type OwnedServerRecord } from './ownership.js';
 import { classifyPortSituation, type PortState } from './port.js';
 import { sanitizeOptional } from './display.js';
 import { buildIsolationPlan, isolationRootArg, resolveLaunchWorkspace, type IsolationPlan } from './isolation.js';
+import type { RuntimeObservation } from './update.js';
 
 export interface ExitInfo {
   code: number | null;
@@ -48,6 +49,12 @@ export interface StartServerRequest {
 export interface ResolvedRuntime {
   dshPath: string;
   nodePath: string | null;
+  /**
+   * Canonical (symlink-resolved) isolation root reported by WSL, `null` when the
+   * backend was resolved without isolation. The updater compares the executable
+   * path against exactly this root (issue #12).
+   */
+  canonicalRoot?: string | null;
 }
 
 /** Result of the read-only "does this exact version exist on npm" check. */
@@ -61,13 +68,22 @@ export interface NpmVersionCheck {
   message: string | null;
 }
 
-/** One streaming update run inside the distribution. */
+/** One streaming update step inside the distribution. */
 export interface UpdateRunRequest {
   distro: string;
   isolationRoot: string;
   version: string;
   nodePath: string | null;
   npmPath: string;
+  /** Transaction id shared by stage/activate/restore and the journal. */
+  transaction: string;
+}
+
+export interface UpdateRestoreRequest {
+  distro: string;
+  isolationRoot: string;
+  transaction: string;
+  nodePath: string | null;
 }
 
 export interface UpdateRunResult {
@@ -96,8 +112,20 @@ export interface WslGateway {
     version: string;
     nodePath: string | null;
   }): Promise<NpmVersionCheck>;
-  /** Install the exact version into the isolated runtime, streaming output. */
-  installRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
+  /** Install the exact version into a staging prefix, streaming output. */
+  stageRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
+  /** Swap the staged tree into `runtime/`, keeping the previous installation. */
+  activateRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
+  /** Restore `update/previous-<tx>` (failure path and journal recovery). */
+  restoreRuntime(request: UpdateRestoreRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
+  /** Read-only state of the isolated root, used to decide journal recovery. */
+  inspectRuntime(distro: string, isolationRoot: string): Promise<RuntimeObservation>;
+}
+
+/** Result of pausing or resuming the supervisor around an update. */
+export interface UpdateTransition {
+  ok: boolean;
+  message: string | null;
 }
 
 export interface WebClient {
@@ -134,6 +162,7 @@ export type ShellErrorCode =
   | 'health-failed'
   | 'backend-lost'
   | 'retry-exhausted'
+  | 'runtime-blocked'
   | 'unexpected';
 
 export class ShellError extends Error {
@@ -182,6 +211,11 @@ export class Supervisor {
   private dshVersion: string | null = null;
   /** Runtime actually launched; `null` until a start resolved one (issue #12). */
   private runtime: ResolvedRuntime | null = null;
+  /**
+   * True while an update owns the backend lifecycle: automatic recovery, health
+   * checks and manual restarts are paused so nothing races the runtime swap.
+   */
+  private updateLocked = false;
 
   constructor(private readonly deps: SupervisorDeps) {
     this.status = this.buildStatus('CHECKING', null);
@@ -269,7 +303,7 @@ export class Supervisor {
   /** First launch or manual retry: serialized, never parallel. */
   start(): Promise<void> {
     return this.serial(async () => {
-      if (this.quitting) return;
+      if (this.quitting || this.refuseDuringUpdate('start')) return;
       // Repeated launches must never spawn a second server for the same port.
       if (this.owned && (this.lifecycle.state === 'READY' || this.lifecycle.state === 'HIDDEN_IN_TRAY' || this.lifecycle.state === 'CONNECTING')) {
         return;
@@ -282,7 +316,7 @@ export class Supervisor {
   /** Tray "Restart WebUI": always restarts the app-owned backend. */
   restart(): Promise<void> {
     return this.serial(async () => {
-      if (this.quitting) return;
+      if (this.quitting || this.refuseDuringUpdate('restart')) return;
       if (!this.owned) {
         this.setDetail('Only the backend started by this app can be restarted.');
         return;
@@ -297,11 +331,95 @@ export class Supervisor {
   /** Retry from a terminal error state. */
   retry(): Promise<void> {
     return this.serial(async () => {
-      if (this.quitting) return;
+      if (this.quitting || this.refuseDuringUpdate('retry')) return;
       if (this.lifecycle.state === 'ERROR') this.setState('CHECKING', null);
       this.attempt = 0;
       await this.bringUp();
     });
+  }
+
+  /** Pause auto-recovery and stop the app-owned backend before the swap. */
+  pauseForUpdate(): Promise<UpdateTransition> {
+    return this.serial(async () => {
+      if (this.quitting) return { ok: false, message: 'The app is quitting.' };
+      this.updateLocked = true;
+      if (!this.owned && this.serverPid === null && this.server === null) {
+        this.deps.log.info('update: no app-owned backend is running');
+        return { ok: true, message: null };
+      }
+      this.setState('RECOVERING', 'Stopping DeepSeek Harness for the update');
+      try {
+        await this.stopOwnedServer();
+        this.deps.log.info('update: app-owned backend stopped');
+        return { ok: true, message: null };
+      } catch (error) {
+        this.deps.log.error(`update: stopping the backend failed (${describe(error)})`);
+        return { ok: false, message: `The app-owned backend could not be stopped: ${describe(error)}` };
+      }
+    });
+  }
+
+  /**
+   * Start the backend again from the (new or restored) runtime.
+   *
+   * This is a full start: distribution check, runtime resolution, token exchange
+   * and the authenticated request — so "the update succeeded" is only reported
+   * when the new version really serves the WebUI.
+   */
+  resumeAfterUpdate(): Promise<UpdateTransition> {
+    return this.serial(async () => {
+      if (this.quitting) {
+        this.updateLocked = false;
+        return { ok: false, message: 'The app is quitting.' };
+      }
+      this.attempt = 0;
+      try {
+        // The lock stays held until the start finished, so a late exit event from
+        // the backend that was just stopped cannot start a recovery mid-update.
+        await this.bringUp();
+        this.deps.log.info('update: backend started from the active runtime');
+        return { ok: true, message: null };
+      } catch (error) {
+        this.deps.log.error(`update: starting the backend failed (${describe(error)})`);
+        return { ok: false, message: describe(error) };
+      } finally {
+        this.updateLocked = false;
+      }
+    });
+  }
+
+  /**
+   * Terminal state for a runtime the app must not start.
+   *
+   * Used when an interrupted update left the isolated root in a state the
+   * recovery could not repair: starting a backend from a half-swapped tree would
+   * hide the problem, so the app explains it instead.
+   */
+  blockForRuntime(message: string): void {
+    this.releaseUpdateLock();
+    this.owned = false;
+    this.fail(
+      new ShellError(
+        'runtime-blocked',
+        'The DeepSeek Harness runtime could not be restored after an interrupted update.',
+        message,
+      ),
+    );
+  }
+
+  /** Release the update lock without starting anything (rollback path). */
+  releaseUpdateLock(): void {
+    this.updateLocked = false;
+  }
+
+  get updateInProgress(): boolean {
+    return this.updateLocked;
+  }
+
+  private refuseDuringUpdate(action: string): boolean {
+    if (!this.updateLocked) return false;
+    this.deps.log.info(`${action} ignored: an update is in progress`);
+    return true;
   }
 
   markHidden(hidden: boolean): void {
@@ -316,6 +434,7 @@ export class Supervisor {
 
   /** Health tick driven by the main process (visible ~10 s, hidden ~25 s). */
   async healthTick(): Promise<void> {
+    if (this.updateLocked) return;
     const state = this.lifecycle.state;
     if (state !== 'READY' && state !== 'HIDDEN_IN_TRAY') return;
     const origin = buildOrigin(this.port());
@@ -338,6 +457,11 @@ export class Supervisor {
 
   /** Unexpected process death, wired by the main process. */
   async handleServerExit(exit: ExitInfo): Promise<void> {
+    if (this.updateLocked) {
+      // The update stops the backend on purpose; recovery must not race it.
+      this.deps.log.debug(`backend exit ignored during the update (code=${exit.code ?? 'null'})`);
+      return;
+    }
     if (this.quitting || this.lifecycle.state === 'QUITTING' || this.lifecycle.state === 'ERROR') return;
     const active: LifecycleState[] = ['STARTING_WEB', 'CONNECTING', 'READY', 'HIDDEN_IN_TRAY'];
     if (!active.includes(this.lifecycle.state)) return;
@@ -346,7 +470,7 @@ export class Supervisor {
   }
 
   private async handleLoss(reason: string): Promise<void> {
-    if (this.recoveryRunning || this.quitting) return;
+    if (this.recoveryRunning || this.quitting || this.updateLocked) return;
     this.recoveryRunning = true;
     try {
       this.setState('RECOVERING', reason === 'process-exited' ? 'DeepSeek Harness stopped unexpectedly' : 'Connection to DeepSeek Harness lost');
@@ -429,7 +553,7 @@ export class Supervisor {
         config.dshPath,
         plan.enabled ? plan.root : null,
       );
-      this.runtime = runtime;
+      this.runtime = { ...runtime, canonicalRoot: runtime.canonicalRoot ?? null };
       await this.refreshDshVersion(config.distro, runtime.dshPath, runtime.nodePath);
 
       const portState = await this.deps.probePort(config.port);

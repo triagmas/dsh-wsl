@@ -9,7 +9,7 @@ import { BrowserWindow, WebContentsView, screen, session, shell, type Session } 
 import { join } from 'node:path';
 import type { Logger } from '../core/logger.js';
 import type { ShellStatus, VersionSnapshot } from '../../shared/types.js';
-import type { UpdateState } from '../core/update.js';
+import { isUpdateRunning, type UpdateState } from '../core/update.js';
 import { computePopoverBounds, computeViewBounds, type PopoverAnchor } from '../core/footer.js';
 import { decideNavigation, decidePermission, decideWindowOpen } from '../core/navigation.js';
 import type { WindowEventContext, WindowEventName, WindowSurface } from '../core/diagnostics.js';
@@ -710,6 +710,17 @@ export class Windows {
       title: 'WSL Web Shell — Updating DeepSeek Harness',
       modal: true,
     });
+    // The window must not disappear while the runtime is being swapped: a user
+    // closing it would hide the outcome and invite a quit mid-transaction.
+    window.setClosable(false);
+    window.on('close', (event) => {
+      if (this.updateState !== null && isUpdateRunning(this.updateState.phase)) {
+        event.preventDefault();
+        this.options.log.warn('update window close blocked: an update is running');
+        this.updateProgress?.flashFrame(true);
+        this.sendUpdateState(window, this.updateState);
+      }
+    });
     window.on('closed', () => {
       this.updateProgress = null;
     });
@@ -771,6 +782,13 @@ export class Windows {
   /** Push the update state to both update windows. */
   publishUpdate(state: UpdateState): void {
     this.updateState = state;
+    // The window is closable again as soon as the run reached a final phase.
+    const progress = this.updateProgress;
+    if (progress !== null && !progress.isDestroyed()) {
+      const running = isUpdateRunning(state.phase);
+      progress.setClosable(!running);
+      if (!running) progress.flashFrame(false);
+    }
     for (const window of [this.updateConfirm, this.updateProgress]) {
       if (window === null || window.isDestroyed() || window.webContents.isDestroyed()) continue;
       this.sendUpdateState(window, state);

@@ -89,6 +89,7 @@ const updateRunning = {
   targetVersion: '0.2.2-rc.1',
   installedVersion: '0.2.1-rc.5',
   updateAvailable: true,
+  dropped: 0,
   lines: [
     'update: published version 0.2.2-rc.1 confirmed by npm',
     'update: staging into ~/.local/share/wsl-web-shell/update/stage-20261106T134500Z',
@@ -109,8 +110,10 @@ const updateDone = {
     'update: verifying the staged installation',
     'update: staged executable reports 0.2.2-rc.1',
     'update: activating',
+    'update: installed version 0.2.2-rc.1',
     'update: previous installation kept at ~/.local/share/wsl-web-shell/update/previous-20261106T134500Z',
-    'update: done',
+    'update: starting the new version',
+    'update: 0.2.2-rc.1 is serving the WebUI',
   ],
   finishedAt: '2026-11-06T13:45:24.000Z',
 };
@@ -339,6 +342,29 @@ async function checkUpdateWindows() {
   const closeDisabled = await evaluate(progress, "document.getElementById('close').disabled");
   check('the terminal window cannot be closed mid-run', closeDisabled === true, String(closeDisabled));
 
+  // Rolling-cap regression (review blocker D): the main process keeps 400 lines
+  // and publishes how many it dropped. Appending alone would freeze the view.
+  const streamed = Array.from({ length: 450 }, (_, index) => `update: line ${index + 1}`);
+  progress.webContents.send('update:state', {
+    ...updateRunning,
+    phase: 'installing',
+    message: 'Installing 0.2.2-rc.1',
+    lines: streamed.slice(0, 400),
+    dropped: 0,
+  });
+  await settle(150);
+  progress.webContents.send('update:state', {
+    ...updateRunning,
+    phase: 'installing',
+    message: 'Installing 0.2.2-rc.1',
+    lines: streamed.slice(50),
+    dropped: 50,
+  });
+  await settle(200);
+  const tail = await evaluate(progress, "document.querySelector('#terminal')?.textContent ?? ''");
+  check('the terminal keeps streaming past the 400-line cap', tail.includes('update: line 450'), tail.slice(-60));
+  check('the terminal drops the oldest lines instead of freezing', !tail.includes('update: line 1\n'), 'contains line 1');
+
   progress.webContents.send('update:state', updateDone);
   await settle(250);
   const donePhase = await evaluate(progress, "document.querySelector('#status')?.dataset.phase ?? ''");
@@ -346,7 +372,22 @@ async function checkUpdateWindows() {
   const closeEnabled = await evaluate(progress, "document.getElementById('close').disabled");
   check('the terminal window is closable once the update finished', closeEnabled === false, String(closeEnabled));
   const keptLines = await evaluate(progress, "document.querySelector('#terminal')?.textContent ?? ''");
-  check('the terminal keeps the earlier output instead of replacing it', keptLines.includes('update: staging into') && keptLines.includes('update: done'));
+  check(
+    'the terminal keeps the earlier output instead of replacing it',
+    keptLines.includes('update: staging into') && keptLines.includes('is serving the WebUI'),
+  );
+
+  // The rollback phase is reported as a finished, closable state.
+  progress.webContents.send('update:state', {
+    ...updateRunning,
+    phase: 'rolled-back',
+    message: 'Update failed, previous version restored',
+    detail: 'The previous installation was restored. The previous version is running again.',
+  });
+  await settle(200);
+  const rolledBack = await evaluate(progress, "document.querySelector('#status')?.dataset.phase ?? ''");
+  const rollbackClose = await evaluate(progress, "document.getElementById('close').disabled");
+  check('a rolled-back update is reported and closable', rolledBack === 'rolled-back' && rollbackClose === false, rolledBack);
 
   return { confirm, progress, done: updateDone };
 }

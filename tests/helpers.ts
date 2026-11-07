@@ -6,9 +6,11 @@ import type {
   StartServerRequest,
   UpdateRunRequest,
   UpdateRunResult,
+  UpdateRestoreRequest,
   WslGateway,
 } from '../src/main/core/supervisor.js';
 import type { ProcessProbe } from '../src/main/wsl/output.js';
+import type { RuntimeObservation } from '../src/main/core/update.js';
 import type { WebClient } from '../src/main/core/supervisor.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
 import { createNullLogger } from '../src/main/core/logger.js';
@@ -120,9 +122,21 @@ export class FakeWsl implements WslGateway {
 
   /** Update-related fake state (issue #12). */
   npmCheckResult: NpmVersionCheck = { found: true, npmPath: '/usr/bin/npm', reported: '0.2.2-rc.1', message: null };
-  updateRunCode: number | null = 0;
-  updateRunLines: string[] = ['update: done'];
-  readonly updateRuns: UpdateRunRequest[] = [];
+  /** Per-step exit codes: staged install, activation, restore. */
+  stageCode: number | null = 0;
+  activateCode: number | null = 0;
+  restoreCode: number | null = 0;
+  updateRunLines: string[] = ['update: verifying the staged installation', 'update: staged version 0.2.2-rc.1'];
+  /** What `inspectRuntime` reports (journal recovery tests). */
+  runtimeObservation: RuntimeObservation = {
+    runtimePresent: true,
+    runtimeVersion: '0.2.1-rc.5',
+    previous: null,
+    stage: null,
+  };
+  readonly stageRuns: UpdateRunRequest[] = [];
+  readonly activateRuns: UpdateRunRequest[] = [];
+  readonly restoreRuns: UpdateRestoreRequest[] = [];
   readonly npmChecks: { distro: string; isolationRoot: string; version: string; nodePath: string | null }[] = [];
 
   async checkPublishedVersion(request: {
@@ -135,10 +149,26 @@ export class FakeWsl implements WslGateway {
     return { ...this.npmCheckResult, reported: this.npmCheckResult.reported ?? request.version };
   }
 
-  async installRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
-    this.updateRuns.push(request);
+  async stageRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
+    this.stageRuns.push(request);
     for (const line of this.updateRunLines) onLine(line);
-    return { code: this.updateRunCode, tail: this.updateRunLines.slice(-2).join(' ') };
+    return { code: this.stageCode, tail: this.updateRunLines.slice(-2).join(' ') };
+  }
+
+  async activateRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
+    this.activateRuns.push(request);
+    onLine('update: activating');
+    return { code: this.activateCode, tail: this.activateCode === 0 ? 'update: installed version 0.2.2-rc.1' : 'update: activation failed' };
+  }
+
+  async restoreRuntime(request: UpdateRestoreRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
+    this.restoreRuns.push(request);
+    onLine('update: restoring the previous installation');
+    return { code: this.restoreCode, tail: this.restoreCode === 0 ? 'update: rollout reverted' : 'update: nothing to restore' };
+  }
+
+  async inspectRuntime(): Promise<RuntimeObservation> {
+    return { ...this.runtimeObservation };
   }
 
   async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {
