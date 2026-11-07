@@ -60,11 +60,48 @@ jobs:
       - name: Composition paint probe (real screen pixels)
         run: npm run paint:probe:xvfb
 
+      - name: Upload paint probe screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-paint-probe
+          path: paint-probe
+          retention-days: 7
+
       - name: Upload build output
         uses: actions/upload-artifact@v4
         with:
           name: dist-linux-build
           path: dist
+          retention-days: 7
+
+  # Issue #11 regression: on a real Windows desktop session the remote WebUI
+  # surface must actually be visible above the footer bar. Runs on its own so a
+  # composition failure is reported even when other jobs are red.
+  windows-paint:
+    name: Windows composition paint
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Composition paint probe (Windows desktop)
+        run: npm run paint:probe -- --out paint-probe
+
+      - name: Upload paint probe screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-paint-probe
+          path: paint-probe
           retention-days: 7
 
   windows-package:
@@ -88,19 +125,6 @@ jobs:
           npm run typecheck
           npm run lint
           npm test
-
-      # The regression check for issue #11: on a real Windows desktop the remote
-      # WebUI must be visible above the footer bar.
-      - name: Composition paint probe (Windows desktop)
-        run: npm run paint:probe -- --out paint-probe
-
-      - name: Upload paint probe screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-paint-probe
-          path: paint-probe
-          retention-days: 7
 
       - name: Package portable EXE
         run: npm run dist

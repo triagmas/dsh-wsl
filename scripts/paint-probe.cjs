@@ -121,6 +121,8 @@ async function inspectWindow(window, label) {
   const samples = {
     webui: [Math.round(content.x + content.width / 2), Math.round(content.y + Math.round(content.height / 2) - 8)],
     bar: [Math.round(content.x + content.width / 2), Math.round(content.y + content.height - 16)],
+    topLeft: [Math.round(content.x + 6), Math.round(content.y + 6)],
+    outside: [Math.round(content.x / 2), Math.round(content.y / 2)],
   };
   let shot;
   try {
@@ -138,9 +140,14 @@ async function inspectWindow(window, label) {
   if (shot === null) return { label, capture: 'unavailable', content, samples, webuiPixels: null, barPixels: null };
   const webuiPixels = shot.pixel(samples.webui[0], samples.webui[1]);
   const barPixels = shot.pixel(samples.bar[0], samples.bar[1]);
+  const probePixels = {
+    topLeft: shot.pixel(samples.topLeft[0], samples.topLeft[1]),
+    outside: shot.pixel(samples.outside[0], samples.outside[1]),
+  };
   if (outDir !== null) {
     mkdirSync(outDir, { recursive: true });
     writeFileSync(join(outDir, `${label}.png`), shot.source.thumbnail.toPNG());
+    writeFileSync(join(outDir, `${label}-window.png`), (await window.capturePage()).toPNG());
   }
   const webuiVisible = near(webuiPixels, WEBUI_COLOR);
   // The bar sample proves the capture itself works (the app-owned page paints).
@@ -151,6 +158,8 @@ async function inspectWindow(window, label) {
     content,
     childViews,
     samples,
+    probePixels,
+    screen: shot.size,
     webuiPixels,
     barPixels,
     webuiVisible,
@@ -284,7 +293,8 @@ app.whenReady().then(async () => {
     if (result.pass !== true) failed += 1;
     console.log(
       `${status} ${result.label}: capture=${result.capture ?? 'n/a'} webuiPixel=${JSON.stringify(result.webuiPixels ?? null)} ` +
-        `barPixel=${JSON.stringify(result.barPixels ?? null)} views=${JSON.stringify(result.childViews ?? null)} ` +
+        `barPixel=${JSON.stringify(result.barPixels ?? null)} probes=${JSON.stringify(result.probePixels ?? null)} ` +
+        `screen=${JSON.stringify(result.screen ?? null)} views=${JSON.stringify(result.childViews ?? null)} ` +
         `content=${JSON.stringify(result.content ?? null)}${result.error === undefined ? '' : ` error=${result.error}`}`,
     );
   }
