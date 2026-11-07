@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WSL Web Shell</title>
+    <link rel="stylesheet" href="./chrome.css" />
+  </head>
+  <body>
+    <footer id="bar" aria-label="Connection status">
+      <div class="left">
+        <span class="dot" id="dot" data-tone="idle" aria-hidden="true"></span>
+        <span class="label" id="conn-label">Checking</span>
+        <span class="sep" aria-hidden="true">·</span>
+        <span class="endpoint" id="endpoint" title=""></span>
+      </div>
+      <div class="right">
+        <button type="button" class="version" id="installed" title="DeepSeek Harness version in use">
+          <span class="version-text">DSH —</span>
+        </button>
+        <button type="button" class="version" id="latest" title="Latest upstream release on GitHub">
+          <span class="version-text">GitHub …</span>
+          <span class="version-arrow" id="latest-arrow" aria-hidden="true" hidden>↑</span>
+        </button>
+        <button type="button" class="gear" id="gear" aria-label="Settings" title="Settings" aria-haspopup="dialog" aria-expanded="false">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+            <path
+              fill="currentColor"
+              d="M8 5.2A2.8 2.8 0 1 0 8 10.8 2.8 2.8 0 0 0 8 5.2Zm0 4.3a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3Z"
+            />
+            <path
+              fill="currentColor"
+              d="m13.3 8.9.9.7a.5.5 0 0 1 .1.6l-.8 1.4a.5.5 0 0 1-.6.2l-1.1-.4a4.7 4.7 0 0 1-1 .6l-.2 1.2a.5.5 0 0 1-.5.4H8.2a.5.5 0 0 1-.5-.4l-.2-1.2a4.7 4.7 0 0 1-1-.6l-1.1.4a.5.5 0 0 1-.6-.2l-.8-1.4a.5.5 0 0 1 .1-.6l.9-.7a4.6 4.6 0 0 1 0-1.2l-.9-.7a.5.5 0 0 1-.1-.6l.8-1.4a.5.5 0 0 1 .6-.2l1.1.4a4.7 4.7 0 0 1 1-.6l.2-1.2a.5.5 0 0 1 .5-.4h1.9a.5.5 0 0 1 .5.4l.2 1.2c.4.2.7.4 1 .6l1.1-.4a.5.5 0 0 1 .6.2l.8 1.4a.5.5 0 0 1-.1.6l-.9.7a4.6 4.6 0 0 1 0 1.2Z"
+              opacity=".55"
+            />
+          </svg>
+        </button>
+      </div>
+    </footer>
+    <script src="./chrome.js"></script>
+  </body>
+</html>

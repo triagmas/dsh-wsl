@@ -61,7 +61,38 @@ export interface ShellStatus {
   maxAttempts: number;
   /** Path of the local log file, shown in the diagnostics view. */
   logPath: string | null;
+  /**
+   * Version reported by the DSH executable this app selected, `null` until it is
+   * known (or when it cannot be queried). Informational only.
+   */
+  dshVersion: string | null;
   updatedAt: string;
+}
+
+/** Newest published upstream DSH release, as reported by the GitHub API. */
+export interface LatestVersionInfo {
+  /** Release version without the `dsh-v` tag prefix, e.g. `0.2.2-rc.1`. */
+  version: string;
+  /** HTML URL of the upstream release. Opens in the system browser only. */
+  url: string;
+  /** True when the upstream release is marked as a pre-release. */
+  prerelease: boolean;
+  /** Release publication timestamp, ISO 8601. */
+  publishedAt: string;
+}
+
+/** Footer payload: installed version plus the cached upstream lookup state. */
+export interface VersionSnapshot {
+  /** Version of the DSH executable currently selected, `null` while unknown. */
+  installed: string | null;
+  /** Last successfully fetched upstream release, `null` when never fetched. */
+  latest: LatestVersionInfo | null;
+  /** When the upstream lookup last succeeded, ISO 8601, `null` if never. */
+  checkedAt: string | null;
+  /** Last lookup error, already sanitized and short, `null` when healthy. */
+  error: string | null;
+  /** True when the upstream release is strictly newer than the installed one. */
+  updateAvailable: boolean;
 }
 
 export interface ConfigPatch {

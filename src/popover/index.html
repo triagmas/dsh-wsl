@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WSL Web Shell — Settings</title>
+    <link rel="stylesheet" href="./popover.css" />
+  </head>
+  <body>
+    <main class="popover" role="dialog" aria-label="Settings">
+      <header class="head">
+        <h1>Settings</h1>
+        <button type="button" class="link" id="openFull" title="Open the full settings window">
+          All settings…
+        </button>
+      </header>
+
+      <form id="form" autocomplete="off">
+        <details class="group" open>
+          <summary>Backend</summary>
+          <label class="field">
+            <span>WSL distribution</span>
+            <select id="distro" name="distro"></select>
+          </label>
+          <label class="field">
+            <span>Loopback port</span>
+            <input id="port" name="port" type="number" min="1024" max="65535" step="1" inputmode="numeric" />
+          </label>
+          <label class="field">
+            <span>Workspace root inside WSL</span>
+            <input id="workspace" name="workspace" type="text" spellcheck="false" placeholder="~" />
+            <small>Trailing slashes are normalised; the app enters this directory.</small>
+          </label>
+        </details>
+
+        <details class="group">
+          <summary>DeepSeek Harness</summary>
+          <label class="field">
+            <span>Executable (optional)</span>
+            <input id="dshPath" name="dshPath" type="text" spellcheck="false" placeholder="/usr/local/bin/dsh" />
+          </label>
+          <label class="toggle">
+            <input id="isolateEnvironment" name="isolateEnvironment" type="checkbox" />
+            <span>Isolated environment</span>
+          </label>
+          <label class="field">
+            <span>Isolated root inside WSL</span>
+            <input id="runtimeRoot" name="runtimeRoot" type="text" spellcheck="false" placeholder="~/.local/share/wsl-web-shell" />
+          </label>
+        </details>
+
+        <details class="group">
+          <summary>Behaviour</summary>
+          <label class="toggle">
+            <input id="autoRestart" name="autoRestart" type="checkbox" />
+            <span>Restart the backend automatically</span>
+          </label>
+          <label class="field inline">
+            <span>Max attempts</span>
+            <input id="maxRestartAttempts" name="maxRestartAttempts" type="number" min="0" max="20" step="1" />
+          </label>
+          <label class="toggle">
+            <input id="openOnLaunch" name="openOnLaunch" type="checkbox" />
+            <span>Open the window when ready</span>
+          </label>
+        </details>
+
+        <p class="notice" id="notice" role="status" aria-live="polite"></p>
+
+        <footer class="actions">
+          <span class="state" id="stateLabel">—</span>
+          <span class="spacer"></span>
+          <button type="button" class="secondary" id="close">Close</button>
+          <button type="submit" class="primary" id="save">Save</button>
+        </footer>
+      </form>
+    </main>
+    <script src="./popover.js"></script>
+  </body>
+</html>

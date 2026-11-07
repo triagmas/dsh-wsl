@@ -21,7 +21,13 @@
     "start": "npm run build && electron .",
     "dist:dir": "npm run build && electron-builder --win dir --x64 --publish never",
     "dist": "npm run build && electron-builder --win portable --x64 --publish never",
-    "smoke:headless": "node scripts/smoke-headless.mjs"
+    "smoke:headless": "node scripts/smoke-headless.mjs",
+    "screenshots": "npm run build && xvfb-run -a electron scripts/screenshot-ui.cjs --no-sandbox --write-images",
+    "chrome:smoke": "npm run build && xvfb-run -a electron scripts/screenshot-ui.cjs --no-sandbox",
+    "composition:build": "node scripts/build-composition.mjs",
+    "composition:smoke": "npm run build && npm run composition:build && xvfb-run -a electron scripts/composition-smoke.cjs --no-sandbox",
+    "paint:probe": "npm run build && npm run composition:build && electron scripts/paint-probe.cjs",
+    "paint:probe:xvfb": "npm run build && npm run composition:build && xvfb-run -a electron scripts/paint-probe.cjs --no-sandbox"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

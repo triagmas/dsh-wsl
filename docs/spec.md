@@ -67,6 +67,8 @@ Additional states: `HIDDEN_IN_TRAY` (window hidden, still supervised), `RECOVERI
 
 Use a minimal **original** local splash inspired by [21st.dev's Orbital Loader](https://21st.dev/@molecule-lab-rushil/components/orbital-loader), not a wholesale dependency-heavy UI kit. A soft animated orbit, neutral dark background, logo + short stage-specific messages. Allow an optional light look and `prefers-reduced-motion`; no fabricated percentage or imitation of Harness's composer. On reconnect, a slight backdrop dim/blur with “Reconnecting…” is enough. Show Retry/Diagnostics when terminally failed. The actual DSH WebUI remains intact.
 
+The main window keeps a thin permanent bottom bar (30–34 px) owned by the app: connection state, distro and port on the left, the running `DSH` version and the latest published GitHub release on the right, and a gear that opens a compact settings popover. It is chrome around the WebUI, not a redesign of it: the remote page lives in its own `WebContentsView` above the bar with no injected markup, styles or scripts, and the version lookup is informational only — the app never updates DSH. Contract and limits: [footer.md](footer.md).
+
 ## Testing and deliverables
 
 **R00**: independent Electron/TypeScript scaffold in branch `feat/m1-electron-shell` from clean public repo main; README, lint, TS build, unit tests, Windows GitHub Actions. Validate current DSH Web CLI startup/authorization semantics from primary source and/or local inspection; document uncertainties. No real user-environment execution.

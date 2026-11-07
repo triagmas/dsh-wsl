@@ -33,6 +33,23 @@ describe('supervisor startup', () => {
     expect(lastStatus(harness.statuses).state).toBe('READY');
   });
 
+  it('probes the installed version with the runtime Node.js the backend uses', async () => {
+    const harness = createHarness();
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    // `wsl.exe --exec dsh` cannot resolve `#!/usr/bin/env node`, so the probe
+    // must carry the same resolved runtime as the launch (issue #11).
+    expect(harness.wsl.versionQueries).toHaveLength(1);
+    expect(harness.wsl.versionQueries[0]).toEqual({
+      distro: 'Ubuntu',
+      dshPath: '/usr/local/bin/dsh',
+      nodePath: '/usr/bin/node',
+    });
+    expect(lastStatus(harness.statuses).dshVersion).toBe('0.2.1-rc.5');
+  });
+
   it('fails closed when an unknown listener holds the port', async () => {
     const harness = createHarness({ portState: 'occupied' });
     const supervisor = new Supervisor(harness.deps);

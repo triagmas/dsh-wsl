@@ -1,5 +1,6 @@
 /** Configuration validation. Pure: no fs, no Electron. */
 import { isValidIsolationRoot } from './isolation.js';
+import { normalizeWorkspacePath } from './workspace.js';
 import {
   DEFAULT_CONFIG,
   PRESET_DEEPSEEK_HARNESS,
@@ -9,7 +10,6 @@ import {
 } from '../../shared/types.js';
 
 const DISTRO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-const WORKSPACE_PATTERN = /^(?:~|\/)[^\0\r\n\\]*$/;
 
 export function isValidPort(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value >= 1024 && value <= 65535;
@@ -19,8 +19,12 @@ export function isValidDistro(value: unknown): value is string {
   return typeof value === 'string' && DISTRO_PATTERN.test(value);
 }
 
+/**
+ * Workspace values share one contract with the launcher (issue #8): a trailing
+ * slash is normalised away instead of being accepted here and rejected at start.
+ */
 export function isValidWorkspace(value: unknown): value is string {
-  return typeof value === 'string' && value.length <= 4096 && WORKSPACE_PATTERN.test(value);
+  return normalizeWorkspacePath(value) !== null;
 }
 
 export function isValidDshPath(value: unknown): value is string {
@@ -41,7 +45,7 @@ export function normalizeConfig(input: unknown): AppConfig {
     presetId,
     distro: isValidDistro(source.distro) ? source.distro : DEFAULT_CONFIG.distro,
     port: isValidPort(source.port) ? source.port : DEFAULT_CONFIG.port,
-    workspace: isValidWorkspace(source.workspace) ? source.workspace : DEFAULT_CONFIG.workspace,
+    workspace: normalizeWorkspacePath(source.workspace) ?? DEFAULT_CONFIG.workspace,
     dshPath: isValidDshPath(source.dshPath) ? source.dshPath : null,
     isolateEnvironment:
       typeof source.isolateEnvironment === 'boolean' ? source.isolateEnvironment : DEFAULT_CONFIG.isolateEnvironment,
@@ -78,7 +82,8 @@ export function applyConfigPatch(current: AppConfig, patch: ConfigPatch): PatchR
     else errors.push('port: expected an integer between 1024 and 65535');
   }
   if (patch.workspace !== undefined) {
-    if (isValidWorkspace(patch.workspace)) next.workspace = patch.workspace;
+    const workspace = normalizeWorkspacePath(patch.workspace);
+    if (workspace !== null) next.workspace = workspace;
     else errors.push('workspace: expected an absolute POSIX path such as /home/user/projects');
   }
   if (patch.dshPath !== undefined) {

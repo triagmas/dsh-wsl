@@ -5,10 +5,11 @@
  * exact-origin navigation allowlist. The splash and settings windows are
  * app-owned local pages with tiny, explicit preload bridges.
  */
-import { BrowserWindow, session, shell, type Session } from 'electron';
+import { BrowserWindow, WebContentsView, screen, session, shell, type Session } from 'electron';
 import { join } from 'node:path';
 import type { Logger } from '../core/logger.js';
-import type { ShellStatus } from '../../shared/types.js';
+import type { ShellStatus, VersionSnapshot } from '../../shared/types.js';
+import { computePopoverBounds, computeViewBounds, type PopoverAnchor } from '../core/footer.js';
 import { decideNavigation, decidePermission, decideWindowOpen } from '../core/navigation.js';
 import type { WindowEventContext, WindowEventName, WindowSurface } from '../core/diagnostics.js';
 
@@ -47,15 +48,30 @@ export interface LoadBackendOptions {
 
 export class Windows {
   private main: BrowserWindow | null = null;
+  /** Remote WebUI rendered above the app-owned footer bar. */
+  private backendView: WebContentsView | null = null;
+  /** Geometry is reported once per window: it is the first thing to check when
+   * the remote surface looks empty (issue #11). */
+  private layoutLogged = false;
+  private displayWatchInstalled = false;
   private splash: BrowserWindow | null = null;
   private settings: BrowserWindow | null = null;
+  private popover: BrowserWindow | null = null;
+  private popoverClosedAt = 0;
   private status: ShellStatus | null = null;
+  private versions: VersionSnapshot | null = null;
   /** True once the app is definitively quitting; close then really closes. */
   private quitting = false;
 
   constructor(private readonly options: WindowsOptions) {}
 
-  /** Create (once) the sandboxed backend window. */
+  /**
+   * Create the main window once.
+   *
+   * The window itself is an app-owned chrome page (footer bar only); the remote
+   * WebUI lives in a separate `WebContentsView` placed above the bar, so the
+   * original page is never modified, wrapped or injected into.
+   */
   ensureMain(): BrowserWindow {
     if (this.main !== null && !this.main.isDestroyed()) return this.main;
     const window = new BrowserWindow({
@@ -68,58 +84,27 @@ export class Windows {
       backgroundColor: '#0b0f16',
       autoHideMenuBar: true,
       webPreferences: {
-        partition: PARTITION,
+        preload: join(this.options.preloadDir, 'chrome.js'),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
         webSecurity: true,
         allowRunningInsecureContent: false,
         webviewTag: false,
-        spellcheck: true,
-        // Packaged builds keep the debugger closed unless development is explicit.
         devTools: this.options.devToolsEnabled,
       },
     });
     window.setMenuBarVisibility(false);
 
+    // The footer page is local and never navigates away or opens windows.
     window.webContents.on('will-navigate', (event, url) => {
-      const decision = decideNavigation({
-        url,
-        origin: this.options.origin(),
-        isMainFrame: true,
-        isUserInitiated: false,
-      });
-      if (decision.action === 'allow') return;
+      if (url.startsWith('file://')) return;
       event.preventDefault();
-      this.options.log.warn(`navigation blocked (${decision.action})`);
+      this.options.log.warn('footer navigation blocked');
     });
-
-    window.webContents.on('will-redirect', (event, url) => {
-      const decision = decideNavigation({
-        url,
-        origin: this.options.origin(),
-        isMainFrame: true,
-        isUserInitiated: false,
-      });
-      if (decision.action === 'allow') return;
-      event.preventDefault();
-      this.options.log.warn('redirect blocked');
-    });
-
-    window.webContents.setWindowOpenHandler(({ url }) => {
-      const decision = decideWindowOpen(url, this.options.origin());
-      if (decision.action === 'external') this.options.onExternalLink(decision.url);
-      return { action: 'deny' };
-    });
-
-    window.webContents.on('will-attach-webview', (event) => {
-      event.preventDefault();
-      this.options.log.warn('webview attachment blocked');
-    });
-
+    window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window.webContents.on('render-process-gone', (_event, details) => {
-      this.options.log.error(`renderer gone: ${details.reason}`);
-      this.options.onRendererGone(details.reason);
+      this.options.log.error(`footer renderer gone: ${details.reason}`);
     });
 
     window.on('close', (event) => {
@@ -135,22 +120,299 @@ export class Windows {
     window.on('show', () => {
       this.reportWindowEvent('main', 'shown', window);
       this.options.onVisibilityChanged(true);
+      // A view added while the window was hidden may still have no compositor
+      // surface; re-assert it every time the window becomes visible.
+      this.syncBackendView();
     });
     window.on('hide', () => {
       this.reportWindowEvent('main', 'hidden', window);
       this.options.onVisibilityChanged(false);
+      // A popover must never float once its window is gone.
+      this.closeSettingsPopover();
     });
     window.on('minimize', () => {
       // Minimised is not "hidden in tray": supervision state must not change.
       this.options.log.debug('window minimized');
+      this.closeSettingsPopover();
     });
+    window.on('move', () => this.closeSettingsPopover());
+    // Overloaded typings: register each geometry event explicitly.
+    window.on('resize', () => this.layoutMain());
+    window.on('maximize', () => this.layoutMain());
+    window.on('unmaximize', () => this.layoutMain());
+    window.on('restore', () => this.layoutMain());
+    window.on('enter-full-screen', () => this.layoutMain());
+    window.on('leave-full-screen', () => this.layoutMain());
+    window.on('ready-to-show', () => this.syncBackendView());
+    // The footer page can finish loading after the view was attached, which
+    // re-orders the window's own surface above the child view on some systems.
+    window.webContents.on('did-finish-load', () => this.syncBackendView());
+    this.watchDisplays();
     window.on('closed', () => {
       this.reportWindowEvent('main', 'closed', window);
+      this.closeSettingsPopover();
+      this.destroyBackendView();
       this.main = null;
     });
     this.main = window;
+    this.layoutLogged = false;
+    this.loadFooter(window);
+    // The view may already exist (created by an earlier WebUI load): attaching
+    // it here is what makes the remote page visible in this window.
+    this.ensureBackendView();
+    this.syncBackendView();
     return window;
   }
+
+  private loadFooter(window: BrowserWindow): void {
+    window.webContents.on('did-finish-load', () => {
+      this.options.log.info('footer bar ready');
+      this.replayFooterState();
+    });
+    window.loadFile(join(this.options.rendererDir, 'chrome', 'index.html')).catch((error: unknown) => {
+      this.options.log.error(`footer load failed: ${error instanceof Error ? error.message : 'unknown'}`);
+    });
+  }
+
+  /**
+   * Remote WebUI surface with the same hardening the window carried before:
+   * isolated partition, sandbox, no Node, exact-origin navigation, denied
+   * popups/webviews/downloads and no DevTools in packaged builds.
+   */
+  private ensureBackendView(): WebContentsView {
+    const existing = this.backendView;
+    if (existing !== null && !existing.webContents.isDestroyed()) {
+      this.attachBackendView(existing);
+      return existing;
+    }
+    const view = new WebContentsView({
+      webPreferences: {
+        partition: PARTITION,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+        allowRunningInsecureContent: false,
+        webviewTag: false,
+        spellcheck: true,
+        // Packaged builds keep the debugger closed unless development is explicit.
+        devTools: this.options.devToolsEnabled,
+      },
+    });
+    const contents = view.webContents;
+
+    contents.on('will-navigate', (event, url) => {
+      const decision = decideNavigation({
+        url,
+        origin: this.options.origin(),
+        isMainFrame: true,
+        isUserInitiated: false,
+      });
+      if (decision.action === 'allow') return;
+      event.preventDefault();
+      this.options.log.warn(`navigation blocked (${decision.action})`);
+    });
+
+    contents.on('will-redirect', (event, url) => {
+      const decision = decideNavigation({
+        url,
+        origin: this.options.origin(),
+        isMainFrame: true,
+        isUserInitiated: false,
+      });
+      if (decision.action === 'allow') return;
+      event.preventDefault();
+      this.options.log.warn('redirect blocked');
+    });
+
+    contents.setWindowOpenHandler(({ url }) => {
+      const decision = decideWindowOpen(url, this.options.origin());
+      if (decision.action === 'external') this.options.onExternalLink(decision.url);
+      return { action: 'deny' };
+    });
+
+    contents.on('will-attach-webview', (event) => {
+      event.preventDefault();
+      this.options.log.warn('webview attachment blocked');
+    });
+
+    contents.on('render-process-gone', (_event, details) => {
+      this.options.log.error(`renderer gone: ${details.reason}`);
+      this.options.onRendererGone(details.reason);
+    });
+
+    this.backendView = view;
+    this.options.log.info('webui surface created');
+    this.attachBackendView(view);
+    return view;
+  }
+
+  private destroyBackendView(): void {
+    const view = this.backendView;
+    this.backendView = null;
+    this.layoutLogged = false;
+    if (view === null) return;
+    try {
+      this.mainWindow?.contentView.removeChildView(view);
+    } catch {
+      // Window already gone: only the contents remain to be released.
+    }
+    if (!view.webContents.isDestroyed()) view.webContents.close();
+  }
+
+  /** Keep the WebUI above the footer on every geometry change. */
+  private layoutMain(): void {
+    const window = this.mainWindow;
+    const view = this.backendView;
+    if (window === null || view === null || view.webContents.isDestroyed()) return;
+    const size = window.getContentSize();
+    const bounds = computeViewBounds(size[0] ?? 0, size[1] ?? 0);
+    if (bounds.width === 0 || bounds.height === 0) return;
+    view.setBounds(bounds);
+    if (!this.layoutLogged) {
+      this.layoutLogged = true;
+      this.options.log.info(
+        `webui layout: ${bounds.width}x${bounds.height} at ${bounds.x},${bounds.y} (content ${size[0]}x${size[1]})`,
+      );
+    }
+  }
+
+  /**
+   * Attach the remote surface to the current window.
+   *
+   * The view can exist before its window does: the READY path loads the WebUI
+   * before it shows anything, so the window is created afterwards. Attaching on
+   * both paths is what keeps the remote page inside the window at all (issue
+   * #11) - otherwise the window stays empty and the app-owned page shows.
+   */
+  private attachBackendView(view: WebContentsView): void {
+    const window = this.mainWindow;
+    if (window === null || view.webContents.isDestroyed()) return;
+    if (window.contentView.children.includes(view)) return;
+    window.contentView.addChildView(view);
+    this.layoutMain();
+  }
+
+  /**
+   * Re-assert the remote surface after it may have lost its compositor frame.
+   *
+   * A view that was attached while the window was still hidden, or a window
+   * whose own page finished loading afterwards, can keep an empty surface.
+   * Re-attaching makes the view the top-most child again and asks for a frame.
+   */
+  private syncBackendView(): void {
+    this.layoutMain();
+    const window = this.mainWindow;
+    const view = this.backendView;
+    if (window === null || view === null || view.webContents.isDestroyed()) return;
+    const children = window.contentView.children;
+    if (!children.includes(view)) {
+      window.contentView.addChildView(view);
+      this.layoutMain();
+      return;
+    }
+    if (children[children.length - 1] === view) return;
+    window.contentView.removeChildView(view);
+    window.contentView.addChildView(view);
+    this.layoutMain();
+  }
+
+  /**
+   * Docking a laptop or moving the window across displays with different scale
+   * factors changes the content geometry without a resize event on Windows.
+   */
+  private watchDisplays(): void {
+    if (this.displayWatchInstalled) return;
+    this.displayWatchInstalled = true;
+    const relayout = (): void => this.syncBackendView();
+    screen.on('display-metrics-changed', relayout);
+    screen.on('display-added', relayout);
+    screen.on('display-removed', relayout);
+  }
+
+  get settingsPopoverOpen(): boolean {
+    return this.popover !== null && !this.popover.isDestroyed();
+  }
+
+  /**
+   * Gear click: open the popover, or close it. A blur-close that happened a
+   * moment ago is treated as the same click, so the gear toggles reliably even
+   * though focusing the main window blurs the popover first.
+   */
+  toggleSettingsPopover(anchor: PopoverAnchor): void {
+    if (this.popover !== null && !this.popover.isDestroyed()) {
+      this.closeSettingsPopover();
+      return;
+    }
+    if (Date.now() - this.popoverClosedAt < 350) return;
+    this.openSettingsPopover(anchor);
+  }
+
+  openSettingsPopover(anchor: PopoverAnchor): void {
+    const window = this.mainWindow;
+    if (window === null || this.popover !== null) return;
+    const contentBounds = window.getContentBounds();
+    const workArea = screen.getDisplayMatching(contentBounds).workArea;
+    const bounds = computePopoverBounds({
+      anchor,
+      window: { x: contentBounds.x, y: contentBounds.y },
+      size: Windows.POPOVER_SIZE,
+      workArea,
+    });
+    const popover = new BrowserWindow({
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+      frame: false,
+      resizable: false,
+      movable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      skipTaskbar: true,
+      show: false,
+      parent: window,
+      title: 'WSL Web Shell — Settings',
+      backgroundColor: '#11161f',
+      hasShadow: true,
+      webPreferences: {
+        preload: join(this.options.preloadDir, 'popover.js'),
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true,
+        devTools: this.options.devToolsEnabled,
+      },
+    });
+    popover.setMenuBarVisibility(false);
+    popover.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    popover.webContents.on('will-navigate', (event, url) => {
+      if (url.startsWith('file://')) return;
+      event.preventDefault();
+    });
+    popover.loadFile(join(this.options.rendererDir, 'popover', 'index.html')).catch((error: unknown) => {
+      this.options.log.error(`settings popover failed to load: ${error instanceof Error ? error.message : 'unknown'}`);
+    });
+    popover.once('ready-to-show', () => popover.show());
+    popover.on('blur', () => this.closeSettingsPopover());
+    popover.on('closed', () => {
+      if (this.popover === popover) this.popover = null;
+      this.popoverClosedAt = Date.now();
+    });
+    this.popover = popover;
+  }
+
+  closeSettingsPopover(): void {
+    const popover = this.popover;
+    if (popover === null) return;
+    this.popover = null;
+    this.popoverClosedAt = Date.now();
+    if (!popover.isDestroyed()) popover.destroy();
+  }
+
+  private static readonly POPOVER_SIZE = { width: 360, height: 460 };
+
 
   get mainWindow(): BrowserWindow | null {
     return this.main !== null && !this.main.isDestroyed() ? this.main : null;
@@ -325,10 +587,29 @@ export class Windows {
 
   publishStatus(status: ShellStatus): void {
     this.status = status;
-    for (const window of [this.splash, this.settings]) {
-      if (window === null || window.isDestroyed()) continue;
+    // Every window that renders `shell:status` must be in this list, otherwise a
+    // window opened while the backend changes state keeps showing a stale label.
+    // The settings popover is a separate window and subscribes to the same channel.
+    for (const window of [this.main, this.splash, this.settings, this.popover]) {
+      if (window === null || window.isDestroyed() || window.webContents.isDestroyed()) continue;
       window.webContents.send('shell:status', status);
     }
+  }
+
+  /** Push the installed/upstream version snapshot to the footer. */
+  publishVersions(snapshot: VersionSnapshot): void {
+    this.versions = snapshot;
+    const window = this.mainWindow;
+    if (window === null || window.webContents.isDestroyed()) return;
+    window.webContents.send('footer:versions', snapshot);
+  }
+
+  /** Re-send the current status and versions after a (re)load of the footer. */
+  private replayFooterState(): void {
+    const window = this.mainWindow;
+    if (window === null || window.webContents.isDestroyed()) return;
+    if (this.status !== null) window.webContents.send('shell:status', this.status);
+    if (this.versions !== null) window.webContents.send('footer:versions', this.versions);
   }
 
   private loadInFlight: Promise<void> | null = null;
@@ -342,9 +623,10 @@ export class Windows {
    * substitute UI.
    */
   async loadBackend(origin: string, options: LoadBackendOptions = {}): Promise<void> {
-    const window = this.ensureMain();
+    const view = this.ensureBackendView();
+    const contents = view.webContents;
     const target = `${origin}/`;
-    const current = window.webContents.getURL();
+    const current = contents.getURL();
     const alreadyThere = current === target || current === origin;
     if (alreadyThere && options.force !== true) return;
     if (this.loadInFlight !== null) {
@@ -353,7 +635,7 @@ export class Windows {
       await this.loadInFlight;
       if (options.force !== true) return;
     }
-    const navigation = window
+    const navigation = contents
       .loadURL(target)
       .then(() => undefined)
       .catch((error: unknown) => {
@@ -380,6 +662,8 @@ export class Windows {
 
   destroyAll(): void {
     this.setQuitting();
+    this.closeSettingsPopover();
+    this.destroyBackendView();
     for (const window of [this.settings, this.splash, this.main]) {
       if (window !== null && !window.isDestroyed()) window.destroy();
     }

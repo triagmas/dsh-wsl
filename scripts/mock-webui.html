@@ -1,0 +1,140 @@
+<!doctype html>
+<!--
+  Offline stand-in for the upstream WebUI, used only by scripts/screenshot-ui.cjs.
+  It exists so the footer bar and the settings popover can be photographed over
+  something that looks like a chat surface, without starting WSL or DeepSeek.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Mock upstream WebUI (test data)</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0b0f16;
+        color: #cbd5e1;
+        font: 13px/1.6 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+      }
+      .page {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 28px 24px 24px;
+        box-sizing: border-box;
+      }
+      .banner {
+        align-self: flex-start;
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #f59e0b;
+        border: 1px solid rgba(245, 158, 11, 0.4);
+        border-radius: 999px;
+        padding: 2px 9px;
+        margin-bottom: 22px;
+      }
+      h1 {
+        font-size: 19px;
+        font-weight: 600;
+        margin: 0 0 6px;
+        color: #e2e8f0;
+      }
+      p.sub {
+        margin: 0 0 26px;
+        color: #64748b;
+      }
+      .chat {
+        flex: 1 1 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        overflow: hidden;
+      }
+      .turn {
+        max-width: 78%;
+        padding: 10px 13px;
+        border-radius: 12px;
+        background: #121a24;
+        border: 1px solid rgba(148, 163, 184, 0.14);
+      }
+      .turn.user {
+        align-self: flex-end;
+        background: #16233a;
+      }
+      .turn .who {
+        display: block;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #64748b;
+        margin-bottom: 4px;
+      }
+      .composer {
+        margin-top: 18px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        border-radius: 12px;
+        padding: 12px 14px;
+        color: #64748b;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .composer .send {
+        width: 26px;
+        height: 26px;
+        border-radius: 7px;
+        background: #1d4ed8;
+      }
+      .barline {
+        height: 1px;
+        background: rgba(148, 163, 184, 0.1);
+        margin: 20px 0 12px;
+      }
+      .hint {
+        font-size: 11px;
+        color: #475569;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <span class="banner">Screenshot test data — mock, not the real Harness</span>
+      <h1>DeepSeek Harness</h1>
+      <p class="sub">Placeholder surface standing in for the upstream WebUI.</p>
+      <div class="chat">
+        <div class="turn user">
+          <span class="who">You</span>
+          Summarise the build log for the last release.
+        </div>
+        <div class="turn">
+          <span class="who">Assistant</span>
+          The Windows package finished in 2 m 41 s. Two warnings, both from unused type imports in the
+          preview script; the test suite passed 269 of 269.
+        </div>
+        <div class="turn user">
+          <span class="who">You</span>
+          Keep the footer out of the way of the composer.
+        </div>
+        <div class="turn">
+          <span class="who">Assistant</span>
+          The bar owns a fixed 32 px strip below the WebUI surface, so the original layout is never
+          covered or resized by it.
+        </div>
+      </div>
+      <div class="barline"></div>
+      <div class="composer">
+        <span>Send a message…</span>
+        <span class="send"></span>
+      </div>
+      <p class="hint">Rendered locally by scripts/screenshot-ui.cjs under Xvfb.</p>
+    </div>
+  </body>
+</html>

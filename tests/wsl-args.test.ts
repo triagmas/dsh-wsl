@@ -6,7 +6,9 @@ import {
   RESOLVE_RUNTIME_SCRIPT,
   SCRIPT_ARGV0,
   START_WRAPPER_SCRIPT,
+  VERSION_PROBE_SCRIPT,
   buildDshPathCheckArgs,
+  buildDshVersionArgs,
   buildListDistrosArgs,
   buildProbeProcessArgs,
   buildResolveRuntimeArgs,
@@ -21,6 +23,7 @@ import {
   parseProcessProbe,
   stripAnsi,
 } from '../src/main/wsl/output.js';
+import { parseDshVersion } from '../src/main/core/versions.js';
 
 describe('start command construction', () => {
   const base = {
@@ -153,5 +156,70 @@ describe('wsl output decoding', () => {
     expect(buffer.push('dsh web: http://127.0.0.1:30')).toEqual([]);
     expect(buffer.push('80/?token=abc\r\nnext')).toEqual(['dsh web: http://127.0.0.1:3080/?token=abc']);
     expect(buffer.flush()).toEqual(['next']);
+  });
+});
+
+describe('installed version probe', () => {
+  it('keeps the direct exec form when no runtime Node.js was resolved', () => {
+    expect(buildDshVersionArgs('Ubuntu', '/usr/local/bin/dsh')).toEqual([
+      '-d',
+      'Ubuntu',
+      '--exec',
+      '/usr/local/bin/dsh',
+      '--version',
+    ]);
+  });
+
+  it('runs the probe through a script with the resolved Node.js directory', () => {
+    const argv = buildDshVersionArgs('Ubuntu', '/home/u/.local/share/wsl-web-shell/runtime/bin/dsh', '/home/u/.local/bin/node');
+    expect(argv).toEqual([
+      '-d',
+      'Ubuntu',
+      '--exec',
+      '/bin/sh',
+      '-c',
+      VERSION_PROBE_SCRIPT,
+      '/home/u/.local/share/wsl-web-shell/runtime/bin/dsh',
+      '/home/u/.local/bin/node',
+    ]);
+    expect(VERSION_PROBE_SCRIPT).toContain('dirname "$node"');
+  });
+
+  it('rejects an unsafe runtime binary passed to the probe', () => {
+    expect(() => buildDshVersionArgs('Ubuntu', '/usr/local/bin/dsh', 'node')).toThrow(ArgumentError);
+    expect(() => buildDshVersionArgs('Ubuntu', '/usr/local/bin/dsh', '/home/u/../bin/node')).toThrow(ArgumentError);
+  });
+
+  // Reproduces the acceptance failure: an npm-installed `dsh` is a
+  // `#!/usr/bin/env node` shim, so `--exec dsh --version` fails with exit 127
+  // when Node.js only exists in a directory that is not on the default PATH.
+  it.skipIf(process.platform === 'win32')('resolves node for a shim without a login PATH', async () => {
+    const { mkdtemp, writeFile, chmod, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { spawnSync } = await import('node:child_process');
+
+    const root = await mkdtemp(join(tmpdir(), 'wss-version-'));
+    try {
+      const nodeBin = join(root, 'bin');
+      await chmod(root, 0o755).catch(() => undefined);
+      await (await import('node:fs/promises')).mkdir(nodeBin, { recursive: true });
+      // A real Node.js in a directory that is deliberately not on PATH.
+      await (await import('node:fs/promises')).symlink(process.execPath, join(nodeBin, 'node'));
+      const dsh = join(root, 'dsh');
+      await writeFile(dsh, '#!/usr/bin/env node\nprocess.stdout.write("0.2.1-rc.5\\n");\n', 'utf8');
+      await chmod(dsh, 0o755);
+
+      const env = { ...process.env, PATH: '/usr/bin:/bin' };
+      const broken = spawnSync('/bin/sh', ['-c', 'exec "$0" --version', dsh], { env, encoding: 'utf8' });
+      expect(broken.status).toBe(127);
+      expect(`${broken.stderr}`).toContain("env: 'node': No such file or directory");
+
+      const fixed = spawnSync('/bin/sh', ['-c', VERSION_PROBE_SCRIPT, dsh, join(nodeBin, 'node')], { env, encoding: 'utf8' });
+      expect(fixed.status).toBe(0);
+      expect(parseDshVersion(fixed.stdout)).toBe('0.2.1-rc.5');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

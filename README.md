@@ -14,6 +14,9 @@ Launch a small Electron application on Windows, automatically start a supported 
 - Electron's bundled Chromium displays the **unchanged official WebUI**, including its real chat composer. No replica and no modified official Windows Desktop.
 - Default local endpoint: `127.0.0.1:3080` (port configurable in app settings, no arbitrary navigation).
 - Start on demand, supervisor/health checks, hide window to tray on X, reopen with auto-reconnect if needed, Quit via tray to exit.
+- Thin permanent bottom bar with the live connection state, the running `DSH`
+  version and the latest GitHub release, plus a gear that opens a compact settings
+  popover. It is app-owned chrome; the WebUI itself is never modified.
 - Lightweight orbital startup/recovery screen; no fake progress percentages.
 - Original WebUI auth bootstrap is handled privately: the tokenized startup URL is exchanged for a session cookie in the main process, so the token never reaches the window, the history or the logs.
 
@@ -65,6 +68,12 @@ Windows 11 + Ubuntu WSL2 environment (details and evidence in
 
 Not covered by that run: a model provider and agent sessions (the UI stops at the
 onboarding screen), signing, installer, auto-update, other distros, non-default ports.
+The footer bar and the settings popover described below were added afterwards and have
+not been part of that acceptance run: they are covered by unit tests, a headless
+render smoke (`npm run chrome:smoke`) and the screenshots in
+[docs/footer.md](docs/footer.md).
+
+![Footer bar over a mock upstream surface](docs/media/footer-bar.png)
 
 ### Diagnostics for support
 
@@ -94,6 +103,15 @@ npm run build         # esbuild -> dist/ (main, preloads, local pages, icons)
 npm start             # build + run Electron on the current platform
 npm run smoke:headless  # Linux/WSL: launch the built app under Xvfb with a
                         # sanitised PATH/HOME; must reach a clean terminal error
+npm run chrome:smoke    # Linux/WSL: render the footer and settings popover with
+                        # fixed test data and assert what they show (no WSL)
+npm run screenshots     # same render, writes docs/media/*.png
+npm run composition:smoke  # real BrowserWindow + WebContentsView composition
+                        # against a local test server: bar, bounds, resize, session,
+                        # cold-start attach order
+npm run paint:probe     # real screen pixels of a composed window: the remote
+                        # WebUI must be visible above the bar (needs a display;
+                        # CI uses xvfb on Linux and a desktop session on Windows)
 ```
 
 Windows packaging (x64, portable EXE):
@@ -125,6 +143,8 @@ are never presented as a real Windows/WSL acceptance PASS.
 - Existing WSL distributions and Linux projects are never deleted or shut down.
 - Local profile only: `config.json`, the ownership record, the redacted log and
   the isolated browser session live in the app's own `userData`.
+- The version lookup is informational: one GitHub API call, no credentials, cached
+  for 18 h, never an auto-update and never a request from the renderer.
 - Diagnostics record causes, not content: window show/hide/close events with
   boolean flags, tray actions, clean/unclean shutdown of the previous run, fatal
   error messages without stacks, and Electron child-process failures. Page text,
@@ -135,6 +155,8 @@ are never presented as a real Windows/WSL acceptance PASS.
 - [Product & architecture contract](docs/spec.md)
 - [Architecture / implementation notes](docs/architecture.md)
 - [Upstream `dsh web` contract and unknowns](docs/upstream-dsh-web.md)
+- [Footer bar, versions and settings popover](docs/footer.md)
+- [Issue #9 evidence (build, checks, artifact)](docs/evidence/r09.md)
 - [M1 issue](https://github.com/triagmas/wsl-web-shell/issues/1) and [agent guidance](AGENTS.md)
 
 ## Artifact provenance
