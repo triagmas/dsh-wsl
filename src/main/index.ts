@@ -15,6 +15,14 @@ import {
   summarizePreviousSession,
 } from './core/diagnostics.js';
 import { createLatestVersionService } from './backend/github-versions.js';
+import { createUpdateRunner } from './core/update-runner.js';
+import {
+  UPDATE_REASONS,
+  describeUpdatePhase,
+  describeUpdateReason,
+  planUpdate,
+  type UpdatePlan,
+} from './core/update.js';
 import { createLogger } from './core/logger.js';
 import { isNewer } from './core/versions.js';
 import { parsePopoverAnchor } from './core/footer.js';
@@ -28,7 +36,14 @@ import { createConfigStore } from './electron/config-store.js';
 import { createWebClient } from './electron/web-client.js';
 import { TrayController } from './electron/tray.js';
 import { Windows } from './electron/windows.js';
-import type { AppConfig, ConfigPatch, ShellStatus, VersionSnapshot } from '../shared/types.js';
+import type {
+  AppConfig,
+  ConfigPatch,
+  ShellStatus,
+  UpdateProbe,
+  UpdateStartResult,
+  VersionSnapshot,
+} from '../shared/types.js';
 
 const APP_ID = 'com.triagmas.wslwebshell';
 
@@ -152,6 +167,97 @@ async function bootstrap(): Promise<void> {
   let tray: TrayController | null = null;
   let healthTimer: NodeJS.Timeout | null = null;
   let quitting = false;
+
+  const updateRunner = createUpdateRunner({
+    wsl,
+    log,
+    publish: (state) => windows.publishUpdate(state),
+    now: () => new Date().toISOString(),
+  });
+
+  /**
+   * What the confirmation window may do (issue #12).
+   *
+   * The plan is computed here, from the live configuration and the executable
+   * the launcher really resolved, so a stale renderer can never talk the app
+   * into replacing a global installation.
+   */
+  function resolveUpdatePlan() {
+    const target = versions.snapshot().latest?.version ?? null;
+    if (target === null) return { ok: false, reason: UPDATE_REASONS.unknownTarget } as const;
+    const status = supervisor.getStatus();
+    return planUpdate({
+      distro: config.distro,
+      targetVersion: target,
+      installedVersion: status.dshVersion,
+      resolvedDshPath: status.dshPath,
+      isolationEnabled: config.isolateEnvironment,
+      runtimeRoot: config.runtimeRoot,
+      customExecutable: config.dshPath !== null,
+    });
+  }
+
+  function updateProbe(): UpdateProbe {
+    const status = supervisor.getStatus();
+    const result = resolveUpdatePlan();
+    const base = {
+      installed: status.dshVersion,
+      target: versions.snapshot().latest?.version ?? null,
+      distro: config.distro,
+      runtimeRoot: config.runtimeRoot,
+      running: updateRunner.running(),
+    };
+    if (!result.ok) {
+      return {
+        ...base,
+        eligible: false,
+        reason: result.reason,
+        description: describeUpdateReason(result.reason),
+        rollbackPath: null,
+      };
+    }
+    return {
+      ...base,
+      installed: result.plan.installedVersion,
+      target: result.plan.version,
+      runtimeRoot: result.plan.runtimeDir,
+      eligible: !updateRunner.running(),
+      reason: null,
+      description: null,
+      rollbackPath: result.plan.previousPattern,
+    };
+  }
+
+  /**
+   * Restart the portable application after a successful update.
+   *
+   * The graceful path is the same as Quit (owned backend stopped, windows
+   * destroyed, clean-shutdown marker written); only the final step differs:
+   * relaunch the portable executable instead of exiting.
+   */
+  const relaunchApp = (): void => {
+    const portable = process.env.PORTABLE_EXECUTABLE_FILE ?? null;
+    log.info('update: relaunching the application');
+    quitting = true;
+    if (healthTimer !== null) clearTimeout(healthTimer);
+    healthTimer = null;
+    windows.setQuitting();
+    tray?.destroy();
+    tray = null;
+    void supervisor
+      .shutdown()
+      .catch((error: unknown) => {
+        log.error(`shutdown before relaunch failed: ${error instanceof Error ? error.message : 'unknown'}`);
+      })
+      .finally(() => {
+        log.info(CLEAN_SHUTDOWN_MARKER);
+        windows.destroyAll();
+        // Portable builds run from a temporary extraction directory: relaunching
+        // `process.execPath` would start a copy that is deleted right after exit.
+        app.relaunch(portable === null ? {} : { execPath: portable, args: [] });
+        app.exit(0);
+      });
+  };
 
   const supervisor: Supervisor = new Supervisor({
     config: () => config,
@@ -336,6 +442,58 @@ async function bootstrap(): Promise<void> {
   });
   guard('popover:close', () => {
     windows.closeSettingsPopover();
+  });
+
+  // --- one-click update (issue #12) --------------------------------------
+  guard('footer:open-update', () => {
+    windows.closeSettingsPopover();
+    windows.openUpdateConfirm();
+  });
+  guard('update:probe', () => updateProbe());
+  guard('update:state', () => updateRunner.snapshot());
+  guard('update:close', () => {
+    if (updateRunner.running()) {
+      // The terminal stays until the run finished; only the confirmation window
+      // may be dismissed while nothing is running.
+      windows.closeUpdateConfirm();
+      return;
+    }
+    windows.closeUpdateWindows();
+  });
+  guard('update:start', (): UpdateStartResult => {
+    if (updateRunner.running()) {
+      return { started: false, reason: 'busy', description: 'An update is already running.' };
+    }
+    const result = resolveUpdatePlan();
+    if (!result.ok) {
+      return { started: false, reason: result.reason, description: describeUpdateReason(result.reason) };
+    }
+    const plan: UpdatePlan = result.plan;
+    log.info(`update requested: ${plan.installedVersion} -> ${plan.version} (${plan.runtimeDir})`);
+    // The confirmation has done its job: the terminal window takes over.
+    windows.closeUpdateConfirm();
+    windows.openUpdateProgress();
+    windows.publishUpdate({
+      ...updateRunner.snapshot(),
+      phase: 'checking',
+      message: describeUpdatePhase('checking'),
+      targetVersion: plan.version,
+      installedVersion: plan.installedVersion,
+    });
+    void updateRunner
+      .run(plan, { distro: plan.distro, nodePath: supervisor.resolvedRuntime()?.nodePath ?? null })
+      .then((outcome) => {
+        if (!outcome.ok) {
+          log.warn(`update did not complete: ${outcome.state.detail ?? 'unknown'}`);
+          return;
+        }
+        // Let the terminal show the last line before the window disappears.
+        setTimeout(() => relaunchApp(), 1_200).unref?.();
+      })
+      .catch((error: unknown) => {
+        log.error(`update runner failed: ${error instanceof Error ? error.message : 'unknown'}`);
+      });
+    return { started: true, reason: null, description: null };
   });
   guard('settings:open-window', () => {
     windows.openSettings();

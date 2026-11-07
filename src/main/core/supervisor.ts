@@ -50,6 +50,32 @@ export interface ResolvedRuntime {
   nodePath: string | null;
 }
 
+/** Result of the read-only "does this exact version exist on npm" check. */
+export interface NpmVersionCheck {
+  found: boolean;
+  /** npm binary used for the query, `null` when none was found. */
+  npmPath: string | null;
+  /** Version string npm reported, `null` when the query produced nothing. */
+  reported: string | null;
+  /** Short, safe explanation when `found` is false. */
+  message: string | null;
+}
+
+/** One streaming update run inside the distribution. */
+export interface UpdateRunRequest {
+  distro: string;
+  isolationRoot: string;
+  version: string;
+  nodePath: string | null;
+  npmPath: string;
+}
+
+export interface UpdateRunResult {
+  code: number | null;
+  /** Last non-empty output lines, used for the failure detail. */
+  tail: string;
+}
+
 export interface WslGateway {
   listDistros(): Promise<string[]>;
   /** Any `wsl.exe` invocation starts a stopped distribution. */
@@ -63,6 +89,15 @@ export interface WslGateway {
   /** `dsh --version` of the selected executable; `null` when it cannot be read. */
   dshVersion(distro: string, dshPath: string, nodePath: string | null): Promise<string | null>;
   signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
+  /** Read-only npm lookup for the exact version the update would install. */
+  checkPublishedVersion(request: {
+    distro: string;
+    isolationRoot: string;
+    version: string;
+    nodePath: string | null;
+  }): Promise<NpmVersionCheck>;
+  /** Install the exact version into the isolated runtime, streaming output. */
+  installRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
 }
 
 export interface WebClient {
@@ -145,6 +180,8 @@ export class Supervisor {
   private readyCount = 0;
   /** Version reported by the DSH executable in use, informational only. */
   private dshVersion: string | null = null;
+  /** Runtime actually launched; `null` until a start resolved one (issue #12). */
+  private runtime: ResolvedRuntime | null = null;
 
   constructor(private readonly deps: SupervisorDeps) {
     this.status = this.buildStatus('CHECKING', null);
@@ -156,6 +193,15 @@ export class Supervisor {
 
   getStatus(): ShellStatus {
     return this.status;
+  }
+
+  /**
+   * Runtime the launcher resolved (`dsh` plus the Node.js that runs it),
+   * `null` until a start succeeded. The updater needs the same Node.js binary
+   * so a staged install can be verified exactly like the backend is started.
+   */
+  resolvedRuntime(): ResolvedRuntime | null {
+    return this.runtime;
   }
 
   get state(): LifecycleState {
@@ -191,6 +237,7 @@ export class Supervisor {
       maxAttempts: config.maxRestartAttempts,
       logPath: this.deps.logPath(),
       dshVersion: this.dshVersion,
+      dshPath: this.runtime?.dshPath ?? null,
       updatedAt: new Date(this.deps.now()).toISOString(),
     };
   }
@@ -382,6 +429,7 @@ export class Supervisor {
         config.dshPath,
         plan.enabled ? plan.root : null,
       );
+      this.runtime = runtime;
       await this.refreshDshVersion(config.distro, runtime.dshPath, runtime.nodePath);
 
       const portState = await this.deps.probePort(config.port);

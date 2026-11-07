@@ -1,4 +1,13 @@
-import type { ExitInfo, ResolvedRuntime, ServerHandle, StartServerRequest, WslGateway } from '../src/main/core/supervisor.js';
+import type {
+  ExitInfo,
+  NpmVersionCheck,
+  ResolvedRuntime,
+  ServerHandle,
+  StartServerRequest,
+  UpdateRunRequest,
+  UpdateRunResult,
+  WslGateway,
+} from '../src/main/core/supervisor.js';
 import type { ProcessProbe } from '../src/main/wsl/output.js';
 import type { WebClient } from '../src/main/core/supervisor.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
@@ -108,6 +117,29 @@ export class FakeWsl implements WslGateway {
   /** Version queried from the selected executable (issue #9 footer). */
   dshVersionValue: string | null = '0.2.1-rc.5';
   readonly versionQueries: { distro: string; dshPath: string; nodePath: string | null }[] = [];
+
+  /** Update-related fake state (issue #12). */
+  npmCheckResult: NpmVersionCheck = { found: true, npmPath: '/usr/bin/npm', reported: '0.2.2-rc.1', message: null };
+  updateRunCode: number | null = 0;
+  updateRunLines: string[] = ['update: done'];
+  readonly updateRuns: UpdateRunRequest[] = [];
+  readonly npmChecks: { distro: string; isolationRoot: string; version: string; nodePath: string | null }[] = [];
+
+  async checkPublishedVersion(request: {
+    distro: string;
+    isolationRoot: string;
+    version: string;
+    nodePath: string | null;
+  }): Promise<NpmVersionCheck> {
+    this.npmChecks.push(request);
+    return { ...this.npmCheckResult, reported: this.npmCheckResult.reported ?? request.version };
+  }
+
+  async installRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
+    this.updateRuns.push(request);
+    for (const line of this.updateRunLines) onLine(line);
+    return { code: this.updateRunCode, tail: this.updateRunLines.slice(-2).join(' ') };
+  }
 
   async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {
     this.versionQueries.push({ distro, dshPath, nodePath });

@@ -1,6 +1,12 @@
 /** Real `wsl.exe` gateway used by the Electron main process. */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import type { WslGateway, ServerHandle, StartServerRequest, ExitInfo } from '../core/supervisor.js';
+import type {
+  WslGateway,
+  ServerHandle,
+  StartServerRequest,
+  ExitInfo,
+  UpdateRunResult,
+} from '../core/supervisor.js';
 import { ShellError } from '../core/supervisor.js';
 import type { Logger } from '../core/logger.js';
 import type { ProcessProbe } from './output.js';
@@ -26,6 +32,7 @@ import {
   buildSignalArgs,
   buildStartServerArgs,
 } from './args.js';
+import { buildInstallRuntimeArgs, buildNpmViewArgs, NPM_MARKER, parseNpmMarker } from './update-args.js';
 
 export interface CommandResult {
   code: number | null;
@@ -254,6 +261,99 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         },
         stderrTail: () => stderrTail,
       };
+    },
+
+    async checkPublishedVersion(request) {
+      const result = await run(
+        buildNpmViewArgs({
+          distro: request.distro,
+          isolationRoot: request.isolationRoot,
+          version: request.version,
+          nodePath: request.nodePath,
+        }),
+        120_000,
+      );
+      const lines = `${result.stdout}\n${result.stderr}`.split('\n');
+      const npmPath = lines.map((line) => parseNpmMarker(line)).find((value) => value !== null) ?? null;
+      const reported = parseDshVersion(lines.filter((line) => !line.includes(NPM_MARKER)).join('\n'));
+      if (npmPath === null) {
+        return {
+          found: false,
+          npmPath: null,
+          reported: null,
+          message: 'npm was not found in this distribution, so nothing can be verified or installed.',
+        };
+      }
+      if (result.code !== 0 || reported === null) {
+        const detail = (result.stderr || result.stdout)
+          .split('\n')
+          .filter((line) => !line.includes(NPM_MARKER))
+          .map((line) => line.trim())
+          .filter((line) => line !== '')
+          .slice(-1)
+          .join(' ');
+        return {
+          found: false,
+          npmPath,
+          reported,
+          message: detail === '' ? 'npm did not report this version.' : detail,
+        };
+      }
+      return { found: reported === request.version, npmPath, reported, message: null };
+    },
+
+    async installRuntime(request, onLine) {
+      const argv = buildInstallRuntimeArgs(
+        {
+          distro: request.distro,
+          isolationRoot: request.isolationRoot,
+          version: request.version,
+          nodePath: request.nodePath,
+        },
+        request.npmPath,
+      );
+      options.log.info(`starting DSH update (distro=${request.distro}, version=${request.version})`);
+      return await new Promise<UpdateRunResult>((resolve) => {
+        let child: ChildProcessWithoutNullStreams;
+        try {
+          child = spawnImpl(wslExe, argv, {
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            env: { ...process.env, WSL_UTF8: '1' },
+          }) as unknown as ChildProcessWithoutNullStreams;
+        } catch (error) {
+          options.log.error(`update spawn failed: ${error instanceof Error ? error.message : 'unknown'}`);
+          resolve({ code: null, tail: 'The update process could not be started.' });
+          return;
+        }
+        const stdoutBuffer = new LineBuffer();
+        const stderrBuffer = new LineBuffer();
+        const tail: string[] = [];
+        const emit = (line: string): void => {
+          const clean = stripAnsi(line);
+          if (clean.trim() === '') return;
+          tail.push(clean);
+          if (tail.length > 20) tail.shift();
+          onLine(clean);
+        };
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
+        child.stdout.on('data', (chunk: string) => {
+          for (const line of stdoutBuffer.push(chunk)) emit(line);
+        });
+        child.stderr.on('data', (chunk: string) => {
+          for (const line of stderrBuffer.push(chunk)) emit(line);
+        });
+        child.once('error', (error: NodeJS.ErrnoException) => {
+          options.log.error(`update process error: ${error.code ?? error.message}`);
+          resolve({ code: null, tail: tail.slice(-2).join(' ') || 'The update process failed to start.' });
+        });
+        child.once('close', (code) => {
+          for (const line of stdoutBuffer.flush()) emit(line);
+          for (const line of stderrBuffer.flush()) emit(line);
+          resolve({ code, tail: tail.slice(-2).join(' ') });
+        });
+      });
     },
 
     async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {
