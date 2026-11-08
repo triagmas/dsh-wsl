@@ -12,6 +12,7 @@ import {
   describeInstallation,
   isInsideDirectory,
   isNpmGlobalInstallation,
+  loginShellAgrees,
   parseSharedDshReport,
   type DshInstallation,
 } from '../src/main/core/dsh-locate.js';
@@ -38,6 +39,8 @@ const base: Record<string, string> = {
   package: PKG,
   writable: 'yes',
   foreign: '0',
+  loginreal: `${PKG}/bin/dsh.js`,
+  loginversion: '0.2.1-rc.5',
 };
 
 function installation(overrides: Partial<DshInstallation> = {}): DshInstallation {
@@ -53,6 +56,8 @@ function installation(overrides: Partial<DshInstallation> = {}): DshInstallation
     npmPath: '/usr/bin/npm',
     source: 'login-shell',
     foreignProcesses: 0,
+    loginShellRealPath: `${PKG}/bin/dsh.js`,
+    loginShellVersion: '0.2.1-rc.5',
     ...overrides,
   };
 }
@@ -73,6 +78,8 @@ describe('provenance report parsing', () => {
       npmPath: '/usr/bin/npm',
       source: 'login-shell',
       foreignProcesses: 0,
+      loginShellRealPath: `${PKG}/bin/dsh.js`,
+      loginShellVersion: '0.2.1-rc.5',
     });
   });
 
@@ -158,5 +165,34 @@ describe('installation classification', () => {
     expect(text).toContain('0.2.1-rc.5');
     expect(text).toContain('npm');
     expect(text).toContain('source=login-shell');
+  });
+});
+
+describe('login shell agreement (issue #17 review B3)', () => {
+  it('accepts an installation a login shell resolves as well', () => {
+    expect(loginShellAgrees(installation())).toBe(true);
+  });
+
+  it('rejects an installation the terminal would not run', () => {
+    expect(loginShellAgrees(installation({ loginShellRealPath: '/home/dev/other/bin/dsh' }))).toBe(false);
+  });
+
+  it('does not invent a disagreement when there is no login shell', () => {
+    expect(loginShellAgrees(installation({ loginShellRealPath: null }))).toBe(true);
+  });
+
+  it('parses the login-shell fields and ignores malformed ones', () => {
+    const parsed = parseSharedDshReport(report(base));
+    expect(parsed.installation?.loginShellRealPath).toBe(`${PKG}/bin/dsh.js`);
+    expect(parsed.installation?.loginShellVersion).toBe('0.2.1-rc.5');
+    // A value the app cannot trust is dropped instead of becoming a path.
+    const broken = parseSharedDshReport(
+      report({ ...base, loginreal: '/home/dev/with space/dsh', loginversion: 'nonsense version' }),
+    );
+    expect(broken.installation?.loginShellRealPath).toBeNull();
+    expect(broken.installation?.loginShellVersion).toBeNull();
+    // The installation itself is still usable, so only the shell comparison is lost.
+    expect(broken.installation?.realPath).toBe(`${PKG}/bin/dsh.js`);
+    expect(loginShellAgrees(broken.installation as DshInstallation)).toBe(true);
   });
 });

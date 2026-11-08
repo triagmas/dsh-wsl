@@ -52,7 +52,13 @@ validation, the same version verification, the same rollback.
 | A login shell sees the update | the script prints `a login shell resolves the updated executable` and the shell still resolves the same path |
 | Recovery works | `ROLLBACK_SHARED_SCRIPT` reinstalls the previous exact version and `dsh --version` reports it again |
 | Foreign processes are not touched | a process whose command line contains the realpath makes the inspection report `foreign≥1`, the plan refuse with `foreign-process`, and the script exit `78` — the version stays unchanged |
-| Non-writable prefixes are refused | a `0555` prefix makes the script refuse (`75`/`76`) and the installed package is byte-identical afterwards |
+| Non-writable prefixes are refused | a `0555` prefix makes the script refuse (`75`/`76`/`81`) and the installed package is byte-identical afterwards |
+| No snapshot, no update (B1) | a read-only app data root makes `PREPARE_BACKUP_SCRIPT` exit `79` and the installation is untouched |
+| Symlinked snapshot locations are refused (B1) | an `update` directory that is a symlink exits `79`, and the link target stays empty |
+| Incomplete snapshots are refused (B1) | deleting `payload/` makes the update exit `80` with "nothing was changed"; a snapshot from another installation is refused too |
+| Offline recovery works (B1) | after a simulated crash (package entry point and manifest removed) with the registry switched off, `ROLLBACK_SHARED_SCRIPT` restores the previous version from the snapshot alone and never calls npm; with the snapshot removed it fails explicitly (`74`) instead of guessing |
+| Changed identity is refused (B2) | re-pointing `bin/dsh` at a foreign package, replacing the package directory with a symlink, switching the npm prefix and replacing the package manifest each abort (`81`/`76`) with nothing written |
+| Login-shell divergence is a failure (B3) | a shell profile that resolves another `dsh` before the install exits `82`; a shadowing change that happens *during* a successful install exits `84`, restores the previous version and leaves it installed |
 
 ## Limits
 

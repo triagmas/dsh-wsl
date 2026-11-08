@@ -39,6 +39,18 @@ export interface DshInstallation {
   source: DshSource;
   /** Number of processes running from this installation that the app does not own. */
   foreignProcesses: number;
+  /**
+   * Real path a **login shell** resolves for `dsh`, `null` when the distribution
+   * has no login shell or it resolves nothing.
+   *
+   * The product promise is that DSH WSL runs the executable an ordinary terminal
+   * runs. The inspection records both sides, so the plan can refuse an
+   * installation the terminal would not actually use and the post-update check
+   * can prove that both resolve to the same file.
+   */
+  loginShellRealPath: string | null;
+  /** Version that login-shell executable reports, `null` when unknown. */
+  loginShellVersion: string | null;
 }
 
 /** Marker the inspection script prints before every `key=value` line. */
@@ -103,6 +115,8 @@ export function parseSharedDshReport(text: string): SharedDshReport {
   const packageDir = asPath(fields.get('package') ?? '');
   const npmPath = asPath(fields.get('npm') ?? '');
   const version = (fields.get('version') ?? '') || null;
+  const loginShellRealPath = asPath(fields.get('loginreal') ?? '');
+  const loginShellVersion = (fields.get('loginversion') ?? '') || null;
 
   return {
     found: true,
@@ -119,6 +133,8 @@ export function parseSharedDshReport(text: string): SharedDshReport {
       npmPath,
       source: asSource(fields.get('source') ?? ''),
       foreignProcesses: asCount(fields.get('foreign') ?? '0'),
+      loginShellRealPath,
+      loginShellVersion,
     },
   };
 }
@@ -161,6 +177,17 @@ export function isNpmGlobalInstallation(installation: DshInstallation): boolean 
   const expected = `${installation.prefix.replace(/\/+$/, '')}/lib/node_modules/@deepseek-ai/dsh`;
   const normalisedPackage = installation.packageDir.replace(/\/+$/, '');
   return normalisedPackage === expected || normalisedPackage === `${installation.prefix.replace(/\/+$/, '')}/node_modules/@deepseek-ai/dsh`;
+}
+
+/**
+ * Does the ordinary terminal resolve exactly the installation the app runs?
+ *
+ * `true` when no login shell could be resolved at all (nothing to disagree
+ * with), otherwise false unless both sides report the same real path.
+ */
+export function loginShellAgrees(installation: DshInstallation): boolean {
+  if (installation.loginShellRealPath === null) return true;
+  return installation.loginShellRealPath === installation.realPath;
 }
 
 /** One-line description for logs: never contains tokens or session data. */

@@ -85,6 +85,8 @@ export interface SharedUpdateRunRequest {
   packageDir: string;
   /** Executable the launcher uses. */
   dshPath: string;
+  /** Approved `readlink -f` of that executable: npm must keep it in place. */
+  realPath: string;
   npmPath: string;
   nodePath: string | null;
   /** Transaction id shared by the update, the rollback and the journal. */
@@ -93,6 +95,8 @@ export interface SharedUpdateRunRequest {
   installedVersion: string;
   /** PID of the app-owned backend, excluded from the foreign-process scan. */
   ownPid: number | null;
+  /** Verified offline recovery snapshot, created before the installation changed. */
+  snapshotDir: string;
 }
 
 export interface SharedRollbackRequest {
@@ -101,8 +105,30 @@ export interface SharedRollbackRequest {
   prefix: string;
   packageDir: string;
   dshPath: string;
+  realPath: string;
   npmPath: string;
   nodePath: string | null;
+  snapshotDir: string;
+}
+
+/** Read-only inputs for preparing the verification snapshot. */
+export interface PrepareBackupRequest {
+  distro: string;
+  appRoot: string;
+  prefix: string;
+  packageDir: string;
+  dshPath: string;
+  realPath: string;
+  installedVersion: string;
+  transaction: string;
+}
+
+/** Result of the snapshot step: where the verified copy lives. */
+export interface BackupSnapshot {
+  /** Absolute snapshot directory inside the app data root. */
+  path: string;
+  /** Number of files the snapshot contains. */
+  files: number;
 }
 
 export interface InspectSharedRequest {
@@ -142,6 +168,11 @@ export interface WslGateway {
   }): Promise<NpmVersionCheck>;
   /** Read-only provenance report of the installation the launcher uses. */
   inspectSharedDsh(request: InspectSharedRequest): Promise<SharedDshReport>;
+  /**
+   * Create and verify the offline recovery snapshot. Throws or returns `null`
+   * when the snapshot cannot be proven; the update must not start then.
+   */
+  prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupSnapshot | null>;
   /** Update the shared installation, streaming npm output. */
   updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
   /** Reinstall the previous exact version (failure path and journal recovery). */

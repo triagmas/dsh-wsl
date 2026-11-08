@@ -1,37 +1,53 @@
 /**
  * Issue #17 — acceptance on an isolated fixture (no WSL, no owner installation).
  *
- * The test runs the **real** update scripts (`INSPECT_SHARED_SCRIPT`,
- * `UPDATE_SHARED_SCRIPT`, `ROLLBACK_SHARED_SCRIPT`) against a throwaway npm prefix
- * in a temporary directory, using stub packages named `@deepseek-ai/dsh`. A shim
- * `npm` maps the registry spec to a local tarball, so the whole flow is offline
- * and never touches a global prefix, an owner installation or the network.
+ * The test runs the **real** scripts (`INSPECT_SHARED_SCRIPT`,
+ * `PREPARE_BACKUP_SCRIPT`, `UPDATE_SHARED_SCRIPT`, `ROLLBACK_SHARED_SCRIPT`)
+ * against a throwaway npm prefix in a temporary directory, using stub packages
+ * named `@deepseek-ai/dsh`. A shim `npm` maps the registry spec to a local
+ * tarball, so the whole flow is offline and never touches a global prefix, an
+ * owner installation or the network.
  *
- * What it proves:
- * - the app resolves and executes the same file an ordinary shell resolves
- *   (`bash -lc 'command -v dsh'` → the same realpath);
- * - the inspection detects an npm global installation, its prefix and writability;
- * - the update changes that installation in place, and afterwards both the app and
- *   a login shell see the new version at the same path;
- * - the recovery path reinstalls the previous exact version;
- * - a foreign DSH process makes the update fail closed without touching anything.
+ * Coverage:
+ * - the happy path: one executable for the app and a login shell, in-place
+ *   update, version verified at the same real path, restore;
+ * - B1: no update without a verified, offline-restorable snapshot, and a
+ *   snapshot-based recovery that works with a **completely broken registry**;
+ * - B2: a changed real path, a symlinked package directory, a foreign package
+ *   and a changed npm prefix are refused before anything is written;
+ * - B3: login-shell divergence is a failure, before and after the install, and
+ *   it restores the previous version;
+ * - a foreign DSH process and a prefix that needs elevation stay refused.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   INSPECT_SHARED_SCRIPT,
+  PREPARE_BACKUP_SCRIPT,
   ROLLBACK_SHARED_SCRIPT,
   UPDATE_SHARED_SCRIPT,
 } from '../src/main/wsl/update-args.js';
 import { parseSharedDshReport } from '../src/main/core/dsh-locate.js';
-import { planSharedUpdate } from '../src/main/core/update.js';
+import { planSharedUpdate, type SharedUpdatePlan } from '../src/main/core/update.js';
 
 const OLD = '0.2.1-rc.5';
 const NEW = '0.2.2-rc.1';
+const FOREIGN = '9.9.9';
 const NODE = process.execPath;
+const TX = '20261108T120000Z-a1b2';
 
 const npmAvailable = spawnSync('npm', ['--version'], { encoding: 'utf8' }).status === 0;
 const shellAvailable = spawnSync('/bin/sh', ['-c', 'exit 0']).status === 0;
@@ -44,12 +60,12 @@ afterAll(() => {
 });
 
 /** One stub package: a JS bin that prints `dsh <version>`, like the real CLI. */
-function writeStubPackage(directory: string, version: string): string {
+function writeStubPackage(directory: string, version: string, packageName = '@deepseek-ai/dsh'): string {
   const packageDir = join(directory, 'pkg');
   mkdirSync(join(packageDir, 'bin'), { recursive: true });
   writeFileSync(
     join(packageDir, 'package.json'),
-    JSON.stringify({ name: '@deepseek-ai/dsh', version, bin: { dsh: 'bin/dsh.js' }, private: true }, null, 2),
+    JSON.stringify({ name: packageName, version, bin: { dsh: 'bin/dsh.js' }, private: true }, null, 2),
   );
   writeFileSync(
     join(packageDir, 'bin/dsh.js'),
@@ -70,26 +86,43 @@ function writeStubPackage(directory: string, version: string): string {
  * It answers `prefix -g` with the fixture prefix (so the scripts' agreement check
  * is exercised for real) and rewrites the exact registry spec the scripts build
  * into the matching local tarball, keeping the run offline.
+ *
+ * Three behaviours are switchable through files in the fixture home so a single
+ * shim can model an unreachable registry and a shadowing shell change:
+ * - `<home>/registry-off`: every install fails, like a registry that is offline;
+ * - `<home>/shadow-on-install`: a successful install of the new version also
+ *   shadows `dsh` in the login shell profile (B3 late divergence);
+ * - `<home>/prefix-override`: `prefix -g` answers with another directory (B2).
  */
-function writeNpmShim(path: string, prefix: string, oldTarball: string, newTarball: string): void {
+function writeNpmShim(path: string, prefix: string, tarballs: Record<string, string>, home: string): void {
   writeFileSync(
     path,
     [
       '#!/bin/bash',
       `real=${JSON.stringify(spawnSync('bash', ['-lc', 'command -v npm'], { encoding: 'utf8' }).stdout.trim())}`,
       `prefix=${JSON.stringify(prefix)}`,
-      `old=${JSON.stringify(oldTarball)}`,
-      `new=${JSON.stringify(newTarball)}`,
-      'if [ "$1" = "prefix" ] && [ "$2" = "-g" ]; then echo "$prefix"; exit 0; fi',
+      `home=${JSON.stringify(home)}`,
+      `declare -A maps=(${Object.entries(tarballs)
+        .map(([version, file]) => `[${JSON.stringify(version)}]=${JSON.stringify(file)}`)
+        .join(' ')})`,
+      'if [ "$1" = "prefix" ] && [ "$2" = "-g" ]; then',
+      '  if [ -f "$home/prefix-override" ]; then cat "$home/prefix-override"; exit 0; fi',
+      '  echo "$prefix"; exit 0',
+      'fi',
+      'if [ -f "$home/registry-off" ]; then echo "npm ERR! network request failed" >&2; exit 1; fi',
       'out=()',
+      'installing=""',
       'for a in "$@"; do',
       '  case "$a" in',
-      `    "@deepseek-ai/dsh@${OLD}") out+=("$old") ;;`,
-      `    "@deepseek-ai/dsh@${NEW}") out+=("$new") ;;`,
+      '    @deepseek-ai/dsh@*) v="${a#@deepseek-ai/dsh@}"; installing="$v"; out+=("${maps[$v]:-$a}") ;;',
       '    *) out+=("$a") ;;',
       '  esac',
       'done',
-      'exec "$real" "${out[@]}"',
+      '"$real" "${out[@]}" || exit $?',
+      'if [ -n "$installing" ] && [ "$installing" = "' + NEW + '" ] && [ -f "$home/shadow-on-install" ]; then',
+      '  printf \'export PATH="%s/foreign/bin:$PATH"\\n\' "$home" > "$home/.bash_profile"',
+      'fi',
+      'exit 0',
       '',
     ].join('\n'),
   );
@@ -100,6 +133,7 @@ interface Fixture {
   home: string;
   prefix: string;
   npmShim: string;
+  appRoot: string;
   env: NodeJS.ProcessEnv;
 }
 
@@ -107,17 +141,22 @@ function createFixture(): Fixture {
   const home = mkdtempSync(join(tmpdir(), 'dsh-wsl-fixture-'));
   scratch.push(home);
   const prefix = join(home, '.npm-global');
+  const appRoot = join(home, 'app-data');
   const stubDir = join(home, 'stubs');
   mkdirSync(stubDir, { recursive: true });
   mkdirSync(join(prefix, 'bin'), { recursive: true });
+  mkdirSync(appRoot, { recursive: true });
 
-  const oldTarball = writeStubPackage(join(stubDir, 'old'), OLD);
-  const newTarball = writeStubPackage(join(stubDir, 'new'), NEW);
+  const tarballs: Record<string, string> = {
+    [OLD]: writeStubPackage(join(stubDir, 'old'), OLD),
+    [NEW]: writeStubPackage(join(stubDir, 'new'), NEW),
+    [FOREIGN]: writeStubPackage(join(stubDir, 'foreign'), FOREIGN),
+  };
   // The scripts look for npm in `$HOME/.local/bin` first, so the shim lives there
   // and the inspection reports it as the installation's npm.
   mkdirSync(join(home, '.local/bin'), { recursive: true });
   const npmShim = join(home, '.local/bin/npm');
-  writeNpmShim(npmShim, prefix, oldTarball, newTarball);
+  writeNpmShim(npmShim, prefix, tarballs, home);
 
   // A login shell resolves the fixture prefix, exactly like a real user profile.
   writeFileSync(join(home, '.profile'), `export PATH="${prefix}/bin:$PATH"\n`);
@@ -130,12 +169,12 @@ function createFixture(): Fixture {
   };
 
   // Real npm installs the stub package into the throwaway prefix (offline).
-  const installed = spawnSync(npmShim, ['install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', oldTarball], {
+  const installed = spawnSync(npmShim, ['install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', tarballs[OLD] ?? '', ], {
     env,
     encoding: 'utf8',
   });
   if (installed.status !== 0) throw new Error(`fixture install failed: ${installed.stderr}`);
-  return { home, prefix, npmShim, env };
+  return { home, prefix, npmShim, appRoot, env };
 }
 
 function runScript(script: string, args: string[], env: NodeJS.ProcessEnv) {
@@ -157,8 +196,57 @@ function realPath(path: string, env: NodeJS.ProcessEnv): string {
   return (result.stdout ?? '').trim();
 }
 
+/** Inspect, plan and prepare the snapshot exactly like the runner does. */
+function arrange(fixture: Fixture): { dsh: string; plan: SharedUpdatePlan; snapshot: string } {
+  const dsh = join(fixture.prefix, 'bin', 'dsh');
+  const inspection = runScript(INSPECT_SHARED_SCRIPT, ['-', '-', NODE, '-'], fixture.env);
+  const report = parseSharedDshReport(`${inspection.stdout}\n${inspection.stderr}`);
+  if (report.installation === null) throw new Error('the fixture installation must be detected');
+  const planned = planSharedUpdate({
+    distro: 'Fixture',
+    targetVersion: NEW,
+    appRoot: fixture.appRoot,
+    installation: report.installation,
+    customExecutable: false,
+  });
+  if (!planned.ok) throw new Error(`the fixture plan must be accepted: ${planned.reason}`);
+  const plan = planned.plan;
+  const backup = runScript(
+    PREPARE_BACKUP_SCRIPT,
+    [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, TX, fixture.appRoot],
+    fixture.env,
+  );
+  if (backup.status !== 0) throw new Error(`fixture backup failed: ${backup.stderr}`);
+  const snapshot = `${fixture.appRoot}/update/shared-backup-${TX}`;
+  return { dsh, plan, snapshot };
+}
+
+function updateArgs(
+  fixture: Fixture,
+  plan: SharedUpdatePlan,
+  snapshot: string,
+  overrides: Partial<Record<number, string>> = {},
+): string[] {
+  const args = [
+    plan.prefix,
+    NEW,
+    plan.installedVersion,
+    plan.npmPath,
+    NODE,
+    TX,
+    plan.dshPath,
+    plan.packageDir,
+    fixture.appRoot,
+    '-',
+    plan.realPath,
+    snapshot,
+  ];
+  for (const [index, value] of Object.entries(overrides)) args[Number(index)] = value as string;
+  return args;
+}
+
 describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared installation fixture (issue #17)', () => {
-  it('resolves, inspects, updates and restores the installation a shell sees', () => {
+  it('resolves, snapshots, updates and restores the installation a shell sees', () => {
     const fixture = createFixture();
     const dsh = join(fixture.prefix, 'bin', 'dsh');
 
@@ -168,77 +256,280 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
     const realBefore = realPath(dsh, fixture.env);
     expect(realBefore.startsWith(join(fixture.prefix, 'lib/node_modules/@deepseek-ai/dsh'))).toBe(true);
 
-    // 2. The app's inspection describes it as an npm global installation.
+    // 2. The app's inspection describes it as an npm global installation and
+    //    records what a login shell resolves.
     const inspection = runScript(INSPECT_SHARED_SCRIPT, ['-', '-', NODE, '-'], fixture.env);
     expect(inspection.status).toBe(0);
     const report = parseSharedDshReport(`${inspection.stdout}\n${inspection.stderr}`);
-    expect(report.found).toBe(true);
     const installation = report.installation;
     if (installation === null) throw new Error('the fixture installation must be detected');
     expect(installation.manager).toBe('npm');
     expect(installation.prefix).toBe(fixture.prefix);
     expect(installation.packageDir).toBe(`${fixture.prefix}/lib/node_modules/@deepseek-ai/dsh`);
     expect(installation.realPath).toBe(realBefore);
+    expect(installation.loginShellRealPath).toBe(realBefore);
+    expect(installation.loginShellVersion).toBe(OLD);
     expect(installation.writable).toBe(true);
     expect(installation.foreignProcesses).toBe(0);
     expect(installation.source).toBe('login-shell');
     expect(installation.version).toBe(OLD);
 
-    // 3. The plan accepts it, which is what the confirmation window shows.
-    const plan = planSharedUpdate({
-      distro: 'Fixture',
-      targetVersion: NEW,
-      appRoot: '-',
-      installation,
-      customExecutable: false,
-    });
-    expect(plan.ok).toBe(true);
-    if (!plan.ok) return;
+    const { plan, snapshot } = arrange(fixture);
+    // The snapshot is complete before anything is installed (B1).
+    expect(existsSync(`${snapshot}/payload/package.json`)).toBe(true);
+    expect(existsSync(`${snapshot}/payload/bin/dsh.js`)).toBe(true);
+    expect(existsSync(`${snapshot}/meta`)).toBe(true);
+    expect(readdirSync(snapshot)).toContain('dsh.link');
+    expect(readFileSync(`${snapshot}/meta`, 'utf8')).toContain('version=' + OLD);
+    expect(readFileSync(`${snapshot}/meta`, 'utf8')).toContain('real=' + realBefore);
 
-    // 4. The update changes that installation in place.
-    const update = runScript(
-      UPDATE_SHARED_SCRIPT,
-      [
-        plan.plan.prefix,
-        NEW,
-        OLD,
-        fixture.npmShim,
-        NODE,
-        '20261108T120000Z-a1b2',
-        plan.plan.dshPath,
-        plan.plan.packageDir,
-        '-',
-        '-',
-      ],
-      fixture.env,
-    );
+    // 3. The update changes that installation in place.
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
     expect(update.stderr).not.toContain('could not be restored');
     expect(update.status).toBe(0);
     expect(update.stdout).toContain('a login shell resolves the updated executable');
 
-    // 5. Both the app and an ordinary shell see the new version at the same path.
+    // 4. Both the app and an ordinary shell see the new version at the same path.
     expect(versionAt(dsh, fixture.env)).toBe(`dsh ${NEW}`);
     expect(loginShellResolves(fixture.env)).toBe(dsh);
     expect(realPath(dsh, fixture.env)).toBe(realBefore);
 
-    const after = parseSharedDshReport(
-      runScript(INSPECT_SHARED_SCRIPT, ['-', '-', NODE, '-'], fixture.env).stdout,
-    );
+    const after = parseSharedDshReport(runScript(INSPECT_SHARED_SCRIPT, ['-', '-', NODE, '-'], fixture.env).stdout);
     expect(after.installation?.version).toBe(NEW);
+    expect(after.installation?.loginShellVersion).toBe(NEW);
 
-    // 6. The recovery path reinstalls the previous exact version.
+    // 5. The rollback restores the previous version from the snapshot.
     const rollback = runScript(
       ROLLBACK_SHARED_SCRIPT,
-      [plan.plan.prefix, OLD, fixture.npmShim, NODE, plan.plan.dshPath, plan.plan.packageDir, '20261108T120000Z-a1b2', '-'],
+      [plan.prefix, OLD, fixture.npmShim, NODE, plan.dshPath, plan.packageDir, TX, fixture.appRoot, realBefore, snapshot],
       fixture.env,
     );
     expect(rollback.status).toBe(0);
     expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+
+    // The existing snapshot is never deleted by a later transaction.
+    expect(existsSync(`${snapshot}/payload/package.json`)).toBe(true);
   }, 120_000);
+
+  // --- B1: no mutation without a verified, offline-restorable snapshot --------
+
+  it('refuses to update when the snapshot location cannot be written', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan } = arrange(fixture);
+    // A snapshot directory that cannot be created models a full disk or a
+    // read-only app data root: the update must not start at all.
+    rmSync(join(fixture.appRoot, 'update'), { recursive: true, force: true });
+    chmodSync(fixture.appRoot, 0o555);
+    try {
+      const backup = runScript(
+        PREPARE_BACKUP_SCRIPT,
+        [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, '20261108T120001Z-a1b3', fixture.appRoot],
+        fixture.env,
+      );
+      expect(backup.status).toBe(79);
+      expect(backup.stderr).toContain('backup');
+      // Nothing changed, and no half-written snapshot is left behind.
+      expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+      expect(existsSync(`${fixture.appRoot}/update/shared-backup-20261108T120001Z-a1b3`)).toBe(false);
+    } finally {
+      chmodSync(fixture.appRoot, 0o755);
+    }
+  }, 60_000);
+
+  it('refuses a symlinked backup directory instead of writing through it', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan } = arrange(fixture);
+    const outside = join(fixture.home, 'outside');
+    mkdirSync(outside, { recursive: true });
+    rmSync(join(fixture.appRoot, 'update'), { recursive: true, force: true });
+    symlinkSync(outside, join(fixture.appRoot, 'update'));
+    const backup = runScript(
+      PREPARE_BACKUP_SCRIPT,
+      [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, '20261108T120002Z-a1b4', fixture.appRoot],
+      fixture.env,
+    );
+    expect(backup.status).toBe(79);
+    expect(backup.stderr).toContain('symlink');
+    expect(readdirSync(outside)).toEqual([]);
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+  }, 60_000);
+
+  it('refuses to update when the snapshot is missing or incomplete', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+
+    // An incomplete snapshot: the package payload is gone.
+    rmSync(`${snapshot}/payload`, { recursive: true, force: true });
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
+    expect(update.status).toBe(80);
+    expect(update.stderr).toContain('nothing was changed');
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+
+    // A snapshot that belongs to another installation is refused as well.
+    const other = createFixture();
+    const otherArrange = arrange(other);
+    const foreignSnapshot = runScript(
+      UPDATE_SHARED_SCRIPT,
+      updateArgs(fixture, plan, otherArrange.snapshot),
+      fixture.env,
+    );
+    expect([79, 80]).toContain(foreignSnapshot.status);
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+  }, 120_000);
+
+  it('restores the previous version offline after an interrupted in-place install', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+    const realBefore = plan.realPath;
+    const pkg = plan.packageDir;
+
+    // Model a crash during `npm install -g`: the package directory is left
+    // half-written (entry point and metadata gone) and the registry is offline.
+    rmSync(join(pkg, 'bin/dsh.js'), { force: true });
+    rmSync(join(pkg, 'package.json'), { force: true });
+    writeFileSync(join(fixture.home, 'registry-off'), '');
+    expect(existsSync(join(pkg, 'package.json'))).toBe(false);
+
+    const rollback = runScript(
+      ROLLBACK_SHARED_SCRIPT,
+      [plan.prefix, OLD, fixture.npmShim, NODE, plan.dshPath, pkg, TX, fixture.appRoot, realBefore, snapshot],
+      fixture.env,
+    );
+    expect(rollback.status).toBe(0);
+    // The snapshot alone repaired the installation: npm was never consulted.
+    expect(rollback.stdout).toContain('from the verified snapshot');
+    expect(rollback.stdout).not.toContain('reinstalling @deepseek-ai/dsh');
+    expect(readFileSync(join(pkg, 'package.json'), 'utf8')).toContain(OLD);
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+    expect(realPath(dsh, fixture.env)).toBe(realBefore);
+    expect(loginShellResolves(fixture.env)).toBe(dsh);
+
+    // With the snapshot gone the same situation ends in an explicit failure,
+    // not in a blind destructive restore.
+    rmSync(snapshot, { recursive: true, force: true });
+    rmSync(join(pkg, 'package.json'), { force: true });
+    const failed = runScript(
+      ROLLBACK_SHARED_SCRIPT,
+      [plan.prefix, OLD, fixture.npmShim, NODE, plan.dshPath, pkg, TX, fixture.appRoot, realBefore, snapshot],
+      fixture.env,
+    );
+    expect(failed.status).toBe(74);
+  }, 120_000);
+
+  // --- B2: the installation identity is re-verified before mutation ----------
+
+  it('refuses when the executable now points at a foreign package', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+    const foreignDir = join(fixture.home, 'foreign-install');
+    mkdirSync(join(foreignDir, 'bin'), { recursive: true });
+    writeFileSync(join(foreignDir, 'bin/dsh'), '#!/bin/sh\necho "dsh ' + FOREIGN + '"\n');
+    chmodSync(join(foreignDir, 'bin/dsh'), 0o755);
+    rmSync(dsh, { force: true });
+    symlinkSync(join(foreignDir, 'bin/dsh'), dsh);
+
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
+    expect([81, 82]).toContain(update.status);
+    expect(update.stderr).toContain('nothing was changed');
+    // The foreign installation is untouched, and so is the real one.
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${FOREIGN}`);
+    expect(readFileSync(`${plan.packageDir}/package.json`, 'utf8')).toContain(OLD);
+  }, 120_000);
+
+  it('refuses a package directory that became a symlink', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+    const moved = join(fixture.home, 'moved-package');
+    spawnSync('mv', [plan.packageDir, moved]);
+    symlinkSync(moved, plan.packageDir);
+
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
+    expect(update.status).toBe(81);
+    expect(update.stderr).toContain('nothing was changed');
+    // The linked-away package still reports the old version: nothing was replaced.
+    expect(readFileSync(`${moved}/package.json`, 'utf8')).toContain(OLD);
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+  }, 120_000);
+
+  it('refuses a changed npm prefix', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+    const elsewhere = join(fixture.home, 'another-prefix');
+    mkdirSync(elsewhere, { recursive: true });
+    writeFileSync(join(fixture.home, 'prefix-override'), `${elsewhere}\n`);
+
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
+    expect(update.status).toBe(76);
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+    expect(existsSync(join(elsewhere, 'lib/node_modules/@deepseek-ai/dsh'))).toBe(false);
+  }, 120_000);
+
+  it('refuses when the package at that path is not DeepSeek Harness any more', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+    const manifest = join(plan.packageDir, 'package.json');
+    writeFileSync(manifest, JSON.stringify({ name: '@other/tool', version: OLD }).concat('\n'));
+
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
+    expect(update.status).toBe(81);
+    expect(update.stderr).toContain('not an @deepseek-ai/dsh package');
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+  }, 120_000);
+
+  // --- B3: login-shell divergence is a failure, never a warning --------------
+
+  it('refuses before installing when the login shell runs another executable', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+    const foreignBin = join(fixture.home, 'foreign/bin');
+    mkdirSync(foreignBin, { recursive: true });
+    writeFileSync(join(foreignBin, 'dsh'), '#!/bin/sh\necho "dsh ' + FOREIGN + '"\n');
+    chmodSync(join(foreignBin, 'dsh'), 0o755);
+    // The terminal would pick the other installation up first.
+    writeFileSync(join(fixture.home, '.bash_profile'), `export PATH="${foreignBin}:$PATH"\n`);
+
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
+    expect(update.status).toBe(82);
+    expect(update.stderr).toContain('login shell');
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+  }, 120_000);
+
+  it('rolls back when the login shell stops resolving the updated version', () => {
+    const fixture = createFixture();
+    const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
+    const foreignBin = join(fixture.home, 'foreign/bin');
+    mkdirSync(foreignBin, { recursive: true });
+    writeFileSync(join(foreignBin, 'dsh'), '#!/bin/sh\necho "dsh ' + FOREIGN + '"\n');
+    chmodSync(join(foreignBin, 'dsh'), 0o755);
+    // The install itself succeeds, then the shell starts resolving something else.
+    writeFileSync(join(fixture.home, 'shadow-on-install'), '');
+
+    const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
+    expect(update.status).toBe(84);
+    expect(update.stderr).toContain('instead of the updated installation');
+    expect(update.stdout).toContain('previous version restored');
+    // Never green: the installation is back at the previous version.
+    expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
+    expect(realPath(dsh, fixture.env)).toBe(plan.realPath);
+    expect(readFileSync(`${plan.packageDir}/package.json`, 'utf8')).toContain(OLD);
+  }, 120_000);
+
+  // --- existing guarantees ----------------------------------------------------
 
   it('fails closed while another DSH process uses the installation', async () => {
     const fixture = createFixture();
     const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
     const real = realPath(dsh, fixture.env);
 
     // A process whose command line contains the real path we are about to change.
@@ -249,22 +540,18 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
       if (report.installation === null) throw new Error('the fixture installation must be detected');
       expect(report.installation.foreignProcesses).toBeGreaterThan(0);
 
-      const plan = planSharedUpdate({
+      const planned = planSharedUpdate({
         distro: 'Fixture',
         targetVersion: NEW,
-        appRoot: '-',
+        appRoot: fixture.appRoot,
         installation: report.installation,
         customExecutable: false,
       });
-      expect(plan.ok).toBe(false);
-      expect(plan.ok === false && plan.reason).toBe('foreign-process');
+      expect(planned.ok).toBe(false);
+      expect(planned.ok === false && planned.reason).toBe('foreign-process');
 
       // Even if the caller ignored the plan, the script refuses on its own.
-      const update = runScript(
-        UPDATE_SHARED_SCRIPT,
-        [fixture.prefix, NEW, OLD, fixture.npmShim, NODE, '20261108T120000Z-a1b2', dsh, report.installation.packageDir ?? '-', '-', '-'],
-        fixture.env,
-      );
+      const update = runScript(UPDATE_SHARED_SCRIPT, updateArgs(fixture, plan, snapshot), fixture.env);
       expect(update.status).toBe(78);
       expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
     } finally {
@@ -275,6 +562,7 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
   it('never touches a prefix that needs elevated rights', () => {
     const fixture = createFixture();
     const dsh = join(fixture.prefix, 'bin', 'dsh');
+    const { plan, snapshot } = arrange(fixture);
     // A read-only prefix models a system-wide installation the user cannot write.
     const locked = join(fixture.home, 'locked-prefix');
     mkdirSync(join(locked, 'lib/node_modules'), { recursive: true });
@@ -282,15 +570,15 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
     try {
       const update = runScript(
         UPDATE_SHARED_SCRIPT,
-        [locked, NEW, OLD, fixture.npmShim, NODE, '20261108T120000Z-a1b2', dsh, '-', '-', '-'],
+        updateArgs(fixture, plan, snapshot, { 0: locked }),
         fixture.env,
       );
       expect(update.status).not.toBe(0);
-      // Either the prefix check or the npm-prefix agreement refuses first.
-      expect([75, 76]).toContain(update.status);
+      // Either the prefix check, the npm-prefix agreement or the identity check
+      // refuses first; all of them fail closed.
+      expect([75, 76, 81]).toContain(update.status);
       expect(versionAt(dsh, fixture.env)).toBe(`dsh ${OLD}`);
-      expect(existsSync(join(fixture.prefix, 'lib/node_modules/@deepseek-ai/dsh/package.json'))).toBe(true);
-      expect(readFileSync(join(fixture.prefix, 'lib/node_modules/@deepseek-ai/dsh/package.json'), 'utf8')).toContain(OLD);
+      expect(readFileSync(`${plan.packageDir}/package.json`, 'utf8')).toContain(OLD);
     } finally {
       chmodSync(join(locked, 'lib/node_modules'), 0o755);
     }

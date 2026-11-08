@@ -11,12 +11,15 @@ import {
   INSPECT_SHARED_SCRIPT,
   NPM_PACKAGE,
   NPM_VIEW_SCRIPT,
+  PREPARE_BACKUP_SCRIPT,
   ROLLBACK_SHARED_SCRIPT,
   UPDATE_SHARED_SCRIPT,
   buildInspectSharedArgs,
   buildNpmViewArgs,
+  buildPrepareBackupArgs,
   buildRollbackSharedArgs,
   buildUpdateSharedArgs,
+  parseBackupReport,
   parseNpmMarker,
 } from '../src/main/wsl/update-args.js';
 import { ArgumentError } from '../src/main/wsl/args.js';
@@ -26,18 +29,23 @@ const PREFIX = '/home/dev/.npm-global';
 const PKG = `${PREFIX}/lib/node_modules/@deepseek-ai/dsh`;
 const DSH = `${PREFIX}/bin/dsh`;
 
+const REAL = `${PKG}/bin/dsh.js`;
+const SNAPSHOT = `${APP_ROOT}/update/shared-backup-20261107T101500Z-1a2b`;
+
 const updateRequest = {
   distro: 'Ubuntu',
   appRoot: APP_ROOT,
   prefix: PREFIX,
   packageDir: PKG,
   dshPath: DSH,
+  realPath: REAL,
   npmPath: '/usr/bin/npm',
   nodePath: '/usr/bin/node',
   transaction: '20261107T101500Z-1a2b',
   version: '0.2.2-rc.1',
   installedVersion: '0.2.1-rc.5',
   ownPid: 4242,
+  snapshotDir: SNAPSHOT,
 };
 
 describe('npm view (read-only check)', () => {
@@ -126,6 +134,8 @@ describe('shared installation update', () => {
       PKG,
       APP_ROOT,
       '4242',
+      REAL,
+      SNAPSHOT,
     ]);
   });
 
@@ -163,9 +173,44 @@ describe('shared installation update', () => {
     expect(UPDATE_SHARED_SCRIPT).toContain('exit 74');
   });
 
-  it('confirms that a login shell resolves the updated executable', () => {
+  it('treats login-shell divergence as a failure, not a warning (B3)', () => {
     expect(UPDATE_SHARED_SCRIPT).toContain('bash -lc "command -v dsh"');
     expect(UPDATE_SHARED_SCRIPT).toContain('a login shell resolves the updated executable');
+    // Neither "warning" nor a silent success: the script exits and restores.
+    expect(UPDATE_SHARED_SCRIPT).not.toContain('warning:');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 82');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 84');
+  });
+
+  it('requires the verified snapshot of this very installation (B1)', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain('snapshot_ok');
+    expect(UPDATE_SHARED_SCRIPT).toContain('shared-backup-$tx');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 79');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 80');
+    // The install must not be reachable without the snapshot checks.
+    const installAt = UPDATE_SHARED_SCRIPT.indexOf('install --global --prefix');
+    expect(UPDATE_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$installed"')).toBeLessThan(installAt);
+    expect(UPDATE_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$installed"')).toBeLessThan(
+      UPDATE_SHARED_SCRIPT.indexOf('install --global --prefix'),
+    );
+  });
+
+  it('re-verifies the pinned real path and package identity before mutating (B2)', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain('[ "$real" = "$real_path" ]');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 81');
+    expect(UPDATE_SHARED_SCRIPT).toContain('readlink -f');
+    expect(UPDATE_SHARED_SCRIPT).toContain('lib/node_modules/*');
+    expect(UPDATE_SHARED_SCRIPT).toContain(`grep -q "\\"name\\"[[:space:]]*:[[:space:]]*\\"${NPM_PACKAGE}\\"`);
+    const identityAt = UPDATE_SHARED_SCRIPT.indexOf('[ "$real" = "$real_path" ]');
+    expect(identityAt).toBeLessThan(UPDATE_SHARED_SCRIPT.indexOf('install --global --prefix'));
+  });
+
+  it('prefers the offline snapshot restore over a registry reinstall', () => {
+    const restoreBlock = UPDATE_SHARED_SCRIPT.slice(
+      UPDATE_SHARED_SCRIPT.indexOf('restore() {'),
+      UPDATE_SHARED_SCRIPT.indexOf('cache="$base/cache/npm"'),
+    );
+    expect(restoreBlock.indexOf('restore_snapshot')).toBeLessThan(restoreBlock.indexOf('falling back to reinstalling'));
   });
 
   it('rejects invalid versions, transactions and paths', () => {
@@ -186,6 +231,68 @@ describe('shared installation update', () => {
   });
 });
 
+describe('backup script (B1)', () => {
+  const backupRequest = {
+    distro: 'Ubuntu',
+    appRoot: APP_ROOT,
+    prefix: PREFIX,
+    packageDir: PKG,
+    dshPath: DSH,
+    realPath: REAL,
+    installedVersion: '0.2.1-rc.5',
+    transaction: '20261107T101500Z-1a2b',
+  };
+
+  it('receives every value as a positional parameter', () => {
+    const argv = buildPrepareBackupArgs(backupRequest);
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PREPARE_BACKUP_SCRIPT]);
+    expect(argv.slice(6)).toEqual([DSH, PREFIX, PKG, REAL, '0.2.1-rc.5', '20261107T101500Z-1a2b', APP_ROOT]);
+  });
+
+  it('refuses symlinked or pre-existing snapshot locations', () => {
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ ! -L "$sn" ]');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ ! -L "$sn.tmp" ]');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ -e "$sn" ] &&');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('exit 79');
+  });
+
+  it('copies the package and the executable shim state, then verifies both', () => {
+    expect(PREPARE_BACKUP_SCRIPT).toContain('cp -a "$pkg/." "$sn.tmp/payload/"');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('dsh.link');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('version_of "$sn.tmp/payload/$entry"');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('printf "entry=%s');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('exit 80');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('exit 81');
+  });
+
+  it('rejects invalid inputs before touching the filesystem', () => {
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, installedVersion: 'latest' })).toThrow(ArgumentError);
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, transaction: '../../x' })).toThrow(ArgumentError);
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, realPath: 'relative/dsh.js' })).toThrow(ArgumentError);
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, packageDir: '/a/../b' })).toThrow(ArgumentError);
+  });
+
+  it('parses only a complete snapshot report', () => {
+    const text = [
+      '__dsh_wsl_backup__ path=/home/dev/app/update/shared-backup-20261107T101500Z-1a2b',
+      '__dsh_wsl_backup__ version=0.2.1-rc.5',
+      '__dsh_wsl_backup__ real=/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+      '__dsh_wsl_backup__ package=/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh',
+      '__dsh_wsl_backup__ files=128',
+    ].join('\n');
+    expect(parseBackupReport(text)).toEqual({
+      path: '/home/dev/app/update/shared-backup-20261107T101500Z-1a2b',
+      version: '0.2.1-rc.5',
+      realPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+      packageDir: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh',
+      files: 128,
+    });
+    expect(parseBackupReport('__dsh_wsl_backup__ files=0')).toBeNull();
+    expect(parseBackupReport(text.replace('files=128', 'files=0'))).toBeNull();
+    expect(parseBackupReport(text.replace('version=0.2.1-rc.5', 'version=latest'))).toBeNull();
+  });
+});
+
 describe('rollback script', () => {
   it('reinstalls the exact previous version', () => {
     const argv = buildRollbackSharedArgs(
@@ -194,9 +301,30 @@ describe('rollback script', () => {
       '20261107T101500Z-1a2b',
     );
     expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', ROLLBACK_SHARED_SCRIPT]);
-    expect(argv.slice(6)).toEqual([PREFIX, '0.2.1-rc.5', '/usr/bin/npm', '/usr/bin/node', DSH, PKG, '20261107T101500Z-1a2b', APP_ROOT]);
-    expect(ROLLBACK_SHARED_SCRIPT).toContain(`"${NPM_PACKAGE}@$ver"`);
+    expect(argv.slice(6)).toEqual([
+      PREFIX,
+      '0.2.1-rc.5',
+      '/usr/bin/npm',
+      '/usr/bin/node',
+      DSH,
+      PKG,
+      '20261107T101500Z-1a2b',
+      APP_ROOT,
+      REAL,
+      SNAPSHOT,
+    ]);
     expect(ROLLBACK_SHARED_SCRIPT).toContain('shared-backup-$tx');
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 74');
+  });
+
+  it('restores from the verified snapshot before asking npm', () => {
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('restoring $ver from the verified snapshot');
+    expect(ROLLBACK_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$ver"')).toBeLessThan(
+      ROLLBACK_SHARED_SCRIPT.indexOf('install --global --prefix'),
+    );
+    // A destination that is no longer the expected one is never replaced.
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('[ ! -L "$pkg" ]');
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 81');
     expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 74');
   });
 

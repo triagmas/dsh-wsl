@@ -298,8 +298,10 @@ async function restore(
         prefix: journal.prefix,
         packageDir: journal.packageDir,
         dshPath: journal.dshPath,
+        realPath: journal.realPath,
         npmPath: journal.npmPath,
         nodePath: null,
+        snapshotDir: journal.backupDir,
       },
       journal.installed,
       journal.transaction,
@@ -314,7 +316,7 @@ async function restore(
     return {
       handled: true,
       action: 'blocked',
-      message: `${reason} The previous version ${journal.installed} could not be restored (${restored.tail}). The journal was kept. Run "npm install -g @deepseek-ai/dsh@${journal.installed}" (or with the matching --prefix) inside WSL, then start DSH WSL again.`,
+      message: `${reason} The previous version ${journal.installed} could not be restored from the verified snapshot at ${journal.backupDir} (${restored.tail}). The journal was kept. Restore that directory over ${journal.packageDir} inside WSL, or run "npm install -g --prefix ${journal.prefix} @deepseek-ai/dsh@${journal.installed}", then start DSH WSL again.`,
     };
   }
 

@@ -4,6 +4,7 @@ import type {
   NpmVersionCheck,
   ResolvedRuntime,
   ServerHandle,
+  PrepareBackupRequest,
   SharedRollbackRequest,
   SharedUpdateRunRequest,
   StartServerRequest,
@@ -31,6 +32,8 @@ export const DEFAULT_INSTALLATION: DshInstallation = {
   npmPath: '/usr/bin/npm',
   source: 'login-shell',
   foreignProcesses: 0,
+  loginShellRealPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+  loginShellVersion: '0.2.1-rc.5',
 };
 
 export const BACKEND_PID = 4242;
@@ -146,12 +149,16 @@ export class FakeWsl implements WslGateway {
   /** What the inspection reports before the update. */
   installation: DshInstallation = { ...DEFAULT_INSTALLATION };
   /** What it reports afterwards (the runner verifies the target version). */
-  installationAfterUpdate: Partial<DshInstallation> = { version: '0.2.2-rc.1' };
+  installationAfterUpdate: Partial<DshInstallation> = { version: '0.2.2-rc.1', loginShellVersion: '0.2.2-rc.1' };
   /** What the recovery inspection reports (`null` = use `installation`). */
   recoveryObservation: SharedInstallObservation | null = null;
   legacyRuntimePresent = false;
   readonly updateRuns: SharedUpdateRunRequest[] = [];
   readonly rollbackRuns: { request: SharedRollbackRequest; version: string; transaction: string }[] = [];
+  /** Verified snapshot step (B1): recorded, and failable on demand. */
+  readonly backupRequests: PrepareBackupRequest[] = [];
+  backupFails = false;
+  backupFiles = 128;
   readonly npmChecks: { distro: string; appRoot: string; version: string; nodePath: string | null }[] = [];
   readonly inspections: InspectSharedRequest[] = [];
 
@@ -178,6 +185,13 @@ export class FakeWsl implements WslGateway {
       };
     }
     return { found: true, installation: { ...this.installation }, legacyRuntimePresent: this.legacyRuntimePresent };
+  }
+
+  async prepareSharedBackup(request: PrepareBackupRequest): Promise<{ path: string; files: number } | null> {
+    this.backupRequests.push(request);
+    if (this.backupFails) return null;
+    const root = request.appRoot === '-' ? '/home/dev/.cache/wsl-web-shell' : request.appRoot.replace(/^~/, '/home/dev');
+    return { path: `${root}/update/shared-backup-${request.transaction}`, files: this.backupFiles };
   }
 
   async updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {

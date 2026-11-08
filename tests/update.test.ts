@@ -311,6 +311,7 @@ const journal = (overrides: Partial<UpdateJournalV2> = {}): UpdateJournalV2 => (
   packageDir: DEFAULT_INSTALLATION.packageDir as string,
   appRoot: APP_ROOT,
   npmPath: '/usr/bin/npm',
+  backupDir: `${APP_ROOT}/update/shared-backup-20261107T101500Z-1a2b`,
   target: '0.2.2-rc.1',
   installed: '0.2.1-rc.5',
   startedAt: '2026-11-07T10:15:00.000Z',
@@ -903,5 +904,117 @@ describe('update window and shutdown wiring (review blocker D)', () => {
     expect(indexSource).toContain('resourcesPath: process.resourcesPath');
     // The old unconditional relaunch is gone.
     expect(indexSource).not.toContain('app.relaunch(portable === null ? {}');
+  });
+});
+
+// --- B1/B2/B3: the blocking review of PR #18 -------------------------------
+
+describe('recovery snapshot and identity checks (review B1-B3)', () => {
+  it('creates the verified snapshot before anything is stopped or installed', async () => {
+    const h = runnerHarness();
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(true);
+    // The snapshot is requested before the backend is paused and carries the
+    // pinned identity of the installation that is about to change.
+    expect(h.wsl.backupRequests).toHaveLength(1);
+    const backup = h.wsl.backupRequests[0];
+    expect(backup?.realPath).toBe(DEFAULT_INSTALLATION.realPath);
+    expect(backup?.packageDir).toBe(DEFAULT_INSTALLATION.packageDir);
+    expect(backup?.transaction).toBe(context.transaction);
+    expect(h.order).toEqual(['pause', 'resume']);
+    // The installation is only touched with that snapshot.
+    expect(h.wsl.updateRuns[0]?.snapshotDir).toContain(`/update/shared-backup-${context.transaction}`);
+    expect(h.wsl.updateRuns[0]?.realPath).toBe(DEFAULT_INSTALLATION.realPath);
+  });
+
+  it('never stops the backend or installs when the snapshot cannot be verified', async () => {
+    const h = runnerHarness();
+    h.wsl.backupFails = true;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    // B1: fail closed *before* the installation and before the backend is paused.
+    expect(h.order).toEqual([]);
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(h.journal.current()).toBeNull();
+    expect(outcome.state.detail).toContain('verified recovery snapshot');
+  });
+
+  it('records the snapshot in the journal so recovery can use it offline', async () => {
+    const h = runnerHarness();
+    const written: UpdateJournalV2[] = [];
+    const store = h.journal;
+    const original = store.write.bind(store);
+    store.write = (next: UpdateJournalV2) => {
+      written.push(next);
+      original(next);
+    };
+    await h.runner.run(acceptedPlan(), context);
+    expect(written.length).toBeGreaterThan(0);
+    expect(written[0]?.backupDir).toContain(`/update/shared-backup-${context.transaction}`);
+    expect(written[0]?.realPath).toBe(DEFAULT_INSTALLATION.realPath);
+    // Success cleared the record; the snapshot path was never guessed.
+    expect(h.journal.current()).toBeNull();
+  });
+
+  it('treats a fail-closed updater code as "nothing changed" and keeps the installation', async () => {
+    for (const code of [79, 80, 81, 82]) {
+      const h = runnerHarness();
+      h.wsl.updateCode = code;
+      h.wsl.updateRunLines = ['update: the installation identity changed, so nothing was changed'];
+      const outcome = await h.runner.run(acceptedPlan(), context);
+      expect(outcome.ok).toBe(false);
+      expect(h.wsl.rollbackRuns).toHaveLength(0);
+      expect(h.journal.current()).toBeNull();
+      expect(h.order).toEqual(['pause', 'resume']);
+      expect(outcome.state.detail).toContain('Nothing was changed');
+    }
+  });
+
+  it('rolls back when the installation did not stay at the approved path', async () => {
+    const h = runnerHarness();
+    h.wsl.installationAfterUpdate = {
+      version: '0.2.2-rc.1',
+      loginShellVersion: '0.2.2-rc.1',
+      realPath: '/home/dev/other/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+    };
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(h.wsl.rollbackRuns).toHaveLength(1);
+    expect(h.wsl.rollbackRuns[0]?.request.snapshotDir).toContain('/update/shared-backup-');
+    expect(h.wsl.rollbackRuns[0]?.request.realPath).toBe(DEFAULT_INSTALLATION.realPath);
+  });
+
+  it('rolls back when a login shell does not run the updated version', async () => {
+    const h = runnerHarness();
+    h.wsl.installationAfterUpdate = {
+      version: '0.2.2-rc.1',
+      loginShellVersion: '0.2.1-rc.5',
+      loginShellRealPath: '/home/dev/other/bin/dsh',
+    };
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(h.wsl.rollbackRuns).toHaveLength(1);
+    expect(outcome.state.phase).not.toBe('done');
+    expect(outcome.state.detail).toContain('login shell');
+  });
+
+  it('refuses a plan when the login shell resolves another installation', () => {
+    const result = planSharedUpdate({
+      distro: 'Ubuntu',
+      targetVersion: '0.2.2-rc.1',
+      appRoot: '/home/dev/.local/share/wsl-web-shell',
+      installation: { ...DEFAULT_INSTALLATION, loginShellRealPath: '/home/dev/other/bin/dsh' },
+      customExecutable: false,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.reason).toBe('login-shell-mismatch');
+  });
+
+  it('rolls back when a crash leaves the installation at the target version but another path', () => {
+    const decision = decideRecovery(
+      journal(),
+      { present: true, version: '0.2.2-rc.1', realPath: '/home/dev/elsewhere/bin/dsh.js' },
+    );
+    expect(decision.action).toBe('rollback');
   });
 });

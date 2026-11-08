@@ -9,6 +9,7 @@ import type {
   SharedUpdateRunRequest,
   SharedRollbackRequest,
   InspectSharedRequest,
+  PrepareBackupRequest,
 } from '../core/supervisor.js';
 import { parseSharedDshReport } from '../core/dsh-locate.js';
 import { ShellError } from '../core/supervisor.js';
@@ -39,9 +40,11 @@ import {
 import {
   buildInspectSharedArgs,
   buildNpmViewArgs,
+  buildPrepareBackupArgs,
   buildRollbackSharedArgs,
   buildUpdateSharedArgs,
   NPM_MARKER,
+  parseBackupReport,
   parseNpmMarker,
 } from './update-args.js';
 
@@ -408,6 +411,30 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       return report;
     },
 
+    async prepareSharedBackup(request: PrepareBackupRequest) {
+      const argv = buildPrepareBackupArgs({
+        distro: request.distro,
+        appRoot: request.appRoot,
+        prefix: request.prefix,
+        packageDir: request.packageDir,
+        dshPath: request.dshPath,
+        realPath: request.realPath,
+        installedVersion: request.installedVersion,
+        transaction: request.transaction,
+      });
+      const result = await run(argv, 120_000);
+      const report = parseBackupReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code !== 0 || report === null) {
+        options.log.error(
+          `the recovery snapshot for ${request.installedVersion} could not be created (code=${result.code ?? 'null'}): ` +
+            `${(result.stderr || result.stdout).trim().split('\n').filter(Boolean).slice(-1)[0] ?? 'no output'}`,
+        );
+        return null;
+      }
+      options.log.info(`recovery snapshot ready at ${report.path} (${report.files} files, version=${report.version})`);
+      return { path: report.path, files: report.files };
+    },
+
     async updateSharedDsh(request: SharedUpdateRunRequest, onLine) {
       const argv = buildUpdateSharedArgs(
         {
@@ -416,12 +443,14 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
           prefix: request.prefix,
           packageDir: request.packageDir,
           dshPath: request.dshPath,
+          realPath: request.realPath,
           npmPath: request.npmPath,
           nodePath: request.nodePath,
           transaction: request.transaction,
           version: request.version,
           installedVersion: request.installedVersion,
           ownPid: request.ownPid,
+          snapshotDir: request.snapshotDir,
         },
         request.transaction,
       );
@@ -440,8 +469,10 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
           prefix: request.prefix,
           packageDir: request.packageDir,
           dshPath: request.dshPath,
+          realPath: request.realPath,
           npmPath: request.npmPath,
           nodePath: request.nodePath,
+          snapshotDir: request.snapshotDir,
         },
         version,
         transaction,

@@ -15,8 +15,9 @@ and never signals a process it does not own.
 footer pill (only while an update exists)
    -> confirmation window   (distro, executable, install scope, versions, warning)
    -> terminal window       (streamed npm output; Close only when the run finished)
+   -> verified recovery snapshot in the app data root (offline, before anything changes)
    -> owned backend stopped, npm install -g into the reported prefix
-   -> version re-verified at the same path, backend started and auth-checked
+   -> version AND login-shell re-verified at the same real path, backend started
    -> app relaunches the packaged EXE (or says it cannot)
 ```
 
@@ -60,6 +61,7 @@ does not exist.
 | `not-writable` | the prefix needs elevated rights; the window shows the exact `npm install -g --prefix …` command instead |
 | `foreign-process` | another `dsh` process runs from the same installation (the app never kills it) |
 | `no-npm` | npm is not available in that distribution |
+| `login-shell-mismatch` | a login shell resolves a different executable than the app runs, so updating would not change the CLI a terminal uses |
 
 The provenance comes from a read-only inspection (`INSPECT_SHARED_SCRIPT`),
 never from guessing:
@@ -87,14 +89,59 @@ command strings.
 | Step | Script | What it does |
 | --- | --- | --- |
 | npm lookup | `NPM_VIEW_SCRIPT` | read-only `npm view @deepseek-ai/dsh@<ver> version`; an unpublished version stops the run |
-| inspect | `INSPECT_SHARED_SCRIPT` | read-only report: `path`, `real`, `link`, `source`, `version`, `npm`, `manager`, `prefix`, `package`, `writable`, `foreign`, `legacy` |
-| update | `UPDATE_SHARED_SCRIPT` | re-checks prefix agreement (`exit 76`), writability (`exit 75`), current version (`exit 71`), already-installed (`exit 77`) and foreign processes (`exit 78`); copies the previous package to `<app root>/update/shared-backup-<tx>`; runs `npm install --global --prefix <prefix> @deepseek-ai/dsh@<ver>`; verifies the executable and that a login shell resolves the same file |
-| rollback | `ROLLBACK_SHARED_SCRIPT` | reinstalls the previous exact version with the same npm and prefix, falls back to the copied package directory, and verifies the reported version |
+| inspect | `INSPECT_SHARED_SCRIPT` | read-only report: `path`, `real`, `link`, `source`, `version`, `loginreal`, `loginversion`, `npm`, `manager`, `prefix`, `package`, `writable`, `foreign`, `legacy` |
+| snapshot | `PREPARE_BACKUP_SCRIPT` | copies the package and the executable shim state into `<app root>/update/shared-backup-<tx>`, verifies that the copy runs and reports the installed version, records the immutable identity (`meta`) and renames the directory into place |
+| update | `UPDATE_SHARED_SCRIPT` | requires that verified snapshot (`exit 79`/`80`); re-checks prefix agreement (`76`), writability (`75`), the pinned real path and package identity (`81`), the current version (`71`), already-installed (`77`), login-shell agreement (`82`) and foreign processes (`78`); runs `npm install --global --prefix <prefix> @deepseek-ai/dsh@<ver>`; then proves the version **and** that the executable stayed at the approved real path (`83`) and that a login shell runs it too (`84`) |
+| rollback | `ROLLBACK_SHARED_SCRIPT` | restores the verified snapshot **offline** (no registry, no npm), and only falls back to `npm install` of the previous exact version when the snapshot is unusable; validates the destination first (`81`) |
 
-Failure handling inside the update script: an npm failure reinstalls the previous
-version (verified) and exits `72`; a version that does not become the target is
-rolled back the same way (`74`); if the restore itself fails the script exits
-`73` and the app keeps the journal and blocks further starts.
+### The recovery snapshot (blocking review B1)
+
+An update cannot start without a snapshot that the app itself can verify. It is
+created **before** the backend is stopped and before npm runs, in the app's own
+data root, in a transaction-specific directory:
+
+```
+<app root>/update/shared-backup-<tx>/
+  payload/          copy of <prefix>/lib/node_modules/@deepseek-ai/dsh
+  dsh.link | dsh    the executable shim: its symlink target, or a copy
+  meta              version, real path, prefix, package, entry, files, transaction
+```
+
+The directory is built as `…-<tx>.tmp`, verified (payload present, entry point
+present, the copy really reports the installed version, at least one file), and
+only then renamed into place — a half-copied snapshot is never mistaken for a
+usable one. Symlinked locations are refused, an existing snapshot is never
+deleted, and nothing is written outside the app data root. The journal records
+the path, and recovery restores from it, so **an interrupted install can be
+repaired with no registry access at all**. `npm install` of the previous version
+is only the fallback.
+
+### Identity at the last safe moment (B2)
+
+`realPath` from the plan is passed into the mutating script and compared again
+right before the install, together with a re-canonicalised package directory, the
+expected npm package name in its `package.json`, containment in
+`<prefix>/lib/node_modules`, and the npm prefix reported by `npm prefix -g`.
+A moved symlink, a foreign package at that path, a symlinked package directory, a
+changed prefix or a changed installation manager aborts with `exit 81` and the
+message "nothing was changed". Rollback re-validates the destination the same way
+before replacing anything, so no `rm -rf` can run through a redirected path.
+
+### The login shell must run the update too (B3)
+
+Before and after the install the script resolves `dsh` through
+`bash -lc 'command -v dsh'`. A different real path before the install means the
+update would not change the CLI a terminal uses: it is refused (`82`). A different
+path or version after the install is a **failure**, not a warning: the snapshot is
+restored and the run exits `84`. The runner repeats the same comparison from a
+fresh inspection (real path and login-shell version) before it reports success, so
+a green result always means "the app and an ordinary terminal run the same updated
+file".
+
+Failure handling inside the update script: an npm failure restores the snapshot
+and exits `72`; a version that does not become the target is rolled back the same
+way (`74`); if the restore itself fails the script exits `73` and the app keeps
+the journal and blocks further starts.
 
 ## Transaction: quiesce, install, verify, recover
 
@@ -118,7 +165,8 @@ the next start inspects the executable and acts on evidence:
 
 | Observed state | Action |
 | --- | --- |
-| reports the target version | `finalize` — the update had finished; start normally |
+| reports the target version at the recorded real path | `finalize` — the update had finished; start normally |
+| reports the target version at another path | `rollback` — the update did not install what the plan approved |
 | reports the previous version | `abandon` — nothing was changed; forget the record |
 | reports anything else, or is missing | `rollback` — reinstall the previous exact version, then start it |
 | cannot be inspected at all | `blocked` — the app refuses to start and explains it |

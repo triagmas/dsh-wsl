@@ -55,7 +55,10 @@ export interface UpdateLifecycle {
 }
 
 export interface UpdateRunnerDeps {
-  wsl: Pick<WslGateway, 'checkPublishedVersion' | 'inspectSharedDsh' | 'updateSharedDsh' | 'rollbackSharedDsh'>;
+  wsl: Pick<
+    WslGateway,
+    'checkPublishedVersion' | 'inspectSharedDsh' | 'prepareSharedBackup' | 'updateSharedDsh' | 'rollbackSharedDsh'
+  >;
   lifecycle: UpdateLifecycle;
   journal: UpdateJournalStore;
   log: Logger;
@@ -131,6 +134,7 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
     context: UpdateContext,
     phase: UpdateJournalPhase,
     startedAt: string,
+    snapshotDir: string,
   ): boolean => {
     try {
       deps.journal.write({
@@ -145,6 +149,7 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         packageDir: plan.packageDir,
         appRoot: plan.appRoot,
         npmPath: plan.npmPath,
+        backupDir: snapshotDir,
         target: plan.version,
         installed: plan.installedVersion,
         startedAt,
@@ -172,6 +177,7 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
     context: UpdateContext,
     reason: string,
     where: string,
+    snapshotDir: string,
   ): Promise<UpdateOutcome> => {
     const restored = await deps.wsl
       .rollbackSharedDsh(
@@ -181,8 +187,10 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
           prefix: plan.prefix,
           packageDir: plan.packageDir,
           dshPath: plan.dshPath,
+          realPath: plan.realPath,
           npmPath: plan.npmPath,
           nodePath: context.nodePath,
+          snapshotDir,
         },
         plan.installedVersion,
         context.transaction,
@@ -243,6 +251,8 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
       // True once the install may have started: from here on only a proven
       // restore may clear the journal.
       let installStarted = false;
+      // Verified snapshot created before the install; needed by the error path.
+      let backupDir: string | null = null;
 
       try {
         const check = await deps.wsl.checkPublishedVersion({
@@ -299,8 +309,40 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         terminal.append(`update: installation ${verified.dshPath} (${verified.scope})`);
         terminal.append(`update: target ${verified.installedVersion} -> ${verified.version}`);
 
-        // 2. The journal must exist before anything can be installed.
-        if (!writeJournal(verified, context, 'updating', startedAt)) {
+        // 2. B1: a verified, offline-restorable snapshot must exist before the
+        //    shared installation is touched. Without it nothing is changed at
+        //    all, and the backend is never stopped.
+        terminal.append(`update: preparing a recovery snapshot of ${verified.installedVersion}`);
+        const snapshot = await deps.wsl
+          .prepareSharedBackup({
+            distro: verified.distro,
+            appRoot: verified.appRoot,
+            prefix: verified.prefix,
+            packageDir: verified.packageDir,
+            dshPath: verified.dshPath,
+            realPath: verified.realPath,
+            installedVersion: verified.installedVersion,
+            transaction: context.transaction,
+          })
+          .catch((error: unknown) => {
+            terminal.append(
+              `update: the recovery snapshot failed (${error instanceof Error ? error.message : 'unknown error'})`,
+            );
+            return null;
+          });
+        if (snapshot === null) {
+          // Nothing was paused and nothing was written, so there is no lock to
+          // release and no journal to clear.
+          deps.journal.clear();
+          deps.log.error('update: no verified recovery snapshot, nothing was changed');
+          return { ok: false, state: fail(describeUpdateReason(UPDATE_REASONS.backupUnavailable)) };
+        }
+        const snapshotDir = snapshot.path;
+        backupDir = snapshotDir;
+        terminal.append(`update: verified recovery snapshot at ${snapshotDir} (${snapshot.files} files)`);
+
+        // 3. The journal must exist before anything can be installed.
+        if (!writeJournal(verified, context, 'updating', startedAt, snapshotDir)) {
           return {
             ok: false,
             state: fail(
@@ -309,7 +351,7 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
           };
         }
 
-        // 3. Quiesce: pause recovery, stop only the app-owned backend.
+        // 4. Quiesce: pause recovery, stop only the app-owned backend.
         publish({ phase: 'stopping', message: describeUpdatePhase('stopping') });
         const paused = await deps.lifecycle.pauseForUpdate();
         if (!paused.ok) {
@@ -321,7 +363,7 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
           };
         }
 
-        // 4. Update the shared installation.
+        // 5. Update the shared installation.
         installStarted = true;
         publish({ phase: 'installing', message: describeUpdatePhase('installing') });
         const updated = await deps.wsl.updateSharedDsh(
@@ -331,37 +373,56 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
             prefix: verified.prefix,
             packageDir: verified.packageDir,
             dshPath: verified.dshPath,
+            realPath: verified.realPath,
             npmPath: check.npmPath,
             nodePath: context.nodePath,
             transaction: context.transaction,
             version: verified.version,
             installedVersion: verified.installedVersion,
             ownPid: context.ownPid,
+            snapshotDir,
           },
           append,
         );
 
-        if (updated.code === 72 || updated.code === 74) {
-          // The script already reinstalled the previous version and proved it.
-          const outcome = await rollback(
-            verified,
-            context,
+        // The script refuses *before* touching anything for these codes, so the
+        // installation is untouched and only the backend has to come back.
+        if (updated.code === 79 || updated.code === 80 || updated.code === 81 || updated.code === 82) {
+          const detail = updated.tail === '' ? `The updater exited with code ${updated.code}.` : updated.tail;
+          deps.log.error(`update: refused before changing anything (code=${updated.code})`);
+          const resumed = await deps.lifecycle.resumeAfterUpdate();
+          if (!resumed.ok) {
+            deps.lifecycle.blockForRuntime(detail);
+            return {
+              ok: false,
+              state: fail(`${detail} The previous installation is still in place, but its backend did not start.`, 'failed'),
+            };
+          }
+          deps.journal.clear();
+          return { ok: false, state: fail(`${detail} Nothing was changed.`) };
+        }
+        if (updated.code === 72 || updated.code === 74 || updated.code === 83 || updated.code === 84) {
+          // The script restored the previous installation itself and proved it;
+          // the runner still verifies and restarts before clearing the journal.
+          const reason =
             updated.code === 72
               ? 'npm could not install the new version.'
-              : 'The updated installation did not report the target version.',
-            'install',
-          );
-          return outcome;
+              : updated.code === 74
+                ? 'The updated installation did not report the target version.'
+                : updated.code === 83
+                  ? 'The updated installation did not stay at the approved path.'
+                  : 'A login shell does not run the updated version.';
+          return await rollback(verified, context, reason, 'install', snapshotDir);
         }
         if (updated.code !== 0) {
           // 73/75/76/77/78 and anything unexpected: the installation may be in any
           // state, so only a proven restore may clear the journal.
           const detail = updated.tail === '' ? `The updater exited with code ${updated.code ?? 'unknown'}.` : updated.tail;
-          return await rollback(verified, context, detail, 'install');
+          return await rollback(verified, context, detail, 'install', snapshotDir);
         }
 
-        // 5. Independently confirm the version the launcher will now run.
-        if (!writeJournal(verified, context, 'verifying', startedAt)) {
+        // 6. Independently confirm the version the launcher will now run.
+        if (!writeJournal(verified, context, 'verifying', startedAt, snapshotDir)) {
           // The previous record still describes the pending install, so a crash
           // here stays recoverable: continue instead of throwing it away.
           terminal.append('update: the journal phase could not be updated; the previous record is kept');
@@ -382,16 +443,52 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
             context,
             `The updated installation reports ${reported ?? 'no version'} instead of ${verified.version}.`,
             'verification',
+            snapshotDir,
           );
         }
         terminal.append(`update: ${verified.dshPath} reports ${reported}`);
 
-        // 6. Prove the new version actually serves the WebUI.
+        // B2/B3 mirror: the target version has to live at the approved real path,
+        // and an ordinary login shell has to run that very file.
+        if (after.installation !== null && after.installation.realPath !== verified.realPath) {
+          terminal.append(
+            `update: the installation resolves to ${after.installation.realPath} instead of ${verified.realPath}`,
+          );
+          return await rollback(
+            verified,
+            context,
+            `The updated installation resolves to ${after.installation.realPath} instead of the approved ${verified.realPath}.`,
+            'verification',
+            snapshotDir,
+          );
+        }
+        const shellReal = after.installation?.loginShellRealPath ?? null;
+        const shellVersion = after.installation?.loginShellVersion ?? null;
+        if (shellReal !== null && (shellReal !== verified.realPath || !isSameVersion(shellVersion, verified.version))) {
+          terminal.append(
+            `update: a login shell resolves ${shellReal} (${shellVersion ?? 'no version'}) instead of ${verified.realPath}`,
+          );
+          return await rollback(
+            verified,
+            context,
+            'A login shell does not run the updated DeepSeek Harness, so the update was reverted.',
+            'verification',
+            snapshotDir,
+          );
+        }
+
+        // 7. Prove the new version actually serves the WebUI.
         publish({ phase: 'starting', message: describeUpdatePhase('starting') });
         const resumed = await deps.lifecycle.resumeAfterUpdate();
         if (!resumed.ok) {
           terminal.append('update: the updated version did not start, restoring the previous version');
-          return await rollback(verified, context, resumed.message ?? 'The updated version did not start.', 'start');
+          return await rollback(
+            verified,
+            context,
+            resumed.message ?? 'The updated version did not start.',
+            'start',
+            snapshotDir,
+          );
         }
 
         // Only a new backend that really served the WebUI clears the journal.
@@ -406,9 +503,21 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         return { ok: true, state: done };
       } catch (error) {
         const detail = error instanceof Error ? `${error.name}: ${error.message}` : 'unknown error';
-        if (installStarted) {
+        if (installStarted && backupDir !== null) {
           // The install may have run: only a proven restore may clear the journal.
-          return await rollback(plan, context, detail, 'exception');
+          return await rollback(plan, context, detail, 'exception', backupDir);
+        }
+        if (installStarted) {
+          // The install may have run and there is no verified snapshot: nothing
+          // may be started from an unknown installation.
+          deps.log.error('update: the install may have run without a verified snapshot');
+          deps.lifecycle.blockForRuntime(detail);
+          return {
+            ok: false,
+            state: fail(
+              `${detail} The installation did not change completely and no verified snapshot is available, so the app will not start it. Reinstall DeepSeek Harness inside WSL or restore it from your own backup.`,
+            ),
+          };
         }
         deps.lifecycle.releaseUpdateLock();
         deps.journal.clear();

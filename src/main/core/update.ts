@@ -27,7 +27,13 @@
  *   the install makes an interrupted update recoverable on the next start.
  */
 import { redactSecrets } from '../backend/urls.js';
-import { describeInstallScope, isInsideDirectory, isNpmGlobalInstallation, type DshInstallation } from './dsh-locate.js';
+import {
+  describeInstallScope,
+  isInsideDirectory,
+  isNpmGlobalInstallation,
+  loginShellAgrees,
+  type DshInstallation,
+} from './dsh-locate.js';
 import { compareSemver, parseSemver } from './versions.js';
 
 /** How many terminal lines the progress window keeps. */
@@ -254,6 +260,8 @@ export const UPDATE_REASONS = {
   notWritable: 'not-writable',
   foreignProcess: 'foreign-process',
   noNpm: 'no-npm',
+  loginShellMismatch: 'login-shell-mismatch',
+  backupUnavailable: 'backup-unavailable',
 } as const;
 
 export function describeUpdateReason(reason: string): string {
@@ -280,6 +288,10 @@ export function describeUpdateReason(reason: string): string {
       return 'Another DeepSeek Harness process is running from this installation. Close it (including any `dsh web` started in a terminal) and try again: the app never stops processes it does not own.';
     case UPDATE_REASONS.noNpm:
       return 'npm was not found in this WSL distribution, so the installation cannot be updated from the app.';
+    case UPDATE_REASONS.loginShellMismatch:
+      return 'An ordinary WSL login shell resolves a different DeepSeek Harness executable than the one this app runs, so updating would not change the CLI you use in a terminal. Fix the PATH order in your shell profile (or clear a pinned path in Settings) and try again.';
+    case UPDATE_REASONS.backupUnavailable:
+      return 'The verified recovery snapshot could not be created, so nothing was changed. Check the free space and write access of the app data directory inside WSL and retry.';
     default:
       return 'This update cannot be started safely.';
   }
@@ -327,6 +339,15 @@ export function planSharedUpdate(input: SharedUpdatePlanInput): SharedUpdatePlan
   }
   if (installation.foreignProcesses > 0) {
     return { ok: false, reason: UPDATE_REASONS.foreignProcess, detail: `${installation.foreignProcesses}` };
+  }
+  // The product promise: the app runs, and updates, the executable a terminal
+  // runs. A login shell that resolves another file makes that impossible.
+  if (!loginShellAgrees(installation)) {
+    return {
+      ok: false,
+      reason: UPDATE_REASONS.loginShellMismatch,
+      detail: installation.loginShellRealPath,
+    };
   }
   return {
     ok: true,
@@ -417,6 +438,11 @@ export interface UpdateJournalV2 {
   appRoot: string;
   /** npm used for the update, needed to restore after an interruption. */
   npmPath: string;
+  /**
+   * Verified offline recovery snapshot created before the installation changed.
+   * Recovery restores from it without asking the registry for anything.
+   */
+  backupDir: string;
   target: string;
   installed: string;
   startedAt: string;
@@ -490,6 +516,7 @@ export function parseUpdateJournal(raw: unknown): UpdateJournal | null {
     const packageDir = requiredString(value, 'packageDir');
     const appRoot = requiredString(value, 'appRoot');
     const npmPath = requiredString(value, 'npmPath');
+    const backupDir = requiredString(value, 'backupDir');
     if (value.kind !== 'npm-global') return null;
     if (!JOURNAL_PHASES.includes(value.phase as UpdateJournalPhase)) return null;
     if (
@@ -499,7 +526,9 @@ export function parseUpdateJournal(raw: unknown): UpdateJournal | null {
       packageDir === null ||
       appRoot === null ||
       npmPath === null ||
+      backupDir === null ||
       !isNormalisedAbsolutePath(npmPath) ||
+      !isNormalisedAbsolutePath(backupDir) ||
       (appRoot !== '-' && !isNormalisedAbsolutePath(appRoot)) ||
       !isNormalisedAbsolutePath(dshPath) ||
       !isNormalisedAbsolutePath(realPath) ||
@@ -520,6 +549,7 @@ export function parseUpdateJournal(raw: unknown): UpdateJournal | null {
       packageDir,
       appRoot,
       npmPath,
+      backupDir,
       target,
       installed,
       startedAt,
@@ -622,6 +652,14 @@ export function decideRecovery(
     };
   }
   if (observation.present && isSameVersion(observation.version, journal.target)) {
+    // The target version must also be the file the plan approved: a target
+    // version that appeared at another path is not the update that was started.
+    if (observation.realPath !== null && observation.realPath !== journal.realPath) {
+      return {
+        action: 'rollback',
+        reason: `the installation reports ${journal.target} but resolves to ${observation.realPath} instead of ${journal.realPath}`,
+      };
+    }
     return { action: 'finalize', reason: `the installation already reports ${journal.target}` };
   }
   if (observation.present && isSameVersion(observation.version, journal.installed)) {
