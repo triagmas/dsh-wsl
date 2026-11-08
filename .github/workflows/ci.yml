@@ -236,11 +236,25 @@ jobs:
         run: |
           $target = Join-Path $env:RUNNER_TEMP 'wss-installed'
           $uninstaller = (Get-ChildItem $target -Filter 'Uninstall *.exe' -File)[0].FullName
-          $removal = Start-Process -FilePath $uninstaller -ArgumentList '/S', "_?=$target" -Wait -PassThru
+          # A normal silent uninstall (no `_?=`): the uninstaller copies itself to
+          # a temporary directory first, otherwise it cannot delete the directory it
+          # is running from. Then wait for the installation to disappear.
+          $removal = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
           if ($removal.ExitCode -ne 0) { throw "uninstaller exited with $($removal.ExitCode)" }
-          $deadline = (Get-Date).AddSeconds(60)
+          $deadline = (Get-Date).AddSeconds(120)
           while ((Test-Path $target) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
-          if (Test-Path $target) { throw 'installation directory survived the uninstall' }
+          Get-Process -Name 'Uninstall WSL Web Shell', 'Au_' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "stopping the leftover uninstaller process (pid $($_.Id))"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+          }
+          foreach ($file in @((Join-Path $target 'WSL Web Shell.exe'), (Join-Path $target 'resources\app.asar'))) {
+            if (Test-Path $file) { throw "installed file survived the uninstall: $file" }
+          }
+          if (Test-Path $target) {
+            $leftover = @(Get-ChildItem $target -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            Write-Host "leftover in the installation directory: $($leftover -join '; ')"
+            throw 'installation directory survived the uninstall'
+          }
           $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
           $shortcuts = @(Get-ChildItem $startMenu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*WSL Web Shell*' })
           if ($shortcuts.Count -ne 0) { throw "Start menu shortcut survived the uninstall: $($shortcuts.FullName -join ', ')" }
