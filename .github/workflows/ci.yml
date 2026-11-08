@@ -42,6 +42,10 @@ jobs:
       - name: Build main/preload/local pages
         run: npm run build
 
+      # Issue #14: every relative link and image in README/README.ru/docs must resolve.
+      - name: Documentation links (README, README.ru, docs)
+        run: npm run docs:check
+
       # Renders the app-owned footer and settings popover under Xvfb and asserts
       # what they show (issue #9). No WSL and no DeepSeek Harness involved.
       - name: Chrome smoke (footer + settings popover)
@@ -107,7 +111,7 @@ jobs:
   windows-package:
     name: Windows x64 packages (Portable + Setup)
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     needs: verify
     steps:
       - uses: actions/checkout@v4
@@ -136,8 +140,8 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $portableName = "WSL-Web-Shell-$version-x64-Portable.exe"
-          $setupName = "WSL-Web-Shell-$version-x64-Setup.exe"
+          $portableName = "DSH-WSL-$version-x64-Portable.exe"
+          $setupName = "DSH-WSL-$version-x64-Setup.exe"
           $portable = Join-Path 'release' $portableName
           $setup = Join-Path 'release' $setupName
           foreach ($file in @($portable, $setup)) {
@@ -159,17 +163,45 @@ jobs:
           "$setupHash  $setupName" | Out-File -FilePath release/SHA256SUMS.txt -Append -Encoding ascii
           Get-Content release/SHA256SUMS.txt
 
-      - name: Packaged relaunch check — portable (issue #12)
+      - name: Packaged relaunch check - portable (issue #12)
         shell: pwsh
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $exe = Join-Path 'release' "WSL-Web-Shell-$version-x64-Portable.exe"
+          $exe = Join-Path 'release' "DSH-WSL-$version-x64-Portable.exe"
           if (-not (Test-Path $exe)) { throw 'portable EXE was not produced' }
           $dir = Join-Path $env:RUNNER_TEMP 'relaunch-probe-portable'
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           Write-Host "probing $exe"
           Start-Process -FilePath $exe -ArgumentList "--relaunch-probe=$dir" -Wait
           node scripts/check-relaunch.cjs $dir $exe 180 --mode=portable
+
+      # Issue #14: the rename must not move the profile. A pre-existing
+      # %APPDATA%\wsl-web-shell (config, logs) has to stay the live one for both
+      # packages, and the new display name must not create a second profile.
+      - name: Profile continuity - legacy profile survives the rename
+        shell: pwsh
+        run: |
+          $legacy = Join-Path $env:APPDATA 'wsl-web-shell'
+          $renamed = Join-Path $env:APPDATA 'DSH WSL'
+          if (Test-Path $renamed) { Remove-Item -Recurse -Force $renamed }
+          New-Item -ItemType Directory -Force -Path (Join-Path $legacy 'logs') | Out-Null
+          '{"port":3091,"presetId":"deepseek-harness"}' | Out-File (Join-Path $legacy 'config.json') -Encoding ascii
+          'legacy profile marker' | Out-File (Join-Path $legacy 'logs\app.log') -Encoding ascii
+          $configBefore = (Get-FileHash (Join-Path $legacy 'config.json') -Algorithm SHA256).Hash
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $portable = Resolve-Path (Join-Path 'release' "DSH-WSL-$version-x64-Portable.exe")
+          $probe = Join-Path $env:RUNNER_TEMP 'profile-portable.json'
+          Start-Process -FilePath $portable -ArgumentList "--profile-probe=$probe" -Wait
+          $info = Get-Content $probe -Raw | ConvertFrom-Json
+          Write-Host "portable: name=$($info.name) userData=$($info.userData)"
+          if ($info.name -ne 'DSH WSL') { throw "the portable build still calls itself $($info.name)" }
+          if ($info.userData -ne $legacy) { throw "the portable build uses $($info.userData) instead of $legacy" }
+          if ((Get-FileHash (Join-Path $legacy 'config.json') -Algorithm SHA256).Hash -ne $configBefore) {
+            throw 'the existing config.json was modified by the rename'
+          }
+          if (-not (Test-Path (Join-Path $legacy 'logs\app.log'))) { throw 'the existing log file disappeared' }
+          if (Test-Path $renamed) { throw "a second profile was created at $renamed" }
+          'portable build keeps the legacy profile' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       # Issue #14: the assisted installer must install per-user without elevation,
       # create shortcuts and an uninstall entry, and keep user data outside the
@@ -178,10 +210,10 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $setup = Join-Path 'release' "WSL-Web-Shell-$version-x64-Setup.exe"
-          $target = Join-Path $env:RUNNER_TEMP 'wss-installed'
+          $setup = Join-Path 'release' "DSH-WSL-$version-x64-Setup.exe"
+          $target = Join-Path $env:RUNNER_TEMP 'dsh-wsl-installed'
           if (Test-Path $target) { Remove-Item -Recurse -Force $target }
-          $app = Join-Path $target 'WSL Web Shell.exe'
+          $app = Join-Path $target 'DSH WSL.exe'
           # Do not block on -Wait: with runAfterFinish the installer may start the
           # app itself, and the app would keep running. Wait for the files instead.
           $install = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$target" -PassThru
@@ -195,7 +227,7 @@ jobs:
           if (-not $install.HasExited) { $install.WaitForExit(60000) | Out-Null }
           if (-not (Test-Path $app)) { throw "installer did not produce $app (exit $($install.ExitCode))" }
           # A launched instance must not hold the probe or the uninstaller.
-          Get-Process -Name 'WSL Web Shell' -ErrorAction SilentlyContinue | ForEach-Object {
+          Get-Process -Name 'DSH WSL' -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host "stopping the instance the installer started (pid $($_.Id))"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
           }
@@ -203,27 +235,40 @@ jobs:
           foreach ($file in @($app, (Join-Path $target 'resources\app.asar'))) {
             if (-not (Test-Path $file)) { throw "installed file is missing: $file" }
           }
-          $uninstaller = @(Get-ChildItem $target -Filter 'Uninstall *.exe' -File)
-          if ($uninstaller.Count -ne 1) { throw "expected one uninstaller, found $($uninstaller.Count)" }
+          $uninstallerName = "Uninstall DSH WSL.exe"
+          if (-not (Test-Path (Join-Path $target $uninstallerName))) { throw "expected uninstaller $uninstallerName" }
           $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-          $shortcuts = @(Get-ChildItem $startMenu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*WSL Web Shell*' })
+          $shortcuts = @(Get-ChildItem $startMenu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*DSH WSL*' })
           if ($shortcuts.Count -lt 1) { throw 'Start menu shortcut was not created' }
           $entries = @(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' |
-            ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -like '*WSL Web Shell*' })
+            ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -like '*DSH WSL*' })
           if ($entries.Count -lt 1) { throw 'Installed Apps entry was not registered' }
-          # User data outside the installation directory must survive an uninstall.
-          $userData = Join-Path $env:APPDATA 'wsl-web-shell'
-          New-Item -ItemType Directory -Force -Path $userData | Out-Null
-          'r14 install smoke marker' | Out-File (Join-Path $userData 'r14-install-smoke.txt') -Encoding ascii
           "installed=$target" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "shortcut=$($shortcuts[0].FullName)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "uninstallEntry=$($entries[0].DisplayName)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
-      - name: Packaged relaunch check — installed (issue #14)
+      - name: Profile continuity - installed build uses the same profile
         shell: pwsh
         run: |
-          $target = Join-Path $env:RUNNER_TEMP 'wss-installed'
-          $app = Join-Path $target 'WSL Web Shell.exe'
+          $target = Join-Path $env:RUNNER_TEMP 'dsh-wsl-installed'
+          $app = Join-Path $target 'DSH WSL.exe'
+          $legacy = Join-Path $env:APPDATA 'wsl-web-shell'
+          $renamed = Join-Path $env:APPDATA 'DSH WSL'
+          $probe = Join-Path $env:RUNNER_TEMP 'profile-installed.json'
+          Start-Process -FilePath $app -ArgumentList "--profile-probe=$probe" -Wait
+          $info = Get-Content $probe -Raw | ConvertFrom-Json
+          Write-Host "installed: name=$($info.name) userData=$($info.userData) packaged=$($info.packaged)"
+          if ($info.name -ne 'DSH WSL') { throw "the installed build still calls itself $($info.name)" }
+          if ($info.userData -ne $legacy) { throw "the installed build uses $($info.userData) instead of $legacy" }
+          if (Test-Path $renamed) { throw "the installed build created a second profile at $renamed" }
+          if (-not (Test-Path (Join-Path $legacy 'logs\app.log'))) { throw 'the existing profile was replaced by the installed build' }
+          'installed build keeps the legacy profile' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Packaged relaunch check - installed (issue #14)
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'dsh-wsl-installed'
+          $app = Join-Path $target 'DSH WSL.exe'
           $dir = Join-Path $env:RUNNER_TEMP 'relaunch-probe-installed'
           if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -234,8 +279,9 @@ jobs:
       - name: Setup EXE uninstall smoke
         shell: pwsh
         run: |
-          $target = Join-Path $env:RUNNER_TEMP 'wss-installed'
-          $uninstaller = (Get-ChildItem $target -Filter 'Uninstall *.exe' -File)[0].FullName
+          $target = Join-Path $env:RUNNER_TEMP 'dsh-wsl-installed'
+          $uninstaller = Join-Path $target 'Uninstall DSH WSL.exe'
+          if (-not (Test-Path $uninstaller)) { throw "uninstaller is missing: $uninstaller" }
           # A normal silent uninstall (no `_?=`): the uninstaller copies itself to
           # a temporary directory first, otherwise it cannot delete the directory it
           # is running from. Then wait for the installation to disappear.
@@ -243,11 +289,11 @@ jobs:
           if ($removal.ExitCode -ne 0) { throw "uninstaller exited with $($removal.ExitCode)" }
           $deadline = (Get-Date).AddSeconds(120)
           while ((Test-Path $target) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
-          Get-Process -Name 'Uninstall WSL Web Shell', 'Au_' -ErrorAction SilentlyContinue | ForEach-Object {
+          Get-Process -Name 'Uninstall DSH WSL', 'Au_' -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host "stopping the leftover uninstaller process (pid $($_.Id))"
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
           }
-          foreach ($file in @((Join-Path $target 'WSL Web Shell.exe'), (Join-Path $target 'resources\app.asar'))) {
+          foreach ($file in @((Join-Path $target 'DSH WSL.exe'), (Join-Path $target 'resources\app.asar'))) {
             if (Test-Path $file) { throw "installed file survived the uninstall: $file" }
           }
           if (Test-Path $target) {
@@ -256,23 +302,24 @@ jobs:
             throw 'installation directory survived the uninstall'
           }
           $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
-          $shortcuts = @(Get-ChildItem $startMenu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*WSL Web Shell*' })
+          $shortcuts = @(Get-ChildItem $startMenu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*DSH WSL*' })
           if ($shortcuts.Count -ne 0) { throw "Start menu shortcut survived the uninstall: $($shortcuts.FullName -join ', ')" }
           $entries = @(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' |
-            ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -like '*WSL Web Shell*' })
+            ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -like '*DSH WSL*' })
           if ($entries.Count -ne 0) { throw 'Installed Apps entry survived the uninstall' }
-          $marker = Join-Path (Join-Path $env:APPDATA 'wsl-web-shell') 'r14-install-smoke.txt'
-          if (-not (Test-Path $marker)) { throw 'user data outside the installation directory was deleted' }
-          Remove-Item $marker -Force
-          'uninstall removed the installation, its shortcuts and its uninstall entry; user data was preserved' |
+          $legacy = Join-Path $env:APPDATA 'wsl-web-shell'
+          foreach ($file in @((Join-Path $legacy 'config.json'), (Join-Path $legacy 'logs\app.log'))) {
+            if (-not (Test-Path $file)) { throw "the uninstaller deleted user data: $file" }
+          }
+          'uninstall removed the installation, its shortcuts and its uninstall entry; the legacy profile and its data were preserved' |
             Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
         with:
-          name: wsl-web-shell-windows-x64
+          name: dsh-wsl-windows-x64
           path: |
-            release/WSL-Web-Shell-*-x64-Portable.exe
-            release/WSL-Web-Shell-*-x64-Setup.exe
+            release/DSH-WSL-*-x64-Portable.exe
+            release/DSH-WSL-*-x64-Setup.exe
             release/SHA256SUMS.txt
           retention-days: 7

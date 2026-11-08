@@ -935,9 +935,9 @@ describe('update runner transaction', () => {
 });
 
 describe('relaunch target after an update (issues #12 and #14)', () => {
-  const portable = 'D:\\Apps\\WSL-Web-Shell-0.1.0-x64-Portable.exe';
-  const installed = 'C:\\Users\\me\\AppData\\Local\\Programs\\wsl-web-shell\\WSL Web Shell.exe';
-  const installedResources = 'C:\\Users\\me\\AppData\\Local\\Programs\\wsl-web-shell\\resources';
+  const portable = 'D:\\Apps\\DSH-WSL-0.1.0-x64-Portable.exe';
+  const installed = 'C:\\Users\\me\\AppData\\Local\\Programs\\DSH WSL\\DSH WSL.exe';
+  const installedResources = 'C:\\Users\\me\\AppData\\Local\\Programs\\DSH WSL\\resources';
   const installedEnv = {
     portableExecutableFile: null as string | null,
     execPath: installed,
@@ -950,7 +950,7 @@ describe('relaunch target after an update (issues #12 and #14)', () => {
     const decision = resolveRelaunchTarget(
       {
         portableExecutableFile: portable,
-        execPath: 'C:\\Temp\\2abc\\WSL Web Shell.exe',
+        execPath: 'C:\\Temp\\2abc\\DSH WSL.exe',
         platform: 'win32',
         packaged: true,
         resourcesPath: 'C:\\Temp\\2abc\\resources',
@@ -967,7 +967,7 @@ describe('relaunch target after an update (issues #12 and #14)', () => {
 
   it('accepts the installed payload with forward slashes as electron-builder reports them', () => {
     const decision = resolveRelaunchTarget(
-      { ...installedEnv, resourcesPath: 'C:/Users/me/AppData/Local/Programs/wsl-web-shell/resources' },
+      { ...installedEnv, resourcesPath: 'C:/Users/me/AppData/Local/Programs/DSH WSL/resources' },
       (path) => path === installed || path.endsWith('app.asar'),
     );
     expect(decision.ok).toBe(true);

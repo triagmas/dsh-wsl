@@ -19,6 +19,7 @@ import { createLatestVersionService } from './backend/github-versions.js';
 import { createUpdateRunner } from './core/update-runner.js';
 import { createJournalStore, recoverInterruptedUpdate } from './core/update-recovery.js';
 import { describeRelaunchFailure, resolveRelaunchTarget } from './core/relaunch.js';
+import { APP_DISPLAY_NAME, APP_ID, PROFILE_DIRECTORY } from './core/branding.js';
 import {
   UPDATE_REASONS,
   createTransactionId,
@@ -50,7 +51,17 @@ import type {
   VersionSnapshot,
 } from '../shared/types.js';
 
-const APP_ID = 'com.triagmas.wslwebshell';
+/**
+ * Identity and profile (issue #14).
+ *
+ * The product is now called "DSH WSL", but the profile directory keeps its
+ * established name: it holds `config.json`, logs, the owned-server registry, the
+ * versions cache and the update journal. Changing it would silently orphan the
+ * user's settings, port choice and interrupted-update state, so the path is pinned
+ * here, before anything reads `userData`.
+ */
+app.setName(APP_DISPLAY_NAME);
+app.setPath('userData', join(app.getPath('appData'), PROFILE_DIRECTORY));
 
 /**
  * Packaged relaunch self-test (issue #12).
@@ -58,8 +69,8 @@ const APP_ID = 'com.triagmas.wslwebshell';
  * The only way to prove that an update restarts the *portable* EXE — and not the
  * temporary extraction copy — is to run the packaged build itself:
  *
- *   WSL-Web-Shell-0.1.0-x64-Portable.exe --relaunch-probe=<dir>
- *   WSL-Web-Shell-0.1.0-x64-Setup.exe (installed) --relaunch-probe=<dir>
+ *   DSH-WSL-0.1.0-x64-Portable.exe --relaunch-probe=<dir>
+ *   DSH-WSL-0.1.0-x64-Setup.exe (installed) --relaunch-probe=<dir>
  *
  * The parent records where it runs, decides the relaunch target with the same
  * `resolveRelaunchTarget()` the update uses, relaunches it through `app.relaunch`
@@ -123,7 +134,43 @@ async function runRelaunchProbe(directory: string): Promise<void> {
 
 const relaunchProbeArg = process.argv.find((argument) => argument.startsWith(RELAUNCH_PROBE_PREFIX));
 
-if (relaunchProbeArg !== undefined) {
+/**
+ * Profile self-test (issue #14).
+ *
+ * Proves on a packaged build — portable and installed — that the rename did not
+ * move the profile: the recorded `userData` must still point at
+ * `%APPDATA%\wsl-web-shell`, where the user's config, logs and update journal live.
+ *
+ *   DSH WSL.exe --profile-probe=<file.json>
+ */
+const PROFILE_PROBE_PREFIX = '--profile-probe=';
+const profileProbeArg = process.argv.find((argument) => argument.startsWith(PROFILE_PROBE_PREFIX));
+
+if (profileProbeArg !== undefined) {
+  const target = profileProbeArg.slice(PROFILE_PROBE_PREFIX.length);
+  try {
+    writeFileSync(
+      target,
+      `${JSON.stringify(
+        {
+          name: app.getName(),
+          version: app.getVersion(),
+          packaged: app.isPackaged,
+          execPath: process.execPath,
+          appData: app.getPath('appData'),
+          userData: app.getPath('userData'),
+          configPath: join(app.getPath('userData'), 'config.json'),
+        },
+        null,
+        2,
+      )}\n`,
+      'utf8',
+    );
+    app.exit(0);
+  } catch {
+    app.exit(1);
+  }
+} else if (relaunchProbeArg !== undefined) {
   // Runs before the single-instance lock: the parent and the relaunched child
   // would otherwise fight over it.
   void runRelaunchProbe(relaunchProbeArg.slice(RELAUNCH_PROBE_PREFIX.length)).catch(() => app.exit(1));
@@ -519,7 +566,7 @@ async function bootstrap(): Promise<void> {
           ].filter((line): line is string => line !== null);
           void dialog.showMessageBox({
             type: status.state === 'ERROR' ? 'error' : 'info',
-            title: 'WSL Web Shell — Connection status',
+            title: 'DSH WSL — Connection status',
             message: status.message,
             detail: lines.join('\n'),
             buttons: ['OK'],

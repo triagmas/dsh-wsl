@@ -29,7 +29,7 @@ export class TrayController {
       ? nativeImage.createFromPath(this.options.iconPath)
       : nativeImage.createEmpty();
     this.tray = new Tray(icon);
-    this.tray.setToolTip('WSL Web Shell');
+    this.tray.setToolTip('DSH WSL');
     this.tray.on('click', () => this.options.handlers.open());
     this.tray.on('double-click', () => this.options.handlers.open());
   }

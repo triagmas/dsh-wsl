@@ -119,13 +119,13 @@ export function resolveRelaunchTarget(
 export function describeRelaunchFailure(reason: RelaunchFailureReason): string {
   switch (reason) {
     case 'portable-not-a-file':
-      return 'The upstream version was installed and verified, but the portable executable could not be found. Start WSL Web Shell again manually to use the new version.';
+      return 'The upstream version was installed and verified, but the portable executable could not be found. Start DSH WSL again manually to use the new version.';
     case 'dev-unpackaged':
-      return 'The upstream version was installed and verified. This build was not started from a packaged Windows application, so it cannot restart itself: quit and start WSL Web Shell again to use the new version.';
+      return 'The upstream version was installed and verified. This build was not started from a packaged Windows application, so it cannot restart itself: quit and start DSH WSL again to use the new version.';
     case 'installed-not-a-file':
-      return 'The upstream version was installed and verified, but the installed executable could not be found. Start WSL Web Shell again manually to use the new version.';
+      return 'The upstream version was installed and verified, but the installed executable could not be found. Start DSH WSL again manually to use the new version.';
     case 'installed-ambiguous':
-      return 'The upstream version was installed and verified, but this process cannot prove which installed file it belongs to, so it will not restart itself. Start WSL Web Shell again manually to use the new version.';
+      return 'The upstream version was installed and verified, but this process cannot prove which installed file it belongs to, so it will not restart itself. Start DSH WSL again manually to use the new version.';
     case 'not-windows':
       return 'The upstream version was installed and verified. Automatic restart is only available in the Windows build; start the app again to use the new version.';
   }

@@ -1,5 +1,5 @@
 appId: com.triagmas.wslwebshell
-productName: WSL Web Shell
+productName: DSH WSL
 copyright: Copyright (c) 2026 triagmas
 
 directories:
@@ -20,8 +20,8 @@ electronLanguages:
 
 win:
   # Issue #14: one Windows x64 build produces both packages from the same sources.
-  #   portable -> WSL-Web-Shell-<version>-x64-Portable.exe (no installation)
-  #   nsis     -> WSL-Web-Shell-<version>-x64-Setup.exe    (assisted installer)
+  #   portable -> DSH-WSL-<version>-x64-Portable.exe (no installation)
+  #   nsis     -> DSH-WSL-<version>-x64-Setup.exe    (assisted installer)
   target:
     - target: portable
       arch:
@@ -32,10 +32,10 @@ win:
   icon: build/icon.png
 
 portable:
-  artifactName: WSL-Web-Shell-${version}-x64-Portable.${ext}
+  artifactName: DSH-WSL-${version}-x64-Portable.${ext}
 
 nsis:
-  artifactName: WSL-Web-Shell-${version}-x64-Setup.${ext}
+  artifactName: DSH-WSL-${version}-x64-Setup.${ext}
   # Assisted (not one-click) wizard: install path and shortcuts are user choices.
   oneClick: false
   perMachine: false
@@ -43,8 +43,8 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: WSL Web Shell
-  uninstallDisplayName: WSL Web Shell ${version}
+  shortcutName: DSH WSL
+  uninstallDisplayName: DSH WSL ${version}
   # The uninstaller must never delete the WSL runtime, DSH data or the app profile:
   # they live outside the installation directory and stay untouched.
   deleteAppDataOnUninstall: false

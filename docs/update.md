@@ -149,12 +149,12 @@ The Windows CI job proves both paths on packaged builds:
 
 ```powershell
 # portable
-WSL-Web-Shell-0.1.0-x64-Portable.exe --relaunch-probe=<dir>
+DSH-WSL-0.1.0-x64-Portable.exe --relaunch-probe=<dir>
 node scripts/check-relaunch.cjs <dir> <portable-exe> --mode=portable
 
 # installed (after the Setup EXE installed it)
-"<install>\WSL Web Shell.exe" --relaunch-probe=<dir>
-node scripts/check-relaunch.cjs <dir> "<install>\WSL Web Shell.exe" --mode=installed
+"<install>\DSH WSL.exe" --relaunch-probe=<dir>
+node scripts/check-relaunch.cjs <dir> "<install>\DSH WSL.exe" --mode=installed
 ```
 
 The parent records its own paths, decides the target with the same function the
