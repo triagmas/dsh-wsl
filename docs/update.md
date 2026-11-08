@@ -26,7 +26,9 @@ footer pill (only while an update exists)
 Both screenshots are rendered by the real confirmation and terminal pages
 (`src/update/`) through the repository harness `scripts/screenshot-ui.cjs`
 (`npm run screenshots`), which drives them with fixture data and never runs a real
-update. Paths, versions and the distribution name are test values.
+update. Paths, versions and the distribution name are test values. They are
+documentation-sized captures (sized to their content), not a strict copy of the
+production window geometry.
 
 | Confirmation | Terminal |
 |---|---|

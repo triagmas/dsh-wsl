@@ -410,19 +410,30 @@ async function writeScreenshots(bar, updateWindows) {
   updateWindows.progress.webContents.send('update:state', updateWindows.done);
   updateWindows.progress.moveTop();
   await settle(300);
-  // The confirmation window is taller than its default frame once the shared-install
-  // warning and the executable row are shown: size it to the content so the image has
-  // no scrollbar and no clipped bullets.
+  writeFileSync(join(outDir, 'update-terminal.png'), (await updateWindows.progress.webContents.capturePage()).toPNG());
+
+  // The confirmation image must show the real pre-confirmation state. The checks
+  // clicked Update, which disables the button for good, so a fresh page is loaded
+  // with the same fixture IPC instead of reusing that instance - and no DOM hack
+  // may enable the button again (issue #21 review, D1).
+  const confirmShot = await windowFor(620, 520, 'update.js', join(dist, 'update', 'confirm.html'));
+  await waitForText(confirmShot, '#target', updateProbe.target);
+  const startEnabled = await evaluate(confirmShot, "document.getElementById('start').disabled === false");
+  if (!startEnabled) throw new Error('the confirmation page did not offer the Update action');
+  confirmShot.moveTop();
+  await settle(250);
+  // The documentation capture is sized to its content so the image has no scrollbar
+  // and no clipped bullets; the production window keeps its own size.
   const overflow = await evaluate(
-    updateWindows.confirm,
+    confirmShot,
     '(() => { const m = document.querySelector("main"); return m.scrollHeight - m.clientHeight; })()',
   );
   if (overflow > 0) {
-    updateWindows.confirm.setContentSize(620, 520 + Math.ceil(overflow) + 1);
+    confirmShot.setContentSize(620, 520 + Math.ceil(overflow) + 1);
     await settle(200);
   }
-  writeFileSync(join(outDir, 'update-confirm.png'), (await updateWindows.confirm.webContents.capturePage()).toPNG());
-  writeFileSync(join(outDir, 'update-terminal.png'), (await updateWindows.progress.webContents.capturePage()).toPNG());
+  writeFileSync(join(outDir, 'update-confirm.png'), (await confirmShot.webContents.capturePage()).toPNG());
+  confirmShot.destroy();
   // The checks left the gear in its expanded state; screenshots show it idle.
   await evaluate(bar, "document.querySelector('#gear').setAttribute('aria-expanded','false'), null");
   const webui = await windowFor(WIDTH, HEIGHT - FOOTER_HEIGHT, 'chrome.js', join(root, 'scripts', 'mock-webui.html'));
