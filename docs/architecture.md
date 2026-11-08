@@ -38,17 +38,22 @@ while a backend is already owned and healthy.
 ### Isolated backend environment
 
 The backend never inherits a shared harness home. Every launch derives one
-validated root — `~/.local/share/wsl-web-shell` by default — and puts the private
-runtime, `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files and the test workspace
-below it (`src/main/core/isolation.ts`):
+validated root — `~/.local/share/wsl-web-shell` by default — and puts
+`DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files, the test workspace and the
+app's own update bookkeeping below it (`src/main/core/isolation.ts`):
 
 | Path | Purpose |
 |---|---|
-| `<root>/runtime/bin` | private npm prefix: the isolated `dsh` install lives here |
 | `<root>/dsh-home` | `DSH_HOME`: harness config, credentials, sessions |
 | `<root>/agents` | `DSH_AGENTS_HOME`: keeps the shared `~/.agents` out of the backend |
 | `<root>/cache`, `<root>/tmp` | `XDG_CACHE_HOME`, `TMPDIR` |
 | `<root>/workspace` | test workspace used when the configured workspace is the bare `~` |
+| `<root>/update` | update backups of the shared npm package (`shared-backup-<tx>`) |
+| `<root>/cache/npm` | npm cache used by the in-app update |
+
+Since issue #17 this is **data** isolation only: the executable is not stored
+here. An older `<root>/runtime/bin` copy may still exist on disk; it is reported
+(`legacy=yes`) and never selected.
 
 **Root rules.** The root must be a dedicated, application-owned subtree at least
 two components deep. `/`, `~`, `~/`, `~/x`, `/srv`, `~user/...`, empty or
@@ -72,11 +77,18 @@ and modes.
 
 **Environment delivery.** Variables are exported *inside* the distribution by the
 start wrapper, so `~` expands against the Linux home and nothing depends on
-`WSLENV` forwarding from Windows. `PATH` is prefixed with the isolated runtime and
-the resolved `node`, making resolution deterministic instead of inheriting an
-arbitrary shell profile. The wrapper re-validates the root and re-checks the four
-managed directories, so it can never launch against a root that changed after
-preparation.
+`WSLENV` forwarding from Windows. Only the resolved `node` directory is prepended
+to `PATH` — never a private runtime prefix — and the wrapper re-validates the root
+and re-checks the managed directories, so it can never launch against a root that
+changed after preparation.
+
+**Which `dsh` runs (issue #17).** `RESOLVE_RUNTIME_SCRIPT` prefers exactly what an
+ordinary terminal would find: a pinned path from Settings, then
+`bash -lc 'command -v dsh'`, then the `--exec` PATH, then the conventional
+install locations. The result is reported with its source, and the provenance
+(realpath, npm prefix, manager, writability, foreign processes) is inspected only
+when the update window opens. The app never installs, copies or prefers its own
+`dsh`; when none is found it shows an actionable install instruction instead.
 
 **Working directory.** `wsl.exe --cd` is not used: whether it expands a
 tilde-prefixed subpath depends on the WSL build, and the shell has to resolve

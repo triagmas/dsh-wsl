@@ -10,8 +10,13 @@
     <main>
       <h1>Update DeepSeek Harness</h1>
       <p class="lead">
-        The exact published version is installed into the isolated runtime of the selected WSL distribution. The
-        previous installation is kept for rollback.
+        The DeepSeek Harness installed in your WSL distribution is updated in place with the exact published version.
+        This is the same <code>dsh</code> that an ordinary <code>dsh web</code> in a WSL terminal runs.
+      </p>
+
+      <p class="warn" id="shared">
+        This changes the shared WSL installation, not an app-private copy: a terminal started afterwards uses the new
+        version too.
       </p>
 
       <dl class="facts">
@@ -21,17 +26,20 @@
         <dd id="target" class="target">—</dd>
         <dt>Distribution</dt>
         <dd id="distro">—</dd>
-        <dt>Isolated runtime</dt>
-        <dd id="root" class="path">—</dd>
-        <dt>Rollback copy</dt>
-        <dd id="rollback" class="path">—</dd>
+        <dt>Executable</dt>
+        <dd id="binary" class="path">—</dd>
+        <dt>Installation</dt>
+        <dd id="scope">—</dd>
       </dl>
 
       <p class="warn" id="blocked" hidden></p>
+      <p class="hint" id="manual" hidden></p>
 
       <ul class="notes">
-        <li>Only <code>@deepseek-ai/dsh</code> inside the isolated runtime is replaced.</li>
-        <li>Your global installation, the official Windows app and your projects are not touched.</li>
+        <li>Only <code>@deepseek-ai/dsh</code> in that npm prefix is replaced; no other package is touched.</li>
+        <li>Your isolated data directory (<code>DSH_HOME</code>, sessions, settings, caches) is kept.</li>
+        <li>The official Windows app, your projects and your npm configuration are not touched.</li>
+        <li>If the update fails, the previous exact version is reinstalled and restarted.</li>
         <li>The app restarts itself after a successful update.</li>
       </ul>
 

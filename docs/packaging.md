@@ -36,9 +36,11 @@ installation may have to be uninstalled manually.
 ## Shared profile
 
 Both variants use the **same profile directory** `%APPDATA%\wsl-web-shell` and the
-same isolated runtime inside WSL. (This is about the two files of one release, not about
-sharing data with a globally installed `dsh` or with the official Windows DeepSeek
-Harness: the isolated `DSH_HOME` starts empty.) Running both under one Windows account therefore
+same isolated data directory inside WSL and the same `dsh` installation, so the
+settings and the installed DeepSeek Harness version are the same whichever you
+start. (This is about the two files of one release, not about sharing data with a
+globally installed `dsh` or with the official Windows DeepSeek Harness: the
+isolated `DSH_HOME` starts empty.) Running both under one Windows account therefore
 shares settings, logs, the owned-backend registry, the update journal and the
 installed DSH version; only one instance can run at a time, and an update performed
 in one variant is visible in the other.

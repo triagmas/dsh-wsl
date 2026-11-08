@@ -108,6 +108,19 @@ code {
   color: #fde68a;
 }
 
+.hint {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
+  color: var(--fg);
+}
+
+.hint code,
+.warn code {
+  color: inherit;
+}
+
 .actions {
   margin-top: auto;
   display: flex;

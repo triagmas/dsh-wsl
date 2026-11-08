@@ -6,8 +6,12 @@ import type {
   StartServerRequest,
   ExitInfo,
   UpdateRunResult,
+  SharedUpdateRunRequest,
+  SharedRollbackRequest,
+  InspectSharedRequest,
+  PrepareBackupRequest,
 } from '../core/supervisor.js';
-import type { RuntimeObservation } from '../core/update.js';
+import { parseSharedDshReport } from '../core/dsh-locate.js';
 import { ShellError } from '../core/supervisor.js';
 import type { Logger } from '../core/logger.js';
 import type { ProcessProbe } from './output.js';
@@ -34,13 +38,13 @@ import {
   buildStartServerArgs,
 } from './args.js';
 import {
-  buildActivateArgs,
-  buildInspectArgs,
+  buildInspectSharedArgs,
   buildNpmViewArgs,
-  buildRestoreArgs,
-  buildStageArgs,
+  buildPrepareBackupArgs,
+  buildRollbackSharedArgs,
+  buildUpdateSharedArgs,
   NPM_MARKER,
-  parseInspectLine,
+  parseBackupReport,
   parseNpmMarker,
 } from './update-args.js';
 
@@ -214,20 +218,29 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
     },
 
     async resolveRuntime(distro, override, isolationRoot) {
-      const result = await run(buildResolveRuntimeArgs(distro, isolationRoot), 30_000);
+      const result = await run(buildResolveRuntimeArgs(distro, isolationRoot, override), 30_000);
       const probe = parseRuntimeProbe(result.stdout);
       if (probe.nodePath !== null) options.log.info(`node runtime: ${probe.nodePath}`);
+      if (probe.legacyRuntimePresent) {
+        options.log.info('an older private runtime/bin exists in the isolated root; it is not used any more');
+      }
 
       if (override !== null) {
         const check = await run(buildDshPathCheckArgs(distro, override), 20_000);
         if (check.code === 0) {
           options.log.info(`dsh (configured): ${override}`);
-          return { dshPath: override, nodePath: probe.nodePath, canonicalRoot: probe.rootPath };
+          return {
+            dshPath: override,
+            nodePath: probe.nodePath,
+            canonicalRoot: probe.rootPath,
+            source: 'custom',
+            legacyRuntimePresent: probe.legacyRuntimePresent,
+          };
         }
         throw new ShellError(
           'dsh-missing',
           `The configured DeepSeek Harness path is not executable: ${override}`,
-          'Update the path in Settings.',
+          'Update the path in Settings, or clear it to use the installation your WSL terminal uses.',
         );
       }
 
@@ -235,16 +248,22 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         throw new ShellError(
           'dsh-missing',
           'DeepSeek Harness CLI (dsh) was not found inside the WSL distribution.',
-          'Install it into the isolated runtime (npm install --prefix ~/.local/share/wsl-web-shell/runtime -g @deepseek-ai/dsh) or set the executable path in Settings. This app never installs packages automatically.',
+          'Install it in that distribution the usual way (for example "npm install -g @deepseek-ai/dsh"), or set its absolute path in Settings. DSH WSL runs the installation that already exists and never installs a private copy.',
         );
       }
       const check = await run(buildDshPathCheckArgs(distro, probe.dshPath), 20_000);
       if (check.code !== 0) {
         throw new ShellError('dsh-missing', 'The detected DeepSeek Harness CLI is not executable.', 'Set the executable path in Settings.');
       }
-      options.log.info(`dsh resolved: ${probe.dshPath}`);
-      if (probe.rootPath !== null) options.log.info(`isolation root (canonical): ${probe.rootPath}`);
-      return { dshPath: probe.dshPath, nodePath: probe.nodePath, canonicalRoot: probe.rootPath };
+      options.log.info(`dsh resolved: ${probe.dshPath} (source=${probe.source ?? 'unknown'})`);
+      if (probe.rootPath !== null) options.log.info(`isolated data root (canonical): ${probe.rootPath}`);
+      return {
+        dshPath: probe.dshPath,
+        nodePath: probe.nodePath,
+        canonicalRoot: probe.rootPath,
+        source: probe.source,
+        legacyRuntimePresent: probe.legacyRuntimePresent,
+      };
     },
 
     startServer(request: StartServerRequest): ServerHandle {
@@ -332,7 +351,7 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       const result = await run(
         buildNpmViewArgs({
           distro: request.distro,
-          isolationRoot: request.isolationRoot,
+          appRoot: request.appRoot,
           version: request.version,
           nodePath: request.nodePath,
         }),
@@ -367,61 +386,99 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       return { found: reported === request.version, npmPath, reported, message: null };
     },
 
-    async stageRuntime(request, onLine) {
-      const argv = buildStageArgs(
+    async inspectSharedDsh(request: InspectSharedRequest) {
+      const result = await run(
+        buildInspectSharedArgs({
+          distro: request.distro,
+          appRoot: request.appRoot,
+          dshPath: request.dshPath,
+          nodePath: request.nodePath,
+          ownPid: request.ownPid,
+        }),
+        45_000,
+      );
+      const report = parseSharedDshReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code !== 0) {
+        options.log.warn(`DeepSeek Harness inspection failed (code=${result.code ?? 'null'})`);
+      }
+      if (report.installation !== null) {
+        options.log.info(
+          `dsh installation: ${report.installation.path} (${report.installation.version ?? 'unknown'}, ` +
+            `${report.installation.manager}, prefix=${report.installation.prefix ?? 'unknown'}, ` +
+            `writable=${report.installation.writable ? 'yes' : 'no'})`,
+        );
+      }
+      return report;
+    },
+
+    async prepareSharedBackup(request: PrepareBackupRequest) {
+      const argv = buildPrepareBackupArgs({
+        distro: request.distro,
+        appRoot: request.appRoot,
+        prefix: request.prefix,
+        packageDir: request.packageDir,
+        dshPath: request.dshPath,
+        realPath: request.realPath,
+        installedVersion: request.installedVersion,
+        transaction: request.transaction,
+      });
+      const result = await run(argv, 120_000);
+      const report = parseBackupReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code !== 0 || report === null) {
+        options.log.error(
+          `the recovery snapshot for ${request.installedVersion} could not be created (code=${result.code ?? 'null'}): ` +
+            `${(result.stderr || result.stdout).trim().split('\n').filter(Boolean).slice(-1)[0] ?? 'no output'}`,
+        );
+        return null;
+      }
+      options.log.info(`recovery snapshot ready at ${report.path} (${report.files} files, version=${report.version})`);
+      return { path: report.path, files: report.files };
+    },
+
+    async updateSharedDsh(request: SharedUpdateRunRequest, onLine) {
+      const argv = buildUpdateSharedArgs(
         {
           distro: request.distro,
-          isolationRoot: request.isolationRoot,
-          version: request.version,
+          appRoot: request.appRoot,
+          prefix: request.prefix,
+          packageDir: request.packageDir,
+          dshPath: request.dshPath,
+          realPath: request.realPath,
+          npmPath: request.npmPath,
           nodePath: request.nodePath,
+          transaction: request.transaction,
+          version: request.version,
+          installedVersion: request.installedVersion,
+          ownPid: request.ownPid,
+          snapshotDir: request.snapshotDir,
         },
-        request.npmPath,
         request.transaction,
       );
-      options.log.info(`staging DSH ${request.version} (distro=${request.distro}, tx=${request.transaction})`);
+      options.log.info(
+        `updating the shared DSH installation ${request.installedVersion} -> ${request.version} ` +
+          `(prefix=${request.prefix}, tx=${request.transaction})`,
+      );
       return await spawnStreaming(argv, onLine, 'the update process');
     },
 
-    async activateRuntime(request, onLine) {
-      const argv = buildActivateArgs(
+    async rollbackSharedDsh(request: SharedRollbackRequest, version, transaction, onLine) {
+      const argv = buildRollbackSharedArgs(
         {
           distro: request.distro,
-          isolationRoot: request.isolationRoot,
-          version: request.version,
+          appRoot: request.appRoot,
+          prefix: request.prefix,
+          packageDir: request.packageDir,
+          dshPath: request.dshPath,
+          realPath: request.realPath,
+          npmPath: request.npmPath,
           nodePath: request.nodePath,
+          snapshotDir: request.snapshotDir,
         },
-        request.transaction,
+        version,
+        transaction,
       );
-      options.log.info(`activating DSH ${request.version} (tx=${request.transaction})`);
-      return await spawnStreaming(argv, onLine, 'the activation process');
-    },
-
-    async restoreRuntime(request, onLine) {
-      const argv = buildRestoreArgs(request.distro, request.isolationRoot, request.transaction, request.nodePath);
-      options.log.warn(`restoring the previous DSH installation (tx=${request.transaction})`);
+      options.log.warn(`reinstalling the previous DeepSeek Harness version ${version} (tx=${transaction})`);
       return await spawnStreaming(argv, onLine, 'the rollback process');
-    },
-
-    async inspectRuntime(distro, isolationRoot) {
-      const result = await run(buildInspectArgs(distro, isolationRoot), 30_000);
-      const report: RuntimeObservation = {
-        runtimePresent: false,
-        runtimeVersion: null,
-        previous: null,
-        stage: null,
-      };
-      for (const line of `${result.stdout}\n${result.stderr}`.split('\n')) {
-        const entry = parseInspectLine(line);
-        if (entry === null) continue;
-        if (entry.key === 'runtime') report.runtimePresent = entry.value === 'present';
-        else if (entry.key === 'version') report.runtimeVersion = entry.value === '' ? null : entry.value;
-        else if (entry.key === 'previous') report.previous = entry.value;
-        else if (entry.key === 'stage') report.stage = entry.value;
-      }
-      if (result.code !== 0) {
-        options.log.warn(`runtime inspection failed (code=${result.code ?? 'null'})`);
-      }
-      return report;
     },
 
     async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {

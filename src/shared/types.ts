@@ -32,9 +32,20 @@ export interface AppConfig {
   workspace: string;
   /** Optional absolute POSIX path to the `dsh` executable inside WSL. */
   dshPath: string | null;
-  /** Keep the backend in a private environment (runtime, DSH_HOME, agents home). */
+  /**
+   * Keep the backend's **data** in a private environment (`DSH_HOME`,
+   * `DSH_AGENTS_HOME`, caches, temp, workspace).
+   *
+   * Since issue #17 this does **not** select which `dsh` executable runs: DSH WSL
+   * always runs the installation the WSL distribution already has. Turning
+   * isolation off additionally uses the user's normal `~/.dsh` data.
+   */
   isolateEnvironment: boolean;
-  /** Root directory of the isolated environment inside the distribution. */
+  /**
+   * Root directory of the isolated data environment inside the distribution
+   * (also holds the npm cache and the update backups of this app). The executable
+   * is never stored here any more.
+   */
   runtimeRoot: string;
   /** Show the window as soon as the shell is ready. */
   openOnLaunch: boolean;
@@ -111,16 +122,22 @@ export interface UpdateProbe {
   /** Exact published version the update would install. */
   target: string | null;
   distro: string;
-  /** Isolated runtime root that would be replaced. */
-  runtimeRoot: string;
+  /** Executable the launcher uses — the shared WSL installation (issue #17). */
+  dshPath: string | null;
+  /** How that installation is managed: `npm`, `pnpm` or `unknown`. */
+  installManager: string;
+  /** Human-readable scope, for example "user (~/.npm-global)". */
+  installScope: string;
+  /** Always true: the WSL terminal runs the same executable. */
+  sharedWithTerminal: boolean;
   /** True when the update may be started; `reason` explains a refusal. */
   eligible: boolean;
   /** Machine-readable refusal code, `null` when eligible. */
   reason: string | null;
   /** Human-readable explanation for the window. */
   description: string | null;
-  /** Directory that keeps the previous installation for rollback. */
-  rollbackPath: string | null;
+  /** Command the user can run when the app refuses to touch the installation. */
+  manualCommand: string | null;
   /** True while an update is already running. */
   running: boolean;
 }

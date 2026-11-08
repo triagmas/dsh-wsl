@@ -78,7 +78,7 @@ function renderVersions(snapshot) {
   if (target !== null) {
     updateVersion.textContent = target;
     updateButton.setAttribute('aria-label', `Update DeepSeek Harness to ${target}`);
-    updateButton.title = `Update DeepSeek Harness ${installedVersion ?? ''} → ${target} in the isolated runtime`;
+    updateButton.title = `Update DeepSeek Harness ${installedVersion ?? ''} → ${target} in your WSL installation`;
   }
 
   releaseUrl = snapshot.latest?.url ?? null;

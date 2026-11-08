@@ -13,20 +13,22 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createJournalStore, recoverInterruptedUpdate } from '../src/main/core/update-recovery.js';
 import { createNullLogger } from '../src/main/core/logger.js';
-import {
-  UpdateJournalError,
-  parseUpdateJournal,
-  type RuntimeObservation,
-  type UpdateJournal,
-} from '../src/main/core/update.js';
+import { UpdateJournalError, parseUpdateJournal, type UpdateJournalV2 } from '../src/main/core/update.js';
+import { DEFAULT_INSTALLATION, FakeWsl } from './helpers.js';
 
-const journal = (overrides: Partial<UpdateJournal> = {}): UpdateJournal => ({
-  version: 1,
+const journal = (overrides: Partial<UpdateJournalV2> = {}): UpdateJournalV2 => ({
+  version: 2,
+  kind: 'npm-global',
   transaction: '20261107T101500Z-1a2b',
-  phase: 'activating',
+  phase: 'updating',
   distro: 'Ubuntu',
-  runtimeRoot: '~/.local/share/wsl-web-shell',
-  canonicalRoot: '/home/u/.local/share/wsl-web-shell',
+  dshPath: DEFAULT_INSTALLATION.path,
+  realPath: DEFAULT_INSTALLATION.realPath,
+  prefix: '/home/dev/.npm-global',
+  packageDir: DEFAULT_INSTALLATION.packageDir as string,
+  appRoot: '/home/dev/.local/share/wsl-web-shell',
+  npmPath: '/usr/bin/npm',
+  backupDir: '/home/dev/.local/share/wsl-web-shell/update/shared-backup-20261107T101500Z-1a2b',
   target: '0.2.2-rc.1',
   installed: '0.2.1-rc.5',
   startedAt: '2026-11-07T10:15:00.000Z',
@@ -76,9 +78,9 @@ describe('journal store', () => {
     const path = join(directory, 'update-journal.json');
     const store = createJournalStore(path, createNullLogger());
 
-    store.write(journal({ phase: 'staging' }));
-    store.write(journal({ phase: 'activating' }));
-    expect(store.read()?.phase).toBe('activating');
+    store.write(journal({ phase: 'updating' }));
+    store.write(journal({ phase: 'verifying' }));
+    expect(store.read()?.phase).toBe('verifying');
     // No temporary file is left behind.
     await expect(stat(`${path}.tmp`)).rejects.toBeTruthy();
   });
@@ -177,12 +179,12 @@ describe('journal store', () => {
   it('reads a record through a valid link', async () => {
     const directory = await scratch();
     const target = join(directory, 'real-journal.json');
-    await writeFile(target, JSON.stringify(journal({ phase: 'staging' })), 'utf8');
+    await writeFile(target, JSON.stringify(journal({ phase: 'updating' })), 'utf8');
     const path = join(directory, 'update-journal.json');
     await symlink(target, path);
 
     const store = createJournalStore(path, createNullLogger());
-    expect(store.read()?.phase).toBe('staging');
+    expect(store.read()?.phase).toBe('updating');
   });
 
   it('throws for an unreadable record', async () => {
@@ -203,24 +205,44 @@ describe('journal store', () => {
   });
 });
 
-describe('start-up handling of the journal states (R12.3)', () => {
-  const observation: RuntimeObservation = {
-    runtimePresent: true,
-    runtimeVersion: '0.2.1-rc.5',
-    previous: null,
-    stage: null,
-  };
-
-  function deps(store: ReturnType<typeof createJournalStore>, calls: string[]) {
+describe('start-up handling of the journal states (issues #12 and #17)', () => {
+  function deps(store: ReturnType<typeof createJournalStore>, calls: string[], version: string | null = '0.2.1-rc.5') {
+    const wsl = new FakeWsl();
+    wsl.recoveryObservation = {
+      present: version !== null,
+      version,
+      realPath: DEFAULT_INSTALLATION.realPath,
+    };
     return {
       wsl: {
-        async inspectRuntime() {
+        async inspectSharedDsh() {
           calls.push('inspect');
-          return observation;
+          return wsl.inspectSharedDsh({
+            distro: 'Ubuntu',
+            appRoot: '/home/dev/.local/share/wsl-web-shell',
+            dshPath: DEFAULT_INSTALLATION.path,
+            nodePath: null,
+            ownPid: null,
+          });
         },
-        async restoreRuntime() {
+        async rollbackSharedDsh(request: { dshPath: string }, restore: string, transaction: string) {
           calls.push('restore');
-          return { code: 0, tail: 'update: rollout reverted' };
+          return wsl.rollbackSharedDsh(
+            {
+              distro: 'Ubuntu',
+              appRoot: '/home/dev/.local/share/wsl-web-shell',
+              prefix: '/home/dev/.npm-global',
+              packageDir: DEFAULT_INSTALLATION.packageDir as string,
+              dshPath: request.dshPath,
+              realPath: DEFAULT_INSTALLATION.realPath,
+              npmPath: '/usr/bin/npm',
+              nodePath: null,
+              snapshotDir: '/home/dev/.local/share/wsl-web-shell/update/shared-backup-20261107T101500Z-1a2b',
+            },
+            restore,
+            transaction,
+            () => undefined,
+          );
         },
       },
       journal: store,
@@ -241,73 +263,50 @@ describe('start-up handling of the journal states (R12.3)', () => {
     expect(calls).toEqual([]);
   });
 
-  it('blocks the start and keeps the file when the journal is corrupt', async () => {
+  it('clears an abandoned journal and starts the backend', async () => {
     const directory = await scratch();
     const path = join(directory, 'update-journal.json');
-    await writeFile(path, 'garbage', 'utf8');
     const store = createJournalStore(path, createNullLogger());
+    store.write(journal());
     const calls: string[] = [];
-
     const result = await recoverInterruptedUpdate(deps(store, calls));
-    expect(result.handled).toBe(true);
-    expect(result.action).toBe('blocked');
-    expect(result.message).toContain('corrupt');
-    expect(result.message).toContain(path);
-    expect(result.message).toContain('was not started');
-    // DeepSeek Harness is never started and nothing is inspected or restored.
-    expect(calls).toEqual([]);
-    expect((await stat(path)).isFile()).toBe(true);
+    expect(result.action).toBe('abandon');
+    expect(calls).toEqual(['inspect', 'resume']);
+    expect(store.read()).toBeNull();
   });
 
-  it.skipIf(!canDenyDirectoryAccess)(
-    'blocks the start when the journal sits behind an unreadable directory',
-    async () => {
-    const directory = await scratch();
-    const profile = join(directory, 'profile');
-    await mkdir(profile);
-    const path = join(profile, 'update-journal.json');
-    await writeFile(path, JSON.stringify(journal()), 'utf8');
-    await chmod(profile, 0o000);
-    try {
-      const calls: string[] = [];
-      const result = await recoverInterruptedUpdate(
-        deps(createJournalStore(path, createNullLogger()), calls),
-      );
-      expect(result.action).toBe('blocked');
-      expect(result.message).toContain('unreadable');
-      expect(calls).toEqual([]);
-    } finally {
-      await chmod(profile, 0o700);
-    }
-    },
-  );
-
-  it('blocks the start when the journal is a broken link', async () => {
+  it('accepts an installation that already reports the target version', async () => {
     const directory = await scratch();
     const path = join(directory, 'update-journal.json');
-    await symlink(join(directory, 'gone.json'), path);
+    const store = createJournalStore(path, createNullLogger());
+    store.write(journal({ phase: 'verifying' }));
     const calls: string[] = [];
-
-    const result = await recoverInterruptedUpdate(
-      deps(createJournalStore(path, createNullLogger()), calls),
-    );
-    expect(result.action).toBe('blocked');
-    expect(result.message).toContain('linked file does not exist');
-    expect(result.message).toContain('was not started');
-    expect(calls).toEqual([]);
+    const result = await recoverInterruptedUpdate(deps(store, calls, '0.2.2-rc.1'));
+    expect(result.action).toBe('finalize');
+    expect(store.read()).toBeNull();
   });
 
-  it('blocks the start and keeps the file when the journal is unreadable', async () => {
+  it('reinstalls the previous version when the installation reports something else', async () => {
     const directory = await scratch();
     const path = join(directory, 'update-journal.json');
-    await mkdir(path);
+    const store = createJournalStore(path, createNullLogger());
+    store.write(journal({ phase: 'verifying' }));
+    const calls: string[] = [];
+    const result = await recoverInterruptedUpdate(deps(store, calls, '0.2.3'));
+    expect(result.action).toBe('rollback');
+    expect(calls).toEqual(['inspect', 'restore', 'resume']);
+    expect(store.read()).toBeNull();
+  });
+
+  it('blocks a corrupt journal instead of starting anything', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'update-journal.json');
+    await writeFile(path, '{ not json', 'utf8');
     const store = createJournalStore(path, createNullLogger());
     const calls: string[] = [];
-
     const result = await recoverInterruptedUpdate(deps(store, calls));
     expect(result.action).toBe('blocked');
-    expect(result.message).toContain('unreadable');
-    expect(result.message).toContain('was not started');
     expect(calls).toEqual([]);
+    expect(result.message).toContain('not valid JSON');
   });
 });

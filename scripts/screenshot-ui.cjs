@@ -69,30 +69,33 @@ const config = {
   maxRestartAttempts: 3,
 };
 
-/** The update fixture is what the confirmation window shows (issue #12). */
+/** The update fixture is what the confirmation window shows (issues #12, #17). */
 const updateProbe = {
   installed: '0.2.1-rc.5',
   target: '0.2.2-rc.1',
   distro: 'Ubuntu',
-  runtimeRoot: '~/.local/share/wsl-web-shell/runtime',
   eligible: true,
   reason: null,
   description: null,
-  rollbackPath: '~/.local/share/wsl-web-shell/update/previous-20261106T134500Z',
+  dshPath: '/home/tester/.npm-global/bin/dsh',
+  installManager: 'npm',
+  installScope: 'user',
+  sharedWithTerminal: true,
+  manualCommand: null,
   running: false,
 };
 
 const updateRunning = {
   phase: 'installing',
   message: 'Installing 0.2.2-rc.1',
-  detail: 'Staged into ~/.local/share/wsl-web-shell/update/stage-20261106T134500Z',
+  detail: 'Installing into /home/tester/.npm-global',
   targetVersion: '0.2.2-rc.1',
   installedVersion: '0.2.1-rc.5',
   updateAvailable: true,
   dropped: 0,
   lines: [
     'update: published version 0.2.2-rc.1 confirmed by npm',
-    'update: staging into ~/.local/share/wsl-web-shell/update/stage-20261106T134500Z',
+    'update: previous package copied to ~/.local/share/wsl-web-shell/update/shared-backup-20261106T134500Z',
     'npm: add 1 package in 4s',
     'npm: found 0 vulnerabilities',
   ],
@@ -104,15 +107,14 @@ const updateDone = {
   ...updateRunning,
   phase: 'done',
   message: 'Updated to 0.2.2-rc.1',
-  detail: 'Previous installation kept at ~/.local/share/wsl-web-shell/update/previous-20261106T134500Z',
+  detail:
+    'The shared installation at /home/tester/.npm-global/bin/dsh now reports 0.2.2-rc.1. ' +
+    'An ordinary dsh web in WSL uses the same executable.',
   lines: [
     ...updateRunning.lines,
-    'update: verifying the staged installation',
-    'update: staged executable reports 0.2.2-rc.1',
-    'update: activating',
-    'update: installed version 0.2.2-rc.1',
-    'update: previous installation kept at ~/.local/share/wsl-web-shell/update/previous-20261106T134500Z',
-    'update: starting the new version',
+    'update: verifying the installation',
+    'update: /home/tester/.npm-global/bin/dsh reports 0.2.2-rc.1',
+    'update: a login shell resolves the updated executable',
     'update: 0.2.2-rc.1 is serving the WebUI',
   ],
   finishedAt: '2026-11-06T13:45:24.000Z',
@@ -323,8 +325,12 @@ async function checkUpdateWindows() {
   const confirm = await windowFor(620, 520, 'update.js', join(dist, 'update', 'confirm.html'));
   const target = await waitForText(confirm, '#target', '0.2.2-rc.1');
   check('the confirmation window states the exact target version', target.trim() === '0.2.2-rc.1', target);
-  const rollback = await evaluate(confirm, "document.querySelector('#rollback')?.textContent ?? ''");
-  check('the confirmation window names the rollback copy', rollback.includes('previous-'), rollback);
+  const binary = await evaluate(confirm, "document.getElementById('binary')?.textContent ?? ''");
+  check('the confirmation window names the executable it will change', binary === '/home/tester/.npm-global/bin/dsh', binary);
+  const scope = await evaluate(confirm, "document.getElementById('scope')?.textContent ?? ''");
+  check('the confirmation window names the install scope', scope.toLowerCase().includes('npm, global'), scope);
+  const shared = await evaluate(confirm, "document.getElementById('shared')?.textContent ?? ''");
+  check('the confirmation window warns that the installation is shared', shared.includes('shared WSL installation'), shared);
   const startDisabled = await evaluate(confirm, "document.getElementById('start').disabled");
   check('an accepted plan enables the update button', startDisabled === false, String(startDisabled));
   await evaluate(confirm, "document.getElementById('start').click(), null");
@@ -338,7 +344,7 @@ async function checkUpdateWindows() {
   const phase = await evaluate(progress, "document.querySelector('#status')?.dataset.phase ?? ''");
   check('the terminal window shows the running phase', phase === 'installing', phase);
   const lines = await evaluate(progress, "document.querySelector('#terminal')?.textContent ?? ''");
-  check('the terminal shows the updater output', lines.includes('update: staging into'), lines.slice(0, 60));
+  check('the terminal shows the updater output', lines.includes('update: previous package copied to'), lines.slice(0, 60));
   const closeDisabled = await evaluate(progress, "document.getElementById('close').disabled");
   check('the terminal window cannot be closed mid-run', closeDisabled === true, String(closeDisabled));
 
@@ -374,7 +380,7 @@ async function checkUpdateWindows() {
   const keptLines = await evaluate(progress, "document.querySelector('#terminal')?.textContent ?? ''");
   check(
     'the terminal keeps the earlier output instead of replacing it',
-    keptLines.includes('update: staging into') && keptLines.includes('is serving the WebUI'),
+    keptLines.includes('update: previous package copied to') && keptLines.includes('is serving the WebUI'),
   );
 
   // The rollback phase is reported as a finished, closable state.

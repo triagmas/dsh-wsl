@@ -98,6 +98,7 @@ describe('start command construction', () => {
       RESOLVE_RUNTIME_SCRIPT,
       SCRIPT_ARGV0,
       '-',
+      '-',
     ]);
     expect(RESOLVE_RUNTIME_SCRIPT).not.toMatch(/\b(apt|npm i|pnpm|curl|wget)\b/);
     expect(PREPARE_ISOLATION_SCRIPT).not.toMatch(/\b(apt|npm|pnpm|curl|wget|rm|mv)\b/);

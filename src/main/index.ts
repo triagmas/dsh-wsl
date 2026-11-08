@@ -18,6 +18,7 @@ import {
 import { createLatestVersionService } from './backend/github-versions.js';
 import { createUpdateRunner } from './core/update-runner.js';
 import { createJournalStore, recoverInterruptedUpdate } from './core/update-recovery.js';
+import { describeInstallScope, type SharedDshReport } from './core/dsh-locate.js';
 import { describeRelaunchFailure, resolveRelaunchTarget } from './core/relaunch.js';
 import { APP_DISPLAY_NAME, APP_ID, PROFILE_DIRECTORY } from './core/branding.js';
 import {
@@ -26,8 +27,9 @@ import {
   describeUpdatePhase,
   describeUpdateReason,
   isUpdateCritical,
-  planUpdate,
-  type UpdatePlan,
+  manualUpdateCommand,
+  planSharedUpdate,
+  type SharedUpdatePlan,
 } from './core/update.js';
 import { createLogger } from './core/logger.js';
 import { isNewer } from './core/versions.js';
@@ -297,25 +299,58 @@ async function bootstrap(): Promise<void> {
 
   const updateJournal = createJournalStore(join(userData, 'update-journal.json'), log);
 
+  /** Cache of the last provenance inspection, so the probe stays synchronous. */
+  let installationCache: { key: string; report: SharedDshReport } | null = null;
+
   /**
-   * What the confirmation window may do (issue #12).
+   * Inspect the installation the launcher uses and remember the result.
    *
-   * The plan is computed here, from the live configuration and the executable
-   * the launcher really resolved, so a stale renderer can never talk the app
-   * into replacing a global installation.
+   * Runs read-only shell commands inside the distribution, so it is only called
+   * when the update window opens, when the popover asks, and right before an
+   * update starts. Never on the launch path.
+   */
+  async function inspectInstallation(): Promise<SharedDshReport | null> {
+    const runtime = supervisor.resolvedRuntime();
+    const status = supervisor.getStatus();
+    const dshPath = runtime?.dshPath ?? status.dshPath;
+    if (dshPath === null) return null;
+    const key = `${config.distro}|${dshPath}|${status.dshVersion ?? ''}`;
+    if (installationCache !== null && installationCache.key === key) return installationCache.report;
+    try {
+      const report = await wsl.inspectSharedDsh({
+        distro: config.distro,
+        appRoot: config.runtimeRoot,
+        dshPath,
+        nodePath: runtime?.nodePath ?? null,
+        ownPid: supervisor.ownedPid(),
+      });
+      installationCache = { key, report };
+      return report;
+    } catch (error) {
+      log.warn(`update: inspecting the installation failed: ${error instanceof Error ? error.message : 'unknown'}`);
+      return null;
+    }
+  }
+
+  /**
+   * What the confirmation window may do (issues #12 and #17).
+   *
+   * The plan is computed here, from live configuration and the installation the
+   * launcher really resolved, so a stale renderer can never talk the app into
+   * updating something the safety checks did not see.
    */
   function resolveUpdatePlan() {
     const target = versions.snapshot().latest?.version ?? null;
-    if (target === null) return { ok: false, reason: UPDATE_REASONS.unknownTarget } as const;
-    const status = supervisor.getStatus();
-    return planUpdate({
+    if (target === null) return { ok: false as const, reason: UPDATE_REASONS.unknownTarget, detail: null };
+    const report = installationCache?.report ?? null;
+    if (report === null || report.installation === null || !report.found) {
+      return { ok: false as const, reason: UPDATE_REASONS.missingInstallation, detail: null };
+    }
+    return planSharedUpdate({
       distro: config.distro,
       targetVersion: target,
-      installedVersion: status.dshVersion,
-      resolvedDshPath: status.dshPath,
-      canonicalRuntimeRoot: supervisor.resolvedRuntime()?.canonicalRoot ?? null,
-      isolationEnabled: config.isolateEnvironment,
-      runtimeRoot: config.runtimeRoot,
+      appRoot: config.runtimeRoot,
+      installation: report.installation,
       customExecutable: config.dshPath !== null,
     });
   }
@@ -323,31 +358,41 @@ async function bootstrap(): Promise<void> {
   function updateProbe(): UpdateProbe {
     const status = supervisor.getStatus();
     const result = resolveUpdatePlan();
+    const installation = installationCache?.report.installation ?? null;
     const base = {
-      installed: status.dshVersion,
+      installed: installation?.version ?? status.dshVersion,
       target: versions.snapshot().latest?.version ?? null,
       distro: config.distro,
-      runtimeRoot: config.runtimeRoot,
+      dshPath: installation?.path ?? status.dshPath,
+      installScope: installation === null ? 'unknown' : describeInstallScope(installation.prefix),
+      installManager: installation?.manager ?? 'unknown',
+      sharedWithTerminal: true,
       running: updateRunner.running(),
     };
     if (!result.ok) {
+      const manual =
+        installation === null || base.target === null ? null : manualUpdateCommand(
+          { npmPath: installation.npmPath, prefix: installation.prefix },
+          base.target,
+        );
       return {
         ...base,
         eligible: false,
         reason: result.reason,
         description: describeUpdateReason(result.reason),
-        rollbackPath: null,
+        manualCommand: manual,
       };
     }
     return {
       ...base,
       installed: result.plan.installedVersion,
       target: result.plan.version,
-      runtimeRoot: result.plan.runtimeDir,
+      dshPath: result.plan.dshPath,
+      installScope: result.plan.scope,
       eligible: !updateRunner.running(),
       reason: null,
       description: null,
-      rollbackPath: result.plan.previousPattern,
+      manualCommand: null,
     };
   }
 
@@ -628,7 +673,12 @@ async function bootstrap(): Promise<void> {
     windows.closeSettingsPopover();
     windows.openUpdateConfirm();
   });
-  guard('update:probe', () => updateProbe());
+  guard('update:probe', async () => {
+    // The window must show what is really installed, so the provenance is
+    // re-inspected before the plan is built.
+    await inspectInstallation();
+    return updateProbe();
+  });
   guard('update:state', () => updateRunner.snapshot());
   guard('update:close', () => {
     if (updateRunner.running()) {
@@ -647,10 +697,11 @@ async function bootstrap(): Promise<void> {
     if (!result.ok) {
       return { started: false, reason: result.reason, description: describeUpdateReason(result.reason) };
     }
-    const plan: UpdatePlan = result.plan;
+    const plan: SharedUpdatePlan = result.plan;
     const transaction = createTransactionId(new Date());
     log.info(
-      `update requested: ${plan.installedVersion} -> ${plan.version} (tx=${transaction}, root=${plan.canonicalRoot})`,
+      `update requested: ${plan.installedVersion} -> ${plan.version} ` +
+        `(tx=${transaction}, dsh=${plan.dshPath}, prefix=${plan.prefix})`,
     );
     // The confirmation has done its job: the terminal window takes over.
     windows.closeUpdateConfirm();
@@ -667,6 +718,8 @@ async function bootstrap(): Promise<void> {
         distro: plan.distro,
         nodePath: supervisor.resolvedRuntime()?.nodePath ?? null,
         transaction,
+        customExecutable: config.dshPath !== null,
+        ownPid: supervisor.ownedPid(),
       })
       .then((outcome) => {
         if (!outcome.ok) {
@@ -801,7 +854,7 @@ async function bootstrap(): Promise<void> {
       if (recovery.action === 'blocked') {
         // Never start a backend on top of a runtime whose state is unknown.
         supervisor.blockForRuntime(
-          recovery.message ?? 'The isolated runtime is in an unknown state.',
+          recovery.message ?? 'The DeepSeek Harness installation is in an unknown state.',
         );
       } else if (recovery.action === null) {
         await supervisor.start();

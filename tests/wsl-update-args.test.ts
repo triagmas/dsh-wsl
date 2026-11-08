@@ -1,421 +1,399 @@
 /**
- * Issue #12 — WSL update commands.
+ * Issues #12 and #17 — argument builders for the update scripts.
  *
- * Two layers:
- * 1. argument construction and validation (never any network or WSL);
- * 2. a real end-to-end run of the shipped scripts under `/bin/sh` in throw-away
- *    directories with a fake `HOME` and a fake npm, which proves root expansion,
- *    the private cache, exact version comparison, staging, the swap, the rollback
- *    copy and the interruption recovery — without touching any installation.
- *
- * The end-to-end part needs a POSIX shell and is skipped on Windows.
+ * Every value that reaches `wsl.exe` is either a module constant or a validated
+ * positional parameter, so these tests check three things: the scripts keep the
+ * safety rules the design promises, invalid values are rejected before anything
+ * runs, and the builders never concatenate user input into shell text.
  */
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import {
-  ACTIVATE_SCRIPT,
-  INSPECT_SCRIPT,
-  NPM_MARKER,
+  INSPECT_SHARED_SCRIPT,
   NPM_PACKAGE,
   NPM_VIEW_SCRIPT,
-  RESTORE_SCRIPT,
-  STAGE_MARKER,
-  STAGE_SCRIPT,
-  buildActivateArgs,
-  buildInspectArgs,
+  PREPARE_BACKUP_SCRIPT,
+  ROLLBACK_SHARED_SCRIPT,
+  UPDATE_SHARED_SCRIPT,
+  buildInspectSharedArgs,
   buildNpmViewArgs,
-  buildRestoreArgs,
-  buildStageArgs,
-  parseInspectLine,
+  buildPrepareBackupArgs,
+  buildRollbackSharedArgs,
+  buildUpdateSharedArgs,
+  parseBackupReport,
   parseNpmMarker,
 } from '../src/main/wsl/update-args.js';
 import { ArgumentError } from '../src/main/wsl/args.js';
 
-const ROOT = '~/.local/share/wsl-web-shell';
-const NODE = '/home/u/.local/bin/node';
-const TX = '20261107T101500Z-1a2b';
+const APP_ROOT = '/home/dev/.local/share/wsl-web-shell';
+const PREFIX = '/home/dev/.npm-global';
+const PKG = `${PREFIX}/lib/node_modules/@deepseek-ai/dsh`;
+const DSH = `${PREFIX}/bin/dsh`;
 
-describe('update command construction', () => {
-  it('checks the exact package version through /bin/sh', () => {
-    const argv = buildNpmViewArgs({ distro: 'Ubuntu', isolationRoot: ROOT, version: '0.2.2-rc.1', nodePath: NODE });
-    expect(argv.slice(0, 5)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c']);
-    expect(argv[5]).toBe(NPM_VIEW_SCRIPT);
-    expect(argv.slice(6)).toEqual([ROOT, '0.2.2-rc.1', NODE]);
-    expect(NPM_VIEW_SCRIPT).toContain(`"${NPM_PACKAGE}@$ver"`);
-    // Read-only: the lookup must not install anything.
-    expect(NPM_VIEW_SCRIPT).not.toContain('install');
+const REAL = `${PKG}/bin/dsh.js`;
+const SNAPSHOT = `${APP_ROOT}/update/shared-backup-20261107T101500Z-1a2b`;
+
+const updateRequest = {
+  distro: 'Ubuntu',
+  appRoot: APP_ROOT,
+  prefix: PREFIX,
+  packageDir: PKG,
+  dshPath: DSH,
+  realPath: REAL,
+  npmPath: '/usr/bin/npm',
+  nodePath: '/usr/bin/node',
+  transaction: '20261107T101500Z-1a2b',
+  version: '0.2.2-rc.1',
+  installedVersion: '0.2.1-rc.5',
+  ownPid: 4242,
+  snapshotDir: SNAPSHOT,
+};
+
+describe('npm view (read-only check)', () => {
+  it('checks the exact version with the app cache and the resolved node', () => {
+    const argv = buildNpmViewArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, version: '0.2.2-rc.1', nodePath: '/usr/bin/node' });
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', NPM_VIEW_SCRIPT]);
+    expect(argv.slice(6)).toEqual([APP_ROOT, '0.2.2-rc.1', '/usr/bin/node']);
+    expect(NPM_VIEW_SCRIPT).toContain(`${NPM_PACKAGE}@$ver`);
+    expect(NPM_VIEW_SCRIPT).toContain('npm_config_cache');
+    // The isolated runtime is not a requirement any more (issue #17).
+    expect(NPM_VIEW_SCRIPT).not.toContain('runtime/bin');
   });
 
-  it('expands a configured ~/ root in every script', () => {
-    // A quoted tilde arrives as a positional parameter and is never expanded by
-    // the shell, so each script has to do it itself (review blocker A).
-    for (const script of [NPM_VIEW_SCRIPT, STAGE_SCRIPT, ACTIVATE_SCRIPT, RESTORE_SCRIPT, INSPECT_SCRIPT]) {
-      expect(script).toContain('"~/"*) root="$HOME/${root_in#"~/"}" ;;');
-      expect(script).toContain('root="$(cd "$root" && pwd -P)"');
-      expect(script).toContain('rejected isolation root');
-      expect(script).toContain('is a symlink');
+  it('rejects anything that is not an exact version', () => {
+    for (const version of ['latest', '^0.2.2', '0.2.2; rm -rf /', '']) {
+      expect(() => buildNpmViewArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, version, nodePath: null })).toThrow(ArgumentError);
     }
   });
 
-  it('uses only the private npm cache', () => {
-    for (const script of [NPM_VIEW_SCRIPT, STAGE_SCRIPT]) {
-      expect(script).toContain('export npm_config_cache="$root/cache/npm"');
-      expect(script).toContain('--cache "$root/cache/npm"');
-      expect(script).not.toContain('~/.npm');
-    }
-  });
-
-  it('compares versions exactly, never as a substring', () => {
-    for (const script of [STAGE_SCRIPT, ACTIVATE_SCRIPT]) {
-      expect(script).toContain('if [ "$staged" != "$ver" ]');
-      expect(script).not.toContain('case "$staged" in *"$ver"*)');
-    }
-    expect(ACTIVATE_SCRIPT).toContain('if [ "$active" != "$ver" ]');
-  });
-
-  it('installs into the isolated prefix and keeps the previous tree', () => {
-    const argv = buildStageArgs(
-      { distro: 'Ubuntu', isolationRoot: ROOT, version: '0.2.2-rc.1', nodePath: NODE },
-      '/usr/bin/npm',
-      TX,
-    );
-    expect(argv.slice(6)).toEqual([ROOT, '0.2.2-rc.1', '/usr/bin/npm', NODE, TX]);
-    expect(argv[5]).toBe(STAGE_SCRIPT);
-    expect(STAGE_SCRIPT).toContain('--prefix "$stage"');
-    expect(STAGE_SCRIPT).toContain('stage="$upd/stage-$tx"');
-    expect(STAGE_SCRIPT).not.toContain('mv "$rt"');
-    expect(ACTIVATE_SCRIPT).toContain('mv "$rt" "$prev"');
-    expect(ACTIVATE_SCRIPT).toContain('mv "$stage" "$rt"');
-    expect(ACTIVATE_SCRIPT).toContain('mv "$prev" "$rt"');
-    // Nothing global is touched.
-    for (const script of [STAGE_SCRIPT, ACTIVATE_SCRIPT, RESTORE_SCRIPT]) {
-      expect(script).not.toContain('/usr/local/lib');
-      expect(script).not.toContain('/usr/lib/node_modules');
-    }
-  });
-
-  it('rejects unsafe values before they reach a command line', () => {
-    expect(() => buildNpmViewArgs({ distro: 'Ubuntu', isolationRoot: ROOT, version: 'latest', nodePath: null })).toThrow(
-      ArgumentError,
-    );
-    expect(() =>
-      buildNpmViewArgs({ distro: 'Ubuntu', isolationRoot: ROOT, version: '0.2.2-rc.1; id', nodePath: null }),
-    ).toThrow(ArgumentError);
-    expect(() => buildNpmViewArgs({ distro: 'Ubuntu', isolationRoot: '~', version: '0.2.2-rc.1', nodePath: null })).toThrow(
-      ArgumentError,
-    );
-    expect(() =>
-      buildNpmViewArgs({ distro: 'bad distro', isolationRoot: ROOT, version: '0.2.2-rc.1', nodePath: null }),
-    ).toThrow(ArgumentError);
-    expect(() =>
-      buildStageArgs({ distro: 'Ubuntu', isolationRoot: ROOT, version: '0.2.2-rc.1', nodePath: null }, 'npm; rm -rf /', TX),
-    ).toThrow(ArgumentError);
-    expect(() =>
-      buildStageArgs({ distro: 'Ubuntu', isolationRoot: ROOT, version: '0.2.2-rc.1', nodePath: null }, '/usr/bin/npm', '../x'),
-    ).toThrow(ArgumentError);
-    expect(() => buildActivateArgs({ distro: 'Ubuntu', isolationRoot: ROOT, version: '0.2.2-rc.1', nodePath: null }, 'a b')).toThrow(
-      ArgumentError,
-    );
-    expect(() => buildRestoreArgs('Ubuntu', ROOT, '../x', null)).toThrow(ArgumentError);
-    expect(() => buildInspectArgs('Ubuntu', '~')).toThrow(ArgumentError);
-  });
-
-  it('parses the markers the scripts print', () => {
-    expect(parseNpmMarker(`${NPM_MARKER} /usr/bin/npm`)).toBe('/usr/bin/npm');
-    expect(parseNpmMarker(`${NPM_MARKER} npm`)).toBeNull();
-    expect(parseNpmMarker('something else')).toBeNull();
-    expect(parseInspectLine(`${'__wsl_web_shell_inspect__'} runtime=present`)).toEqual({ key: 'runtime', value: 'present' });
-    expect(parseInspectLine(`${'__wsl_web_shell_inspect__'} previous=previous-x`)).toEqual({
-      key: 'previous',
-      value: 'previous-x',
-    });
-    expect(parseInspectLine('runtime=present')).toBeNull();
-    expect(STAGE_MARKER).toContain('__wsl_web_shell_stage__');
+  it('parses the npm marker it prints', () => {
+    expect(parseNpmMarker('__wsl_web_shell_npm__ /usr/bin/npm')).toBe('/usr/bin/npm');
+    expect(parseNpmMarker('__wsl_web_shell_npm__ relative')).toBeNull();
+    expect(parseNpmMarker('other output')).toBeNull();
   });
 });
 
-describe.skipIf(process.platform === 'win32')('update scripts in an isolated environment', () => {
-  /**
-   * Fake npm: understands exactly the global install invocation, writes a `dsh`
-   * shim reporting the requested version, and records the arguments it saw so the
-   * tests can assert the private cache and prefix.
-   */
-  const FAKE_NPM = `#!/bin/sh
-set -eu
-mode="$FAKE_NPM_MODE"
-prefix=""
-cache=""
-target=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --prefix) prefix="$2"; shift 2;;
-    --cache) cache="$2"; shift 2;;
-    --global|--no-audit|--no-fund) shift;;
-    --loglevel=*) shift;;
-    *) target="$1"; shift;;
-  esac
-done
-printf 'target=%s\\nprefix=%s\\ncache=%s\\n' "$target" "$prefix" "$cache" > "$FAKE_NPM_LOG"
-if [ "$mode" = "fail" ]; then
-  echo "npm ERR! network unreachable" >&2
-  exit 7
-fi
-ver="$(printf '%s' "$target" | sed -e 's/.*@//')"
-mkdir -p "$prefix/bin" "$prefix/lib/node_modules/@deepseek-ai/dsh"
-if [ "$mode" = "wrong-version" ]; then ver="$FAKE_WRONG_VERSION"; fi
-cat > "$prefix/bin/dsh" <<SHIM
-#!/bin/sh
-echo "$ver"
-SHIM
-chmod +x "$prefix/bin/dsh"
-printf '{"name":"@deepseek-ai/dsh"}\\n' > "$prefix/lib/node_modules/@deepseek-ai/dsh/package.json"
-`;
-
-  interface Sandbox {
-    base: string;
-    home: string;
-    root: string;
-    npm: string;
-    log: string;
-  }
-
-  /**
-   * Creates a fake `$HOME` so a configured `~/…` root really has to be expanded.
-   * `installed` is the version the current runtime reports.
-   */
-  async function sandbox(options: { mode?: string; installed?: string; withRuntime?: boolean } = {}): Promise<Sandbox> {
-    const base = await mkdtemp(join(tmpdir(), 'wss-update-'));
-    const home = join(base, 'home');
-    const root = join(home, '.local', 'share', 'wsl-web-shell');
-    await mkdir(join(root, 'runtime', 'bin'), { recursive: true });
-    await mkdir(join(root, 'update'), { recursive: true });
-    await mkdir(join(root, 'cache'), { recursive: true });
-    if (options.withRuntime !== false) {
-      const dsh = join(root, 'runtime', 'bin', 'dsh');
-      await writeFile(dsh, `#!/bin/sh\necho "${options.installed ?? '0.2.1-rc.5'}"\n`, 'utf8');
-      await chmod(dsh, 0o755);
-    }
-    const npm = join(root, 'runtime', 'bin', 'npm');
-    await writeFile(npm, FAKE_NPM, 'utf8');
-    await chmod(npm, 0o755);
-    const log = join(base, 'npm-args.log');
-    await writeFile(log, '', 'utf8');
-    return { base, home, root, npm, log };
-  }
-
-  function run(script: string, args: string[], sandboxPath: Sandbox, env: Record<string, string> = {}) {
-    return spawnSync('/bin/sh', ['-c', script, ...args], {
-      encoding: 'utf8',
-      env: { ...process.env, HOME: sandboxPath.home, FAKE_NPM_LOG: sandboxPath.log, ...env },
-      timeout: 30_000,
+describe('shared installation inspection', () => {
+  it('asks for the executable, the app root, node and the owned pid', () => {
+    const argv = buildInspectSharedArgs({
+      distro: 'Ubuntu',
+      appRoot: APP_ROOT,
+      dshPath: DSH,
+      nodePath: '/usr/bin/node',
+      ownPid: 4242,
     });
-  }
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', INSPECT_SHARED_SCRIPT]);
+    expect(argv.slice(6)).toEqual([DSH, APP_ROOT, '/usr/bin/node', '4242']);
+  });
 
-  function version(binary: string): string {
-    return spawnSync(binary, ['--version'], { encoding: 'utf8' }).stdout.trim();
-  }
+  it('resolves the distribution executable when no path is pinned', () => {
+    const argv = buildInspectSharedArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, dshPath: null, nodePath: null, ownPid: null });
+    expect(argv.slice(6)).toEqual(['-', APP_ROOT, '-', '-']);
+  });
 
-  it('expands the default ~/.local/share/wsl-web-shell root against $HOME (review blocker A)', async () => {
-    const box = await sandbox();
-    try {
-      const result = run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', box.npm, '-', TX], box, { FAKE_NPM_MODE: 'ok' });
-      expect(result.status, result.stderr).toBe(0);
-      // The staged tree landed below the fake $HOME, not in the real one, and the
-      // runtime was not touched by staging.
-      expect((await readdir(join(box.root, 'update'))).filter((name) => name.startsWith('stage-'))).toEqual([`stage-${TX}`]);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
+  it('uses the login shell first and never a private runtime', () => {
+    // `bash -lc "command -v dsh"` is exactly what an ordinary terminal does.
+    expect(INSPECT_SHARED_SCRIPT).toContain('bash -lc "command -v dsh"');
+    expect(INSPECT_SHARED_SCRIPT).toContain('legacy=');
+    expect(INSPECT_SHARED_SCRIPT).not.toContain('runtime/bin:');
+  });
 
-      const activate = run(ACTIVATE_SCRIPT, [ROOT, '0.2.2-rc.1', TX, '-'], box);
-      expect(activate.status, activate.stderr).toBe(0);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.2-rc.1');
-      expect(version(join(box.root, 'update', `previous-${TX}`, 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
+  it('reports the npm prefix, the package and the writability', () => {
+    for (const key of ['manager', 'prefix', 'package', 'writable', 'version', 'real', 'link', 'foreign', 'source']) {
+      expect(INSPECT_SHARED_SCRIPT).toContain(`${key}=%s`);
+    }
+    expect(INSPECT_SHARED_SCRIPT).toContain('found=yes');
+    expect(INSPECT_SHARED_SCRIPT).toContain('"$npm_bin" prefix -g');
+    expect(INSPECT_SHARED_SCRIPT).toContain('pnpm root -g');
+    expect(INSPECT_SHARED_SCRIPT).toContain('[ -w "$prefix" ]');
+  });
+
+  it('never signals anything while counting foreign processes', () => {
+    expect(INSPECT_SHARED_SCRIPT).toContain('foreign_count');
+    expect(INSPECT_SHARED_SCRIPT).not.toContain('kill');
+  });
+
+  it('rejects a relative executable path', () => {
+    expect(() =>
+      buildInspectSharedArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, dshPath: 'bin/dsh', nodePath: null, ownPid: null }),
+    ).toThrow(ArgumentError);
+  });
+});
+
+describe('shared installation update', () => {
+  it('passes every value as a positional parameter', () => {
+    const argv = buildUpdateSharedArgs(updateRequest, updateRequest.transaction);
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', UPDATE_SHARED_SCRIPT]);
+    expect(argv.slice(6)).toEqual([
+      PREFIX,
+      '0.2.2-rc.1',
+      '0.2.1-rc.5',
+      '/usr/bin/npm',
+      '/usr/bin/node',
+      '20261107T101500Z-1a2b',
+      DSH,
+      PKG,
+      APP_ROOT,
+      '4242',
+      REAL,
+      SNAPSHOT,
+    ]);
+  });
+
+  it('never builds a shell string out of the values', () => {
+    const argv = buildUpdateSharedArgs(updateRequest, updateRequest.transaction);
+    // The script text is a constant: it is identical for every request.
+    const other = buildUpdateSharedArgs({ ...updateRequest, version: '0.3.0' }, updateRequest.transaction);
+    expect(other[5]).toBe(argv[5]);
+    expect(argv[5]).not.toContain(PREFIX);
+  });
+
+  it('re-checks prefix, writability and foreign processes inside the script', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain('npm_bin" prefix -g');
+    expect(UPDATE_SHARED_SCRIPT).toContain('report');
+    expect(UPDATE_SHARED_SCRIPT).toContain('! -w "$prefix"');
+    expect(UPDATE_SHARED_SCRIPT).toContain('foreign_count');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 75');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 76');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 78');
+  });
+
+  it('installs exactly the published package version', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain(`"${NPM_PACKAGE}@$ver"`);
+    expect(UPDATE_SHARED_SCRIPT).toContain('install --global --prefix');
+    expect(UPDATE_SHARED_SCRIPT).not.toContain('--force');
+    expect(UPDATE_SHARED_SCRIPT).not.toMatch(/\bsudo\b/);
+  });
+
+  it('keeps a copy of the previous package and knows how to restore it', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain('shared-backup-$tx');
+    expect(UPDATE_SHARED_SCRIPT).toContain('restore()');
+    expect(UPDATE_SHARED_SCRIPT).toContain(`"${NPM_PACKAGE}@$installed"`);
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 72');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 73');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 74');
+  });
+
+  it('treats login-shell divergence as a failure, not a warning (B3)', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain('bash -lc "command -v dsh"');
+    expect(UPDATE_SHARED_SCRIPT).toContain('a login shell resolves the updated executable');
+    // Neither "warning" nor a silent success: the script exits and restores.
+    expect(UPDATE_SHARED_SCRIPT).not.toContain('warning:');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 82');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 84');
+  });
+
+  it('requires the verified snapshot of this very installation (B1)', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain('snapshot_ok');
+    expect(UPDATE_SHARED_SCRIPT).toContain('shared-backup-$tx');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 79');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 80');
+    // The install must not be reachable without the snapshot checks.
+    const installAt = UPDATE_SHARED_SCRIPT.indexOf('install --global --prefix');
+    expect(UPDATE_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$installed"')).toBeLessThan(installAt);
+    expect(UPDATE_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$installed"')).toBeLessThan(
+      UPDATE_SHARED_SCRIPT.indexOf('install --global --prefix'),
+    );
+  });
+
+  it('re-verifies the pinned real path and package identity before mutating (B2)', () => {
+    expect(UPDATE_SHARED_SCRIPT).toContain('[ "$real" = "$real_path" ]');
+    expect(UPDATE_SHARED_SCRIPT).toContain('exit 81');
+    expect(UPDATE_SHARED_SCRIPT).toContain('readlink -f');
+    expect(UPDATE_SHARED_SCRIPT).toContain('lib/node_modules/*');
+    expect(UPDATE_SHARED_SCRIPT).toContain(`grep -q "\\"name\\"[[:space:]]*:[[:space:]]*\\"${NPM_PACKAGE}\\"`);
+    const identityAt = UPDATE_SHARED_SCRIPT.indexOf('[ "$real" = "$real_path" ]');
+    expect(identityAt).toBeLessThan(UPDATE_SHARED_SCRIPT.indexOf('install --global --prefix'));
+  });
+
+  it('prefers the offline snapshot restore over a registry reinstall', () => {
+    const restoreBlock = UPDATE_SHARED_SCRIPT.slice(
+      UPDATE_SHARED_SCRIPT.indexOf('restore() {'),
+      UPDATE_SHARED_SCRIPT.indexOf('cache="$base/cache/npm"'),
+    );
+    expect(restoreBlock.indexOf('restore_snapshot')).toBeLessThan(restoreBlock.indexOf('falling back to reinstalling'));
+  });
+
+  it('rejects invalid versions, transactions and paths', () => {
+    expect(() => buildUpdateSharedArgs({ ...updateRequest, version: 'latest' }, '20261107T101500Z-1a2b')).toThrow(ArgumentError);
+    expect(() => buildUpdateSharedArgs({ ...updateRequest, installedVersion: '^0.2.1' }, '20261107T101500Z-1a2b')).toThrow(ArgumentError);
+    expect(() => buildUpdateSharedArgs(updateRequest, '../../etc')).toThrow(ArgumentError);
+    expect(() => buildUpdateSharedArgs({ ...updateRequest, prefix: 'relative' }, updateRequest.transaction)).toThrow(ArgumentError);
+    expect(() => buildUpdateSharedArgs({ ...updateRequest, dshPath: '/a/../b' }, updateRequest.transaction)).toThrow(ArgumentError);
+    expect(() => buildUpdateSharedArgs({ ...updateRequest, npmPath: 'npm' }, updateRequest.transaction)).toThrow(ArgumentError);
+    expect(() => buildUpdateSharedArgs({ ...updateRequest, ownPid: 0 }, updateRequest.transaction)).toThrow(ArgumentError);
+  });
+
+  it('rejects a prefix or transaction containing shell metacharacters', () => {
+    for (const prefix of ['/home/dev/.npm-global;id', '/home/dev/$(id)', '/home/dev/`id`']) {
+      expect(() => buildUpdateSharedArgs({ ...updateRequest, prefix }, updateRequest.transaction)).toThrow(ArgumentError);
+    }
+    expect(() => buildUpdateSharedArgs(updateRequest, '2026 11 07')).toThrow(ArgumentError);
+  });
+});
+
+describe('backup script (B1)', () => {
+  const backupRequest = {
+    distro: 'Ubuntu',
+    appRoot: APP_ROOT,
+    prefix: PREFIX,
+    packageDir: PKG,
+    dshPath: DSH,
+    realPath: REAL,
+    installedVersion: '0.2.1-rc.5',
+    transaction: '20261107T101500Z-1a2b',
+  };
+
+  it('receives every value as a positional parameter', () => {
+    const argv = buildPrepareBackupArgs(backupRequest);
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PREPARE_BACKUP_SCRIPT]);
+    expect(argv.slice(6)).toEqual([DSH, PREFIX, PKG, REAL, '0.2.1-rc.5', '20261107T101500Z-1a2b', APP_ROOT]);
+  });
+
+  it('refuses symlinked or pre-existing snapshot locations (C3)', () => {
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ ! -L "$sn" ]');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ -L "$sn.tmp" ]');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ -e "$sn" ] &&');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ -e "$sn.tmp" ] &&');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('exit 79');
+    // A pre-existing temp tree is never removed: cleanup only removes what this
+    // invocation created.
+    expect(PREPARE_BACKUP_SCRIPT).not.toContain('rm -rf "$sn.tmp" 2>/dev/null ||');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('cleanup() { [ "$created" = "yes" ]');
+    const removal = PREPARE_BACKUP_SCRIPT.slice(PREPARE_BACKUP_SCRIPT.indexOf('[ -e "$sn.tmp" ]'));
+    expect(removal.indexOf('rm -rf')).toBeGreaterThan(0);
+  });
+
+  it('writes a content manifest and re-verifies it (C3)', () => {
+    expect(PREPARE_BACKUP_SCRIPT).toContain('manifest_of "$sn.tmp/payload"');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('snapshot_ok "$sn" "$installed"');
+    // Every consumer re-verifies the manifest before it deletes anything.
+    for (const script of [UPDATE_SHARED_SCRIPT, ROLLBACK_SHARED_SCRIPT]) {
+      expect(script).toContain('manifest_ok "$sn"');
+      expect(script).toContain('cksum');
+      expect(script).toContain('cmp -s -');
+      const check = script.indexOf('manifest_ok "$sn"');
+      expect(check).toBeGreaterThan(-1);
+    }
+    // The integrity check happens before the destructive restore.
+    expect(UPDATE_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$installed"')).toBeLessThan(
+      UPDATE_SHARED_SCRIPT.indexOf('rm -rf "$target"'),
+    );
+    expect(ROLLBACK_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$ver"')).toBeLessThan(
+      ROLLBACK_SHARED_SCRIPT.indexOf('rm -rf "$pkg"'),
+    );
+  });
+
+  it('refuses a redirected ancestry before replacing anything (C2)', () => {
+    for (const script of [UPDATE_SHARED_SCRIPT, ROLLBACK_SHARED_SCRIPT, PREPARE_BACKUP_SCRIPT]) {
+      expect(script).toContain('dest_trusted');
+      expect(script).toContain('real_dir');
+      expect(script).toContain('is not a real directory (symlinked or redirected)');
+    }
+    expect(UPDATE_SHARED_SCRIPT.indexOf('dest_trusted "$prefix" "$target"')).toBeLessThan(
+      UPDATE_SHARED_SCRIPT.indexOf('rm -rf "$target"'),
+    );
+    expect(ROLLBACK_SHARED_SCRIPT.indexOf('dest_trusted "$prefix" "$pkg"')).toBeLessThan(
+      ROLLBACK_SHARED_SCRIPT.indexOf('rm -rf "$pkg"'),
+    );
+  });
+
+  it('copies the package and the executable shim state, then verifies both', () => {
+    expect(PREPARE_BACKUP_SCRIPT).toContain('cp -a "$pkg/." "$sn.tmp/payload/"');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('dsh.link');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('version_of "$sn.tmp/payload/$entry"');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('printf "entry=%s');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('exit 80');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('exit 81');
+  });
+
+  it('rejects invalid inputs before touching the filesystem', () => {
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, installedVersion: 'latest' })).toThrow(ArgumentError);
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, transaction: '../../x' })).toThrow(ArgumentError);
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, realPath: 'relative/dsh.js' })).toThrow(ArgumentError);
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, packageDir: '/a/../b' })).toThrow(ArgumentError);
+  });
+
+  it('parses only a complete snapshot report', () => {
+    const text = [
+      '__dsh_wsl_backup__ path=/home/dev/app/update/shared-backup-20261107T101500Z-1a2b',
+      '__dsh_wsl_backup__ version=0.2.1-rc.5',
+      '__dsh_wsl_backup__ real=/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+      '__dsh_wsl_backup__ package=/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh',
+      '__dsh_wsl_backup__ files=128',
+    ].join('\n');
+    expect(parseBackupReport(text)).toEqual({
+      path: '/home/dev/app/update/shared-backup-20261107T101500Z-1a2b',
+      version: '0.2.1-rc.5',
+      realPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+      packageDir: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh',
+      files: 128,
+    });
+    expect(parseBackupReport('__dsh_wsl_backup__ files=0')).toBeNull();
+    expect(parseBackupReport(text.replace('files=128', 'files=0'))).toBeNull();
+    expect(parseBackupReport(text.replace('version=0.2.1-rc.5', 'version=latest'))).toBeNull();
+  });
+});
+
+describe('rollback script', () => {
+  it('reinstalls the exact previous version', () => {
+    const argv = buildRollbackSharedArgs(
+      updateRequest,
+      '0.2.1-rc.5',
+      '20261107T101500Z-1a2b',
+    );
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', ROLLBACK_SHARED_SCRIPT]);
+    expect(argv.slice(6)).toEqual([
+      PREFIX,
+      '0.2.1-rc.5',
+      '/usr/bin/npm',
+      '/usr/bin/node',
+      DSH,
+      PKG,
+      '20261107T101500Z-1a2b',
+      APP_ROOT,
+      REAL,
+      SNAPSHOT,
+    ]);
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('shared-backup-$tx');
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 74');
+  });
+
+  it('restores from the verified snapshot before asking npm', () => {
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('restoring $ver from the verified snapshot');
+    expect(ROLLBACK_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$ver"')).toBeLessThan(
+      ROLLBACK_SHARED_SCRIPT.indexOf('install --global --prefix'),
+    );
+    // A destination that is no longer the expected one is never replaced, and
+    // neither is one whose ancestry was redirected (C2).
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('dest_trusted "$prefix" "$pkg" "$dsh"');
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 81');
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 74');
+  });
+
+  it('refuses a missing npm prefix', () => {
+    expect(() => buildRollbackSharedArgs({ ...updateRequest, prefix: '' }, '0.2.1-rc.5', '20261107T101500Z-1a2b')).toThrow(
+      ArgumentError,
+    );
+  });
+});
+
+describe('scripts never depend on the retired private runtime', () => {
+  it('never installs, stages or activates anything in a private runtime', () => {
+    for (const script of [NPM_VIEW_SCRIPT, UPDATE_SHARED_SCRIPT, ROLLBACK_SHARED_SCRIPT]) {
+      expect(script).not.toContain('runtime');
     }
   });
 
-  it('uses only the private npm cache and prefix', async () => {
-    const box = await sandbox();
-    try {
-      const result = run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', box.npm, '-', TX], box, { FAKE_NPM_MODE: 'ok' });
-      expect(result.status, result.stderr).toBe(0);
-      const seen = await readFile(box.log, 'utf8');
-      expect(seen).toContain(`prefix=${box.root}/update/stage-${TX}`);
-      expect(seen).toContain(`cache=${box.root}/cache/npm`);
-      expect(seen).toContain(`target=${NPM_PACKAGE}@0.2.2-rc.1`);
-      expect(seen).not.toContain('.npm');
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
+  it('only uses the legacy runtime path to report that it exists', () => {
+    // The inspection may look at it to tell the user it is no longer selected,
+    // but it must never be executed, copied or updated.
+    expect(INSPECT_SHARED_SCRIPT).toContain('[ -x "$root/runtime/bin/dsh" ] && legacy=yes');
+    expect(INSPECT_SHARED_SCRIPT).not.toContain('runtime/bin/dsh" web');
   });
 
-  it('refuses a symlinked isolation root or runtime (review blocker C)', async () => {
-    const box = await sandbox();
-    try {
-      const link = join(box.home, 'link-root');
-      await rm(join(box.base, 'elsewhere'), { recursive: true, force: true });
-      await mkdir(join(box.base, 'elsewhere'), { recursive: true });
-      const { symlink } = await import('node:fs/promises');
-      await symlink(join(box.base, 'elsewhere'), link);
-      const viaLink = run(STAGE_SCRIPT, ['~/link-root', '0.2.2-rc.1', box.npm, '-', TX], box, { FAKE_NPM_MODE: 'ok' });
-      expect(viaLink.status).toBe(67);
-
-      // And the runtime directory itself must not be a link out of the root.
-      await rm(join(box.root, 'runtime'), { recursive: true, force: true });
-      await symlink(join(box.base, 'elsewhere'), join(box.root, 'runtime'));
-      const viaRuntime = run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', box.npm, '-', TX], box, { FAKE_NPM_MODE: 'ok' });
-      expect(viaRuntime.status).toBe(67);
-      expect(viaRuntime.stderr).toContain('symlink');
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
-  });
-
-  it('rejects a version the staged executable does not report exactly', async () => {
-    const box = await sandbox();
-    try {
-      // npm produces the old version: `0.2.2-rc.1` must not be satisfied by
-      // `0.2.2-rc.10` or by the previous release.
-      const wrong = run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', box.npm, '-', TX], box, {
-        FAKE_NPM_MODE: 'wrong-version',
-        FAKE_WRONG_VERSION: '0.2.2-rc.10',
-      });
-      expect(wrong.status).toBe(71);
-      expect(wrong.stderr).toContain('staged version check failed');
-      expect(wrong.stderr).toContain('[0.2.2-rc.10]');
-      const entries = await readdir(join(box.root, 'update'));
-      expect(entries.filter((name) => name.startsWith('stage-'))).toHaveLength(0);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
-  });
-
-  it('keeps the old install when npm fails', async () => {
-    const box = await sandbox();
-    try {
-      const result = run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', box.npm, '-', TX], box, { FAKE_NPM_MODE: 'fail' });
-      expect(result.status).toBe(7);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-      const entries = await readdir(join(box.root, 'update'));
-      expect(entries.filter((name) => name.startsWith('previous-'))).toHaveLength(0);
-      expect(entries.filter((name) => name.startsWith('stage-'))).toHaveLength(0);
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
-  });
-
-  it('stages without touching the runtime, then activates', async () => {
-    const box = await sandbox();
-    try {
-      const staged = run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', box.npm, '-', TX], box, { FAKE_NPM_MODE: 'ok' });
-      expect(staged.status, staged.stderr).toBe(0);
-      expect(staged.stdout).toContain(`${STAGE_MARKER} ${box.root}/update/stage-${TX}`);
-      // Staging alone never replaces anything: the backend can keep running.
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-      expect((await stat(join(box.root, 'update', `stage-${TX}`, 'bin', 'dsh'))).isFile()).toBe(true);
-
-      const activated = run(ACTIVATE_SCRIPT, [ROOT, '0.2.2-rc.1', TX, '-'], box);
-      expect(activated.status, activated.stderr).toBe(0);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.2-rc.1');
-      expect((await readdir(join(box.root, 'update'))).filter((name) => name.startsWith('stage-'))).toHaveLength(0);
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
-  });
-
-  it('rolls back when the activated executable is wrong', async () => {
-    const box = await sandbox();
-    try {
-      const staged = run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', box.npm, '-', TX], box, { FAKE_NPM_MODE: 'ok' });
-      expect(staged.status).toBe(0);
-      // Break the staged executable after verification: activation must notice
-      // and restore the previous install.
-      await writeFile(join(box.root, 'update', `stage-${TX}`, 'bin', 'dsh'), '#!/bin/sh\necho "0.2.2-rc.10"\n', 'utf8');
-      await chmod(join(box.root, 'update', `stage-${TX}`, 'bin', 'dsh'), 0o755);
-      const activated = run(ACTIVATE_SCRIPT, [ROOT, '0.2.2-rc.1', TX, '-'], box);
-      expect(activated.status).toBe(71);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-      expect((await readdir(join(box.root, 'update'))).filter((name) => name.startsWith('stage-'))).toHaveLength(0);
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
-  });
-
-  it('recovers an interruption at every swap boundary (review blocker B)', async () => {
-    // Boundary 1: killed between `mv runtime previous` and `mv stage runtime`.
-    const first = await sandbox();
-    try {
-      expect(run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', first.npm, '-', TX], first, { FAKE_NPM_MODE: 'ok' }).status).toBe(0);
-      const { rename } = await import('node:fs/promises');
-      await rename(join(first.root, 'runtime'), join(first.root, 'update', `previous-${TX}`));
-
-      const inspected = run(INSPECT_SCRIPT, [ROOT], first);
-      expect(inspected.status, inspected.stderr).toBe(0);
-      const report = new Map(
-        inspected.stdout
-          .split('\n')
-          .map((line) => parseInspectLine(line))
-          .filter((entry): entry is { key: string; value: string } => entry !== null)
-          .map((entry) => [entry.key, entry.value]),
-      );
-      expect(report.get('runtime')).toBe('missing');
-      expect(report.get('previous')).toBe(`previous-${TX}`);
-      expect(report.get('stage')).toBe(`stage-${TX}`);
-
-      const restored = run(RESTORE_SCRIPT, [ROOT, TX, '-'], first);
-      expect(restored.status, restored.stderr).toBe(0);
-      expect(version(join(first.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-      expect(run(INSPECT_SCRIPT, [ROOT], first).stdout).toContain('runtime=present');
-    } finally {
-      await rm(first.base, { recursive: true, force: true });
-    }
-
-    // Boundary 2: killed after the swap but before the version was verified.
-    const second = await sandbox();
-    try {
-      expect(run(STAGE_SCRIPT, [ROOT, '0.2.2-rc.1', second.npm, '-', TX], second, { FAKE_NPM_MODE: 'ok' }).status).toBe(0);
-      const { rename } = await import('node:fs/promises');
-      await rename(join(second.root, 'runtime'), join(second.root, 'update', `previous-${TX}`));
-      await rename(join(second.root, 'update', `stage-${TX}`), join(second.root, 'runtime'));
-      // The new tree is in place but reports another version: restore wins.
-      await writeFile(join(second.root, 'runtime', 'bin', 'dsh'), '#!/bin/sh\necho "0.2.2-rc.10"\n', 'utf8');
-      await chmod(join(second.root, 'runtime', 'bin', 'dsh'), 0o755);
-
-      const restored = run(RESTORE_SCRIPT, [ROOT, TX, '-'], second);
-      expect(restored.status, restored.stderr).toBe(0);
-      expect(version(join(second.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-    } finally {
-      await rm(second.base, { recursive: true, force: true });
-    }
-  });
-
-  it('is idempotent: a second restore changes nothing', async () => {
-    const box = await sandbox();
-    try {
-      const first = run(RESTORE_SCRIPT, [ROOT, TX, '-'], box);
-      expect(first.status, first.stderr).toBe(0);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-      const second = run(RESTORE_SCRIPT, [ROOT, TX, '-'], box);
-      expect(second.status).toBe(0);
-      expect(version(join(box.root, 'runtime', 'bin', 'dsh'))).toBe('0.2.1-rc.5');
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
-  });
-
-  it('reports a missing runtime to the inspect step', async () => {
-    const box = await sandbox({ withRuntime: false });
-    try {
-      const inspected = run(INSPECT_SCRIPT, [ROOT], box);
-      expect(inspected.status, inspected.stderr).toBe(0);
-      expect(inspected.stdout).toContain('runtime=missing');
-      expect(inspected.stdout).not.toContain('version=');
-    } finally {
-      await rm(box.base, { recursive: true, force: true });
-    }
+  it('never installs into an alternate prefix', () => {
+    // The prefix always comes from the inspection, never from the script itself.
+    expect(UPDATE_SHARED_SCRIPT).toContain('--prefix "$prefix"');
+    expect(UPDATE_SHARED_SCRIPT).not.toContain('--prefix "$HOME"');
   });
 });

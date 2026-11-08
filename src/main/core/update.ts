@@ -1,7 +1,13 @@
 /**
- * One-click DeepSeek Harness update (issue #12).
+ * DeepSeek Harness update policy, phase model, terminal buffer and journal
+ * (issues #12 and #17).
  *
- * Everything here is pure: version guards, the ownership checks that decide
+ * Issue #17 changed what an update *is*: DSH WSL now runs the `dsh` the selected
+ * WSL distribution already has, so the in-app update must change **that shared
+ * installation** — the same executable an ordinary `dsh web` in a terminal uses.
+ * There is no app-private runtime any more.
+ *
+ * Everything here is pure: version guards, the provenance checks that decide
  * whether an update is allowed at all, the bounded terminal buffer that the
  * modal window renders, the phase model the UI follows and the transaction
  * journal that makes an interrupted update recoverable. No Electron, no child
@@ -10,15 +16,24 @@
  * Safety model:
  * - only an exact published version is accepted (no ranges, tags or shell text),
  *   and the installed version is compared exactly, never as a substring;
- * - only the isolated runtime below the *canonical* root WSL reported may be
- *   replaced — never a global installation, a custom executable, the official
- *   Windows app or a runtime that merely looks similar;
- * - the previous install is kept next to the root for rollback, and a journal
- *   written to the app profile makes an interrupted swap recoverable on the
- *   next start.
+ * - an update is allowed only for an **npm global** installation whose executable
+ *   really lives inside the reported package directory, whose prefix is writable
+ *   without elevated rights and whose version is the one the launcher resolved;
+ * - a pinned custom executable, an unknown package manager (pnpm, distro package,
+ *   standalone binary), a foreign runtime, a non-writable prefix and any other
+ *   `dsh` process running from that installation all fail closed with an
+ *   actionable message instead of a risky mutation;
+ * - the previous exact version stays installable, and a journal written before
+ *   the install makes an interrupted update recoverable on the next start.
  */
 import { redactSecrets } from '../backend/urls.js';
-import { isValidIsolationRoot, joinPosix } from './isolation.js';
+import {
+  describeInstallScope,
+  isInsideDirectory,
+  isNpmGlobalInstallation,
+  loginShellAgrees,
+  type DshInstallation,
+} from './dsh-locate.js';
 import { compareSemver, parseSemver } from './versions.js';
 
 /** How many terminal lines the progress window keeps. */
@@ -127,10 +142,10 @@ export function planTerminalUpdate(
 export type UpdatePhase =
   | 'idle'
   | 'checking'
+  | 'inspecting'
+  | 'stopping'
   | 'installing'
   | 'verifying'
-  | 'stopping'
-  | 'activating'
   | 'starting'
   | 'done'
   | 'failed'
@@ -139,10 +154,10 @@ export type UpdatePhase =
 const PHASE_TEXT: Record<UpdatePhase, string> = {
   idle: 'Ready',
   checking: 'Checking the published version on npm…',
-  installing: 'Installing DeepSeek Harness…',
-  verifying: 'Verifying the new installation…',
+  inspecting: 'Checking the DeepSeek Harness installation…',
   stopping: 'Stopping the app-owned backend…',
-  activating: 'Activating the new installation…',
+  installing: 'Updating DeepSeek Harness in WSL…',
+  verifying: 'Verifying the updated installation…',
   starting: 'Starting DeepSeek Harness…',
   done: 'Update complete',
   failed: 'Update failed',
@@ -157,10 +172,10 @@ export function describeUpdatePhase(phase: UpdatePhase): string {
 export function isUpdateRunning(phase: UpdatePhase): boolean {
   return (
     phase === 'checking' ||
+    phase === 'inspecting' ||
+    phase === 'stopping' ||
     phase === 'installing' ||
     phase === 'verifying' ||
-    phase === 'stopping' ||
-    phase === 'activating' ||
     phase === 'starting'
   );
 }
@@ -168,13 +183,14 @@ export function isUpdateRunning(phase: UpdatePhase): boolean {
 /**
  * Phases during which the app must not quit.
  *
- * Before the swap only a staging directory changes, so a quit is safe and the
- * journal is simply abandoned on the next start. From `stopping` to `starting`
- * `runtime/` is being replaced or started, and interrupting that is exactly what
- * the journal recovery would have to repair — so the app refuses to quit instead.
+ * Before `stopping` only read-only checks run, so a quit is safe and the journal
+ * is simply abandoned on the next start. From `stopping` to `starting` the shared
+ * WSL installation is being changed or the new backend is starting, and
+ * interrupting that is exactly what the journal recovery would have to repair —
+ * so the app refuses to quit instead.
  */
 export function isUpdateCritical(phase: UpdatePhase): boolean {
-  return phase === 'stopping' || phase === 'activating' || phase === 'starting';
+  return phase === 'stopping' || phase === 'installing' || phase === 'verifying' || phase === 'starting';
 }
 
 /** The app may only relaunch after a completed update. */
@@ -182,10 +198,13 @@ export function shouldRestartAfterUpdate(phase: UpdatePhase): boolean {
   return phase === 'done';
 }
 
+
 /** Reject any path that is not a plain, normalised POSIX absolute path. */
-function isNormalisedAbsolute(candidate: string): boolean {
+export function isNormalisedAbsolutePath(candidate: unknown): candidate is string {
+  if (typeof candidate !== 'string' || candidate.length > 4096) return false;
   return (
     candidate.startsWith('/') &&
+    !candidate.endsWith('/') &&
     !candidate.includes('//') &&
     !candidate.includes('/./') &&
     !candidate.endsWith('/.') &&
@@ -195,56 +214,38 @@ function isNormalisedAbsolute(candidate: string): boolean {
   );
 }
 
-/**
- * Is the executable in use exactly `<canonicalRoot>/runtime/bin/dsh`?
- *
- * `canonicalRoot` is the absolute, symlink-resolved root that WSL itself
- * reported for the selected distribution and user (`pwd -P`), so this is an
- * exact comparison. A configured `~/…` root is never matched as a substring:
- * another user's home, a similarly named directory or a nested copy is not the
- * runtime this app may replace.
- */
-export function isExpectedRuntimePath(resolvedDshPath: string | null, canonicalRoot: string | null): boolean {
-  if (resolvedDshPath === null || canonicalRoot === null) return false;
-  if (!isNormalisedAbsolute(canonicalRoot) || !isNormalisedAbsolute(resolvedDshPath)) return false;
-  const expected = joinPosix(canonicalRoot, 'runtime', 'bin', 'dsh');
-  return resolvedDshPath === expected;
-}
-
-export interface UpdatePlanInput {
+export interface SharedUpdatePlanInput {
   distro: string;
   /** Exact published version to install. */
   targetVersion: string;
-  /** Version of the executable currently in use, `null` when unknown. */
-  installedVersion: string | null;
-  /** Path the launcher would actually execute inside the distribution. */
-  resolvedDshPath: string | null;
-  /** Absolute, symlink-resolved root WSL reported, `null` when isolation is off. */
-  canonicalRuntimeRoot: string | null;
-  /** Isolation must be enabled: a global installation is never replaced. */
-  isolationEnabled: boolean;
-  /** Configured root of the isolated environment (as written in Settings). */
-  runtimeRoot: string;
+  /** App data root used for the npm cache and the backup copy, `-` when off. */
+  appRoot: string;
+  /** What the inspection reported for the installation the launcher uses. */
+  installation: DshInstallation;
   /** True when the user pinned a custom executable in Settings. */
   customExecutable: boolean;
 }
 
-export interface UpdatePlan {
+export interface SharedUpdatePlan {
   distro: string;
+  appRoot: string;
   version: string;
   installedVersion: string;
-  /** Configured root, used for the script arguments. */
-  runtimeRoot: string;
-  /** Canonical root reported by WSL, used for ownership and the journal. */
-  canonicalRoot: string;
-  /** Canonical runtime directory that will be replaced. */
-  runtimeDir: string;
-  stagingRoot: string;
-  /** Filesystem location of the kept previous installation. */
-  previousPattern: string;
+  /** Executable the launcher runs (as resolved, may be a shim). */
+  dshPath: string;
+  /** `readlink -f` of that executable: the file npm really owns. */
+  realPath: string;
+  /** npm global prefix, verified by `npm prefix -g` inside the script. */
+  prefix: string;
+  packageDir: string;
+  npmPath: string;
+  /** Human-readable scope for the confirmation window. */
+  scope: string;
 }
 
-export type UpdatePlanResult = { ok: true; plan: UpdatePlan } | { ok: false; reason: string };
+export type SharedUpdatePlanResult =
+  | { ok: true; plan: SharedUpdatePlan }
+  | { ok: false; reason: string; detail: string | null };
 
 /** Stable reason codes are shown verbatim by the confirmation window. */
 export const UPDATE_REASONS = {
@@ -252,10 +253,15 @@ export const UPDATE_REASONS = {
   invalidVersion: 'invalid-version',
   sameOrOlder: 'not-newer',
   unknownInstalled: 'installed-unknown',
-  globalInstallation: 'global-installation',
+  missingInstallation: 'missing-installation',
   customExecutable: 'custom-executable',
-  unsafeRoot: 'unsafe-root',
+  unsupportedManager: 'unsupported-manager',
   foreignRuntime: 'foreign-runtime',
+  notWritable: 'not-writable',
+  foreignProcess: 'foreign-process',
+  noNpm: 'no-npm',
+  loginShellMismatch: 'login-shell-mismatch',
+  backupUnavailable: 'backup-unavailable',
 } as const;
 
 export function describeUpdateReason(reason: string): string {
@@ -268,54 +274,97 @@ export function describeUpdateReason(reason: string): string {
       return 'The published version is not newer than the installed one.';
     case UPDATE_REASONS.unknownInstalled:
       return 'The installed DeepSeek Harness version is unknown; start the backend once and retry.';
-    case UPDATE_REASONS.globalInstallation:
-      return 'Environment isolation is disabled, so an update would replace a global installation. Enable the isolated environment in Settings first.';
+    case UPDATE_REASONS.missingInstallation:
+      return 'No DeepSeek Harness executable was found in this WSL distribution.';
     case UPDATE_REASONS.customExecutable:
-      return 'A custom DeepSeek Harness executable is configured in Settings; the app never replaces it.';
-    case UPDATE_REASONS.unsafeRoot:
-      return 'The isolated runtime root is not a dedicated directory, so it is not updated.';
+      return 'A custom DeepSeek Harness executable is pinned in Settings. The app only updates the installation npm manages for your WSL user; clear the path in Settings to update in-app.';
+    case UPDATE_REASONS.unsupportedManager:
+      return 'This DeepSeek Harness installation is not managed by npm (for example pnpm, a distro package or a standalone binary), so the app will not modify it. Update it with the tool that installed it.';
     case UPDATE_REASONS.foreignRuntime:
-      return 'The executable in use is not exactly <root>/runtime/bin/dsh inside the isolated root, so there is nothing safe to replace.';
+      return 'The executable in use is not the one inside the reported npm package, so there is nothing this app can safely update.';
+    case UPDATE_REASONS.notWritable:
+      return 'The npm prefix of this installation is not writable without elevated rights. Run the update yourself with the command shown, or reinstall DeepSeek Harness for your user (npm prefix in your home directory). The app never uses sudo or UAC.';
+    case UPDATE_REASONS.foreignProcess:
+      return 'Another DeepSeek Harness process is running from this installation. Close it (including any `dsh web` started in a terminal) and try again: the app never stops processes it does not own.';
+    case UPDATE_REASONS.noNpm:
+      return 'npm was not found in this WSL distribution, so the installation cannot be updated from the app.';
+    case UPDATE_REASONS.loginShellMismatch:
+      return 'An ordinary WSL login shell does not resolve the same DeepSeek Harness executable this app runs (or cannot report its version), so updating would not change the CLI you use in a terminal. Make sure `bash -lc "command -v dsh"` prints the installation you expect, fix the PATH order in your shell profile, or clear a pinned path in Settings, then try again.';
+    case UPDATE_REASONS.backupUnavailable:
+      return 'The verified recovery snapshot could not be created, so nothing was changed. Check the free space and write access of the app data directory inside WSL and retry.';
     default:
       return 'This update cannot be started safely.';
   }
 }
 
+/** The npm command the user can run manually when the app refuses. */
+export function manualUpdateCommand(plan: { npmPath: string | null; prefix: string | null } | null, version: string): string {
+  const npm = plan?.npmPath ?? 'npm';
+  const prefix = plan?.prefix ?? null;
+  return prefix === null || prefix === ''
+    ? `${npm} install -g @deepseek-ai/dsh@${version}`
+    : `${npm} install -g --prefix ${prefix} @deepseek-ai/dsh@${version}`;
+}
+
 /**
- * Decide whether the isolated runtime may be replaced by `targetVersion`.
+ * Decide whether the shared installation may be updated to `targetVersion`.
  *
  * Every rejection is a safety decision, not a failure: the caller shows the
- * reason and stops before running anything inside WSL.
+ * reason and stops before running anything that writes inside WSL.
  */
-export function planUpdate(input: UpdatePlanInput): UpdatePlanResult {
-  if (!isExactVersion(input.targetVersion)) return { ok: false, reason: UPDATE_REASONS.invalidVersion };
-  if (!input.isolationEnabled) return { ok: false, reason: UPDATE_REASONS.globalInstallation };
-  if (input.customExecutable) return { ok: false, reason: UPDATE_REASONS.customExecutable };
-  if (!isValidIsolationRoot(input.runtimeRoot)) return { ok: false, reason: UPDATE_REASONS.unsafeRoot };
-  if (input.canonicalRuntimeRoot === null || !isNormalisedAbsolute(input.canonicalRuntimeRoot)) {
-    return { ok: false, reason: UPDATE_REASONS.unsafeRoot };
+export function planSharedUpdate(input: SharedUpdatePlanInput): SharedUpdatePlanResult {
+  const { installation } = input;
+  if (!isExactVersion(input.targetVersion)) return { ok: false, reason: UPDATE_REASONS.invalidVersion, detail: null };
+  if (input.customExecutable) return { ok: false, reason: UPDATE_REASONS.customExecutable, detail: installation.path };
+  if (installation.version === null || !isExactVersion(installation.version)) {
+    return { ok: false, reason: UPDATE_REASONS.unknownInstalled, detail: installation.path };
   }
-  if (input.installedVersion === null || !isExactVersion(input.installedVersion)) {
-    return { ok: false, reason: UPDATE_REASONS.unknownInstalled };
+  if (compareSemver(input.targetVersion, installation.version) <= 0) {
+    return { ok: false, reason: UPDATE_REASONS.sameOrOlder, detail: null };
   }
-  if (compareSemver(input.targetVersion, input.installedVersion) <= 0) {
-    return { ok: false, reason: UPDATE_REASONS.sameOrOlder };
+  if (installation.manager !== 'npm') {
+    return { ok: false, reason: UPDATE_REASONS.unsupportedManager, detail: `${installation.path} (${installation.manager})` };
   }
-  // The launcher must really be running the copy inside the isolated runtime.
-  if (!isExpectedRuntimePath(input.resolvedDshPath, input.canonicalRuntimeRoot)) {
-    return { ok: false, reason: UPDATE_REASONS.foreignRuntime };
+  if (
+    !isNpmGlobalInstallation(installation) ||
+    !isInsideDirectory(installation.realPath, installation.packageDir) ||
+    !isNormalisedAbsolutePath(installation.prefix) ||
+    !isNormalisedAbsolutePath(installation.realPath)
+  ) {
+    return { ok: false, reason: UPDATE_REASONS.foreignRuntime, detail: installation.realPath };
+  }
+  if (installation.npmPath === null) return { ok: false, reason: UPDATE_REASONS.noNpm, detail: null };
+  if (!installation.writable) {
+    return { ok: false, reason: UPDATE_REASONS.notWritable, detail: installation.prefix };
+  }
+  if (installation.foreignProcesses > 0) {
+    return { ok: false, reason: UPDATE_REASONS.foreignProcess, detail: `${installation.foreignProcesses}` };
+  }
+  // The product promise: the app runs, and updates, the executable a terminal
+  // runs. A login shell that resolves another file makes that impossible.
+  if (!loginShellAgrees(installation)) {
+    return {
+      ok: false,
+      reason: UPDATE_REASONS.loginShellMismatch,
+      detail:
+        installation.loginShellRealPath === null
+          ? 'a login shell does not resolve dsh at all'
+          : `${installation.loginShellRealPath} (${installation.loginShellVersion ?? 'no version'})`,
+    };
   }
   return {
     ok: true,
     plan: {
       distro: input.distro,
+      appRoot: input.appRoot,
       version: input.targetVersion,
-      installedVersion: input.installedVersion,
-      runtimeRoot: input.runtimeRoot,
-      canonicalRoot: input.canonicalRuntimeRoot,
-      runtimeDir: joinPosix(input.canonicalRuntimeRoot, 'runtime'),
-      stagingRoot: joinPosix(input.canonicalRuntimeRoot, 'update'),
-      previousPattern: joinPosix(input.canonicalRuntimeRoot, 'update', 'previous-<timestamp>'),
+      installedVersion: installation.version,
+      dshPath: installation.path,
+      realPath: installation.realPath,
+      prefix: installation.prefix ?? '',
+      packageDir: installation.packageDir ?? '',
+      npmPath: installation.npmPath,
+      scope: describeInstallScope(installation.prefix),
     },
   };
 }
@@ -351,8 +400,8 @@ export function createUpdateState(now: string): UpdateState {
 
 /** Line prefixes the updater script uses to announce its own steps. */
 const STEP_MARKERS: { prefix: string; phase: UpdatePhase }[] = [
+  { prefix: 'update: installing', phase: 'installing' },
   { prefix: 'update: verifying', phase: 'verifying' },
-  { prefix: 'update: activating', phase: 'activating' },
 ];
 
 /** Map an updater line to a phase, `null` when the line is plain output. */
@@ -366,20 +415,50 @@ export function phaseFromUpdateLine(line: string): UpdatePhase | null {
 // --- transaction journal ---------------------------------------------------
 
 /**
- * Where an update was when the app last looked. Written before the swap, so a
- * crash or a forced quit between the two renames can be repaired on the next
- * start instead of leaving no runtime at all.
+ * Where an update was when the app last looked.
+ *
+ * The journal is written **before** the shared installation is touched, so a
+ * crash, a forced quit or a killed npm cannot leave the app guessing on the next
+ * start. Version 2 describes a shared npm installation (issue #17); version 1 is
+ * the retired private-runtime swap and is only read, never written, so a profile
+ * written by an older build is handled explicitly instead of being ignored.
  */
-export type UpdateJournalPhase = 'staging' | 'activating' | 'verifying-backend';
+export type UpdateJournalPhase = 'updating' | 'verifying';
 
-export interface UpdateJournal {
-  version: 1;
+export interface UpdateJournalV2 {
+  version: 2;
+  kind: 'npm-global';
   transaction: string;
   phase: UpdateJournalPhase;
   distro: string;
-  /** Configured root, so a changed setting is noticed instead of guessed. */
+  /** Executable the launcher uses. */
+  dshPath: string;
+  /** `readlink -f` of that executable. */
+  realPath: string;
+  prefix: string;
+  packageDir: string;
+  /** App data root inside the distribution (`-` when isolation is off). */
+  appRoot: string;
+  /** npm used for the update, needed to restore after an interruption. */
+  npmPath: string;
+  /**
+   * Verified offline recovery snapshot created before the installation changed.
+   * Recovery restores from it without asking the registry for anything.
+   */
+  backupDir: string;
+  target: string;
+  installed: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
+/** Journal written by the retired isolated-runtime updater (issue #12). */
+export interface LegacyUpdateJournalV1 {
+  version: 1;
+  transaction: string;
+  phase: 'staging' | 'activating' | 'verifying-backend';
+  distro: string;
   runtimeRoot: string;
-  /** Canonical root the scripts worked in. */
   canonicalRoot: string;
   target: string;
   installed: string;
@@ -387,7 +466,10 @@ export interface UpdateJournal {
   updatedAt: string;
 }
 
-const JOURNAL_PHASES: UpdateJournalPhase[] = ['staging', 'activating', 'verifying-backend'];
+export type UpdateJournal = UpdateJournalV2 | LegacyUpdateJournalV1;
+
+const JOURNAL_PHASES: UpdateJournalPhase[] = ['updating', 'verifying'];
+const LEGACY_PHASES: LegacyUpdateJournalV1['phase'][] = ['staging', 'activating', 'verifying-backend'];
 const TRANSACTION_ID = /^[0-9A-Za-z][0-9A-Za-z-]{7,31}$/;
 
 /** A transaction id that is safe both as a path segment and as an argv value. */
@@ -401,38 +483,110 @@ export function isValidTransactionId(value: unknown): value is string {
   return typeof value === 'string' && TRANSACTION_ID.test(value);
 }
 
+function requiredString(value: Record<string, unknown>, key: string): string | null {
+  const field = value[key];
+  return typeof field === 'string' && field.length > 0 && field.length <= 4096 ? field : null;
+}
+
 /** Validate a journal read back from disk; anything odd means "no journal". */
 export function parseUpdateJournal(raw: unknown): UpdateJournal | null {
   if (raw === null || typeof raw !== 'object') return null;
   const value = raw as Record<string, unknown>;
-  const fields = ['transaction', 'distro', 'runtimeRoot', 'canonicalRoot', 'target', 'installed', 'startedAt', 'updatedAt'];
-  for (const field of fields) {
-    if (typeof value[field] !== 'string' || (value[field] as string).length === 0) return null;
+  const transaction = requiredString(value, 'transaction');
+  const distro = requiredString(value, 'distro');
+  const target = requiredString(value, 'target');
+  const installed = requiredString(value, 'installed');
+  const startedAt = requiredString(value, 'startedAt');
+  const updatedAt = requiredString(value, 'updatedAt');
+  if (
+    transaction === null ||
+    distro === null ||
+    target === null ||
+    installed === null ||
+    startedAt === null ||
+    updatedAt === null ||
+    !isValidTransactionId(transaction) ||
+    !isExactVersion(target) ||
+    !isExactVersion(installed)
+  ) {
+    return null;
   }
-  if (value.version !== 1) return null;
-  if (!JOURNAL_PHASES.includes(value.phase as UpdateJournalPhase)) return null;
-  if (!isValidTransactionId(value.transaction)) return null;
-  if (!isExactVersion(value.target) || !isExactVersion(value.installed)) return null;
-  if (!isNormalisedAbsolute(value.canonicalRoot as string)) return null;
-  return {
-    version: 1,
-    transaction: value.transaction as string,
-    phase: value.phase as UpdateJournalPhase,
-    distro: value.distro as string,
-    runtimeRoot: value.runtimeRoot as string,
-    canonicalRoot: value.canonicalRoot as string,
-    target: value.target as string,
-    installed: value.installed as string,
-    startedAt: value.startedAt as string,
-    updatedAt: value.updatedAt as string,
-  };
+
+  if (value.version === 2) {
+    const dshPath = requiredString(value, 'dshPath');
+    const realPath = requiredString(value, 'realPath');
+    const prefix = requiredString(value, 'prefix');
+    const packageDir = requiredString(value, 'packageDir');
+    const appRoot = requiredString(value, 'appRoot');
+    const npmPath = requiredString(value, 'npmPath');
+    const backupDir = requiredString(value, 'backupDir');
+    if (value.kind !== 'npm-global') return null;
+    if (!JOURNAL_PHASES.includes(value.phase as UpdateJournalPhase)) return null;
+    if (
+      dshPath === null ||
+      realPath === null ||
+      prefix === null ||
+      packageDir === null ||
+      appRoot === null ||
+      npmPath === null ||
+      backupDir === null ||
+      !isNormalisedAbsolutePath(npmPath) ||
+      !isNormalisedAbsolutePath(backupDir) ||
+      (appRoot !== '-' && !isNormalisedAbsolutePath(appRoot)) ||
+      !isNormalisedAbsolutePath(dshPath) ||
+      !isNormalisedAbsolutePath(realPath) ||
+      !isNormalisedAbsolutePath(prefix) ||
+      !isNormalisedAbsolutePath(packageDir)
+    ) {
+      return null;
+    }
+    return {
+      version: 2,
+      kind: 'npm-global',
+      transaction,
+      phase: value.phase as UpdateJournalPhase,
+      distro,
+      dshPath,
+      realPath,
+      prefix,
+      packageDir,
+      appRoot,
+      npmPath,
+      backupDir,
+      target,
+      installed,
+      startedAt,
+      updatedAt,
+    };
+  }
+
+  if (value.version === 1) {
+    const runtimeRoot = requiredString(value, 'runtimeRoot');
+    const canonicalRoot = requiredString(value, 'canonicalRoot');
+    if (!LEGACY_PHASES.includes(value.phase as LegacyUpdateJournalV1['phase'])) return null;
+    if (runtimeRoot === null || canonicalRoot === null || !isNormalisedAbsolutePath(canonicalRoot)) return null;
+    return {
+      version: 1,
+      transaction,
+      phase: value.phase as LegacyUpdateJournalV1['phase'],
+      distro,
+      runtimeRoot,
+      canonicalRoot,
+      target,
+      installed,
+      startedAt,
+      updatedAt,
+    };
+  }
+
+  return null;
 }
 
 /**
  * The journal file exists but cannot be used.
  *
  * A missing file is a normal start; an unreadable or corrupt file is not: the app
- * cannot know whether a swap happened, so it must not start anything.
+ * cannot know whether an install happened, so it must not start anything.
  */
 export class UpdateJournalError extends Error {
   constructor(
@@ -452,81 +606,73 @@ export class UpdateJournalError extends Error {
  *
  * `read()` returns `null` **only** when there is no journal at all. A file that
  * exists but cannot be read or validated throws `UpdateJournalError`: treating
- * that as "nothing happened" would start DeepSeek Harness on top of a runtime
- * whose state is unknown.
+ * that as "nothing happened" would start DeepSeek Harness on top of an
+ * installation whose state is unknown.
  */
 export interface UpdateJournalStore {
   read(): UpdateJournal | null;
-  write(journal: UpdateJournal): void;
+  write(journal: UpdateJournalV2): void;
   clear(): void;
 }
 
-/** What the distribution currently looks like, as `INSPECT_SCRIPT` reported it. */
-export interface RuntimeObservation {
-  runtimePresent: boolean;
-  /** Version reported by `<root>/runtime/bin/dsh`, `null` when missing. */
-  runtimeVersion: string | null;
-  /** Directory name of a kept previous installation, `null` when none. */
-  previous: string | null;
-  /** Directory name of a staged installation, `null` when none. */
-  stage: string | null;
+/** What the shared installation looks like now, as the inspection reported it. */
+export interface SharedInstallObservation {
+  /** The executable still exists and is executable. */
+  present: boolean;
+  /** Version it reports, `null` when unknown. */
+  version: string | null;
+  /** Real path it resolves to, `null` when missing. */
+  realPath: string | null;
 }
 
 /**
  * What to do about a journal that outlived its update.
  *
- * - `finalize`: the new runtime is active and reports the target version, so
+ * - `finalize`: the shared installation already reports the target version, so
  *   the update really finished before the app died — keep it.
- * - `abandon`: the runtime still reports the version from before the update
- *   (only staging happened) — nothing to undo, just forget the journal.
- * - `rollback`: the new runtime is missing or wrong while the previous install
- *   is still there — restore it and start the old backend.
+ * - `abandon`: it still reports the version from before the update — nothing was
+ *   changed (or the restore already ran), so forget the record.
+ * - `rollback`: it reports something else, or is missing while npm still can
+ *   reinstall the previous version — restore the previous exact version.
  * - `blocked`: nothing can be restored safely; the caller must not start
  *   anything and has to explain the state instead of guessing.
  */
-export type RecoveryAction = 'finalize' | 'rollback' | 'abandon' | 'blocked';
+export type RecoveryAction = 'finalize' | 'rollback' | 'abandon' | 'blocked' | 'legacy';
 
 export interface RecoveryDecision {
   action: RecoveryAction;
   reason: string;
 }
 
-export function decideRecovery(journal: UpdateJournal, observation: RuntimeObservation): RecoveryDecision {
-  const sameTarget = isSameVersion(observation.runtimeVersion, journal.target);
-  const previousName = observation.previous;
-
-  if (observation.runtimePresent && isSameVersion(observation.runtimeVersion, journal.installed)) {
+export function decideRecovery(
+  journal: UpdateJournal,
+  observation: SharedInstallObservation,
+): RecoveryDecision {
+  if (journal.version === 1) {
     return {
-      action: 'abandon',
-      reason: `the runtime still reports ${journal.installed}, so the update never replaced it`,
+      action: 'legacy',
+      reason: 'the journal describes the retired private runtime, which this build no longer starts',
     };
   }
-  if (observation.runtimePresent && sameTarget) {
-    return {
-      action: 'finalize',
-      reason: `the activated runtime already reports ${journal.target}`,
-    };
+  if (observation.present && isSameVersion(observation.version, journal.target)) {
+    // The target version must also be the file the plan approved: a target
+    // version that appeared at another path is not the update that was started.
+    if (observation.realPath !== null && observation.realPath !== journal.realPath) {
+      return {
+        action: 'rollback',
+        reason: `the installation reports ${journal.target} but resolves to ${observation.realPath} instead of ${journal.realPath}`,
+      };
+    }
+    return { action: 'finalize', reason: `the installation already reports ${journal.target}` };
   }
-  if (observation.runtimePresent && !sameTarget && previousName !== null) {
-    return {
-      action: 'rollback',
-      reason: `the active runtime reports ${observation.runtimeVersion ?? 'no version'}, previous installation ${previousName} is available`,
-    };
+  if (observation.present && isSameVersion(observation.version, journal.installed)) {
+    return { action: 'abandon', reason: `the installation still reports ${journal.installed}` };
   }
-  if (!observation.runtimePresent && previousName !== null) {
-    return {
-      action: 'rollback',
-      reason: `the runtime is missing, previous installation ${previousName} is available`,
-    };
-  }
-  if (!observation.runtimePresent && previousName === null && observation.stage !== null) {
+  if (observation.present) {
     return {
       action: 'rollback',
-      reason: `the runtime is missing and only the staged installation ${observation.stage} exists`,
+      reason: `the installation reports ${observation.version ?? 'an unknown version'}, expected ${journal.target} or ${journal.installed}`,
     };
   }
-  return {
-    action: 'blocked',
-    reason: `the runtime is ${observation.runtimePresent ? `at ${observation.runtimeVersion ?? 'an unknown version'}` : 'missing'} and no previous installation can be restored`,
-  };
+  return { action: 'rollback', reason: 'the installation is missing, so the previous version is reinstalled' };
 }

@@ -1,16 +1,21 @@
 /**
- * Recovery for an interrupted update (issue #12).
+ * Recovery for an interrupted update (issues #12 and #17).
  *
- * The swap replaces `runtime/` with the staged tree in two renames. If the app,
- * the process or Windows dies between them, the next start has to know what
- * happened instead of guessing:
+ * The update now changes the **shared** DeepSeek Harness installation in WSL: npm
+ * replaces the package below the reported prefix. If the app, the process or
+ * Windows dies while npm works, the next start has to know what happened instead
+ * of guessing:
  *
- * - a journal is written to the app profile *before* the swap and removed after
- *   the update really finished (or was rolled back);
- * - on start, the journal plus a read-only inspection of the isolated root decide
- *   between `finalize` (the new runtime is already active and correct),
- *   `rollback` (restore the kept previous installation) and `blocked` (nothing can
- *   be restored safely — the app must not start anything).
+ * - a journal is written to the app profile *before* the installation is touched
+ *   and removed after the update really finished (or was rolled back);
+ * - on start, the journal plus a read-only inspection of the executable decide
+ *   between `finalize` (the installation already reports the target version),
+ *   `abandon` (it still reports the previous one — nothing was changed),
+ *   `rollback` (reinstall the previous exact version) and `blocked` (nothing can
+ *   be restored safely — the app must not start anything);
+ * - a journal written by the retired private-runtime updater (version 1) is
+ *   handled explicitly: that copy is no longer started, so the record is cleared
+ *   with a visible note instead of being silently ignored or misapplied.
  *
  * The decision itself is pure (`decideRecovery` in `update.ts`); this module adds
  * the file-backed journal and the small orchestration around it.
@@ -23,15 +28,16 @@ import {
   UpdateJournalError,
   decideRecovery,
   parseUpdateJournal,
-  type RuntimeObservation,
+  type SharedInstallObservation,
   type UpdateJournal,
   type UpdateJournalStore,
+  type UpdateJournalV2,
 } from './update.js';
 
 export interface UpdateRecoveryResult {
   /** True when a journal was found and something was done about it. */
   handled: boolean;
-  action: 'finalize' | 'rollback' | 'abandon' | 'blocked' | null;
+  action: 'finalize' | 'rollback' | 'abandon' | 'blocked' | 'legacy' | null;
   message: string | null;
 }
 
@@ -52,15 +58,15 @@ function detailOf(error: unknown): string {
 /**
  * Journal persisted as JSON in the app profile.
  *
- * `write()` is deliberately fail-loud: the caller must not replace a runtime it
- * cannot repair after a crash. The content is flushed, renamed into place and
- * read back, so a full or read-only profile stops the update instead of leaving
- * a silent gap.
+ * `write()` is deliberately fail-loud: the caller must not change an installation
+ * it cannot repair after a crash. The content is flushed, renamed into place and
+ * read back, so a full or read-only profile stops the update instead of leaving a
+ * silent gap.
  *
  * `read()` distinguishes the three states a profile can be in: no journal (a
  * normal start), a valid journal (repair it) and a journal that exists but is
  * corrupt or unreadable — that last one throws, because ignoring it would start
- * the backend on a runtime nobody can vouch for.
+ * the backend on an installation nobody can vouch for.
  */
 export function createJournalStore(path: string, log: Logger): UpdateJournalStore {
   return {
@@ -113,11 +119,12 @@ export function createJournalStore(path: string, log: Logger): UpdateJournalStor
       }
       return journal;
     },
-    write(journal: UpdateJournal): void {
+    write(journal: UpdateJournalV2): void {
       const directory = dirname(path);
       const temporary = `${path}.tmp`;
       // Errors are not swallowed: the updater must stop before it touches the
-      // runtime when its recovery record cannot be stored.
+      // installation when its recovery record cannot be stored.
+
       mkdirSync(directory, { recursive: true });
       const descriptor = openSync(temporary, 'w');
       try {
@@ -143,7 +150,12 @@ export function createJournalStore(path: string, log: Logger): UpdateJournalStor
       // Read the record back: only a journal that can be parsed again protects
       // the next start, so a write that produced anything else is a failure.
       const persisted = parseUpdateJournal(JSON.parse(readFileSync(path, 'utf8')) as unknown);
-      if (persisted === null || persisted.transaction !== journal.transaction || persisted.phase !== journal.phase) {
+      if (
+        persisted === null ||
+        persisted.version !== 2 ||
+        persisted.transaction !== journal.transaction ||
+        persisted.phase !== journal.phase
+      ) {
         throw new Error('the update journal could not be verified after writing');
       }
       log.info(`update journal written (tx=${journal.transaction}, phase=${journal.phase})`);
@@ -159,19 +171,19 @@ export function createJournalStore(path: string, log: Logger): UpdateJournalStor
 }
 
 export interface UpdateRecoveryDeps {
-  wsl: Pick<WslGateway, 'inspectRuntime' | 'restoreRuntime'>;
+  wsl: Pick<WslGateway, 'inspectSharedDsh' | 'rollbackSharedDsh'>;
   journal: UpdateJournalStore;
-  /** Start the backend from whatever runtime is active after the repair. */
+  /** Start the backend from whatever installation is active after the repair. */
   resume: () => Promise<UpdateTransition>;
   log: Logger;
 }
 
 /**
- * Repair an update that was interrupted after the staging step.
+ * Repair an update that was interrupted while the shared installation changed.
  *
  * Called once at start-up, before the normal backend start: if a journal exists,
- * the isolated root is inspected and either the new runtime is accepted (it is
- * already active and correct) or the previous installation is restored. The
+ * the executable is inspected and either the new version is accepted (it is
+ * already active and correct) or the previous exact version is reinstalled. The
  * backend is then started, so a completed update does not need a second restart
  * and a rollback comes back with a working WebUI.
  */
@@ -192,15 +204,42 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
   if (journal === null) return { handled: false, action: null, message: null };
 
   deps.log.warn(
-    `update recovery: journal found (tx=${journal.transaction}, phase=${journal.phase}, target=${journal.target})`,
+    `update recovery: journal found (v${journal.version}, tx=${journal.transaction}, target=${journal.target})`,
   );
 
-  let observation: RuntimeObservation;
+  if (journal.version === 1) {
+    // The private runtime this record describes is not started by this build.
+    // Clearing the record is safe; pretending to repair a tree nobody runs is not.
+    deps.journal.clear();
+    const message =
+      'An update journal from an older version of DSH WSL was found. It described the retired app-private DeepSeek Harness runtime, which this version no longer starts: the record was cleared and DeepSeek Harness from your WSL installation was started.';
+    deps.log.info('update recovery: legacy journal cleared');
+    const resumed = await deps.resume();
+    return { handled: true, action: 'legacy', message: resumed.ok ? message : (resumed.message ?? message) };
+  }
+
+  const inspect = async (): Promise<SharedInstallObservation> => {
+    const report = await deps.wsl.inspectSharedDsh({
+      distro: journal.distro,
+      appRoot: journal.appRoot,
+      dshPath: journal.dshPath,
+      nodePath: null,
+      ownPid: null,
+    });
+    const installation = report.installation;
+    return {
+      present: installation !== null,
+      version: installation?.version ?? null,
+      realPath: installation?.realPath ?? null,
+    };
+  };
+
+  let observation: SharedInstallObservation;
   try {
-    observation = await deps.wsl.inspectRuntime(journal.distro, journal.runtimeRoot);
+    observation = await inspect();
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown error';
-    deps.log.error(`update recovery: inspecting the isolated root failed (${message})`);
+    deps.log.error(`update recovery: inspecting the installation failed (${message})`);
     // Keep the journal: the state is unknown, so the next start retries.
     return {
       handled: true,
@@ -213,8 +252,7 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
   deps.log.info(`update recovery: ${decision.action} (${decision.reason})`);
 
   if (decision.action === 'abandon') {
-    // Only staging happened: the runtime was never replaced, so there is nothing
-    // to undo. The staged tree stays for a later attempt and is reused by name.
+    // Nothing was changed: forget the record and continue with the normal start.
     deps.journal.clear();
     const resumed = await deps.resume();
     return {
@@ -227,84 +265,75 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
   if (decision.action === 'finalize') {
     const resumed = await deps.resume();
     if (resumed.ok) {
-      // Proven: the new runtime is active and serves the WebUI.
+      // Proven: the new version is active and serves the WebUI.
       deps.journal.clear();
       return { handled: true, action: 'finalize', message: null };
     }
-    // The new runtime is in place but does not serve: restore the previous one and
-    // keep the journal until that is proven as well.
+    // The new version is installed but does not serve: restore the previous one
+    // and keep the journal until that is proven as well.
     deps.log.warn(`update recovery: the updated version did not start (${resumed.message ?? 'unknown'})`);
-    const fallback = await deps.wsl
-      .restoreRuntime(
-        {
-          distro: journal.distro,
-          isolationRoot: journal.runtimeRoot,
-          transaction: journal.transaction,
-          nodePath: null,
-        },
-        (line) => deps.log.info(`update recovery: ${line}`),
-      )
-      .catch((error: unknown) => ({ code: null, tail: error instanceof Error ? error.message : 'unknown' }));
-    if (fallback.code !== 0) {
-      return {
-        handled: true,
-        action: 'blocked',
-        message: `The updated version did not start (${resumed.message ?? 'unknown error'}) and the previous installation could not be restored (${fallback.tail}). The journal was kept.`,
-      };
-    }
-    const recovered = await deps.resume();
-    if (!recovered.ok) {
-      return {
-        handled: true,
-        action: 'blocked',
-        message: `The previous installation was restored, but its backend did not start (${recovered.message ?? 'unknown error'}). The journal was kept.`,
-      };
-    }
-    deps.journal.clear();
+    return await restore(deps, journal, `The updated version did not start (${resumed.message ?? 'unknown error'}).`);
+  }
+
+  return await restore(
+    deps,
+    journal,
+    decision.action === 'blocked'
+      ? `An interrupted update left the installation in an unknown state: ${decision.reason}.`
+      : `An interrupted update left ${observation.version ?? 'no version'} installed instead of ${journal.target}.`,
+  );
+}
+
+/** Reinstall the previous exact version, then prove that its backend starts. */
+async function restore(
+  deps: UpdateRecoveryDeps,
+  journal: UpdateJournalV2,
+  reason: string,
+): Promise<UpdateRecoveryResult> {
+  const restored = await deps.wsl
+    .rollbackSharedDsh(
+      {
+        distro: journal.distro,
+        appRoot: journal.appRoot,
+        prefix: journal.prefix,
+        packageDir: journal.packageDir,
+        dshPath: journal.dshPath,
+        realPath: journal.realPath,
+        npmPath: journal.npmPath,
+        nodePath: null,
+        snapshotDir: journal.backupDir,
+      },
+      journal.installed,
+      journal.transaction,
+      (line) => deps.log.info(`update recovery: ${line}`),
+    )
+    .catch((error: unknown) => ({
+      code: null,
+      tail: error instanceof Error ? error.message : 'unknown error',
+    }));
+
+  if (restored.code !== 0) {
     return {
       handled: true,
-      action: 'rollback',
-      message: `The updated version did not start (${resumed.message ?? 'unknown error'}); the previous installation was restored and is running again.`,
+      action: 'blocked',
+      message: `${reason} The previous version ${journal.installed} could not be restored from the verified snapshot at ${journal.backupDir} (${restored.tail}). The journal was kept. Restore that directory over ${journal.packageDir} inside WSL, or run "npm install -g --prefix ${journal.prefix} @deepseek-ai/dsh@${journal.installed}", then start DSH WSL again.`,
     };
   }
 
-  if (decision.action === 'rollback') {
-    const restored = await deps.wsl
-      .restoreRuntime(
-        {
-          distro: journal.distro,
-          isolationRoot: journal.runtimeRoot,
-          transaction: journal.transaction,
-          nodePath: null,
-        },
-        (line) => deps.log.info(`update recovery: ${line}`),
-      )
-      .catch((error: unknown) => ({ code: null, tail: error instanceof Error ? error.message : 'unknown' }));
-    if (restored.code !== 0) {
-      // Keep the journal so a later start can try again, and do not start a
-      // backend whose runtime may be the half-swapped tree.
-      return {
-        handled: true,
-        action: 'blocked',
-        message: `The previous installation could not be restored: ${restored.tail}`,
-      };
-    }
-    const resumed = await deps.resume();
-    if (!resumed.ok) {
-      // Keep the record: the next start must be able to try again.
-      return {
-        handled: true,
-        action: 'blocked',
-        message: `The previous installation was restored, but its backend did not start (${resumed.message ?? 'unknown error'}). The journal was kept.`,
-      };
-    }
-    deps.journal.clear();
-    return { handled: true, action: 'rollback', message: null };
+  const resumed = await deps.resume();
+  if (!resumed.ok) {
+    // Keep the record: the next start must be able to try again.
+    return {
+      handled: true,
+      action: 'blocked',
+      message: `${reason} The previous version was restored, but its backend did not start (${resumed.message ?? 'unknown error'}). The journal was kept.`,
+    };
   }
 
+  deps.journal.clear();
   return {
     handled: true,
-    action: 'blocked',
-    message: `An interrupted update left no usable runtime: ${decision.reason}. Reinstall DeepSeek Harness into the isolated runtime, or restore it from ${journal.canonicalRoot}/update.`,
+    action: 'rollback',
+    message: `${reason} The previous version ${journal.installed} was reinstalled and is running again.`,
   };
 }
