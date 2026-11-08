@@ -15,7 +15,7 @@ import { verifyOwnership, type OwnedServerRecord } from './ownership.js';
 import { classifyPortSituation, type PortState } from './port.js';
 import { sanitizeOptional } from './display.js';
 import { buildIsolationPlan, isolationRootArg, resolveLaunchWorkspace, type IsolationPlan } from './isolation.js';
-import type { RuntimeObservation } from './update.js';
+import type { SharedDshReport } from './dsh-locate.js';
 
 export interface ExitInfo {
   code: number | null;
@@ -51,10 +51,16 @@ export interface ResolvedRuntime {
   nodePath: string | null;
   /**
    * Canonical (symlink-resolved) isolation root reported by WSL, `null` when the
-   * backend was resolved without isolation. The updater compares the executable
-   * path against exactly this root (issue #12).
+   * backend was resolved without isolation. It is where the isolated **data**
+   * lives (issue #17); the executable is not inside it.
    */
   canonicalRoot?: string | null;
+  /** `readlink -f` of `dshPath`, `null` when it could not be resolved. */
+  realPath?: string | null;
+  /** Where the executable was found (login shell, PATH, fallback, custom). */
+  source?: 'login-shell' | 'path' | 'fallback' | 'custom' | null;
+  /** True when an older private `<root>/runtime/bin/dsh` still exists. */
+  legacyRuntimePresent?: boolean;
 }
 
 /** Result of the read-only "does this exact version exist on npm" check. */
@@ -68,22 +74,44 @@ export interface NpmVersionCheck {
   message: string | null;
 }
 
-/** One streaming update step inside the distribution. */
-export interface UpdateRunRequest {
+/** One streaming update step of the shared installation. */
+export interface SharedUpdateRunRequest {
   distro: string;
-  isolationRoot: string;
-  version: string;
-  nodePath: string | null;
+  /** App data root inside the distribution (`-` when isolation is off). */
+  appRoot: string;
+  /** npm global prefix reported by the inspection. */
+  prefix: string;
+  /** Package directory of the installation. */
+  packageDir: string;
+  /** Executable the launcher uses. */
+  dshPath: string;
   npmPath: string;
-  /** Transaction id shared by stage/activate/restore and the journal. */
+  nodePath: string | null;
+  /** Transaction id shared by the update, the rollback and the journal. */
   transaction: string;
+  version: string;
+  installedVersion: string;
+  /** PID of the app-owned backend, excluded from the foreign-process scan. */
+  ownPid: number | null;
 }
 
-export interface UpdateRestoreRequest {
+export interface SharedRollbackRequest {
   distro: string;
-  isolationRoot: string;
-  transaction: string;
+  appRoot: string;
+  prefix: string;
+  packageDir: string;
+  dshPath: string;
+  npmPath: string;
   nodePath: string | null;
+}
+
+export interface InspectSharedRequest {
+  distro: string;
+  appRoot: string;
+  /** Executable to inspect, `null` lets the script resolve the distribution's one. */
+  dshPath: string | null;
+  nodePath: string | null;
+  ownPid: number | null;
 }
 
 export interface UpdateRunResult {
@@ -96,9 +124,9 @@ export interface WslGateway {
   listDistros(): Promise<string[]>;
   /** Any `wsl.exe` invocation starts a stopped distribution. */
   ensureDistro(distro: string): Promise<void>;
-  /** Resolve `dsh` and `node` inside the distribution (read-only). */
+  /** Resolve the distribution's own `dsh` and `node` (read-only). */
   resolveRuntime(distro: string, override: string | null, isolationRoot: string | null): Promise<ResolvedRuntime>;
-  /** Create the isolated environment directories below the validated root. */
+  /** Create the isolated data directories below the validated root. */
   prepareIsolation(distro: string, root: string): Promise<void>;
   startServer(request: StartServerRequest): ServerHandle;
   probeProcess(distro: string, pid: number): Promise<ProcessProbe | null>;
@@ -108,18 +136,21 @@ export interface WslGateway {
   /** Read-only npm lookup for the exact version the update would install. */
   checkPublishedVersion(request: {
     distro: string;
-    isolationRoot: string;
+    appRoot: string;
     version: string;
     nodePath: string | null;
   }): Promise<NpmVersionCheck>;
-  /** Install the exact version into a staging prefix, streaming output. */
-  stageRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
-  /** Swap the staged tree into `runtime/`, keeping the previous installation. */
-  activateRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
-  /** Restore `update/previous-<tx>` (failure path and journal recovery). */
-  restoreRuntime(request: UpdateRestoreRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
-  /** Read-only state of the isolated root, used to decide journal recovery. */
-  inspectRuntime(distro: string, isolationRoot: string): Promise<RuntimeObservation>;
+  /** Read-only provenance report of the installation the launcher uses. */
+  inspectSharedDsh(request: InspectSharedRequest): Promise<SharedDshReport>;
+  /** Update the shared installation, streaming npm output. */
+  updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
+  /** Reinstall the previous exact version (failure path and journal recovery). */
+  rollbackSharedDsh(
+    request: SharedRollbackRequest,
+    version: string,
+    transaction: string,
+    onLine: (line: string) => void,
+  ): Promise<UpdateRunResult>;
 }
 
 /** Result of pausing or resuming the supervisor around an update. */
@@ -223,6 +254,17 @@ export class Supervisor {
       this.status = this.buildStatus(state, this.detail);
       this.deps.publish(this.status);
     });
+  }
+
+  /**
+   * PID of the app-owned backend, `null` when nothing is owned.
+   *
+   * The updater excludes exactly this process from the "another DSH process uses
+   * this installation" check, so the app never has to stop anything it does not
+   * own and never mistakes its own backend for a foreign one.
+   */
+  ownedPid(): number | null {
+    return this.owned ? this.serverPid : null;
   }
 
   getStatus(): ShellStatus {

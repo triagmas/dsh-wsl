@@ -178,8 +178,10 @@ describe('launcher environment', () => {
     ]) {
       expect(START_WRAPPER_SCRIPT).toContain(line);
     }
-    // The isolated runtime always wins the PATH prefix.
-    expect(START_WRAPPER_SCRIPT).toContain('export PATH="$iroot/runtime/bin:$(dirname "$node"):$PATH"');
+    // Only the resolved Node.js directory is prepended: the backend must run the
+    // distribution's own `dsh`, not an app-private copy (issue #17).
+    expect(START_WRAPPER_SCRIPT).toContain('export PATH="$(dirname "$node"):$PATH"');
+    expect(START_WRAPPER_SCRIPT).not.toContain('runtime/bin');
   });
 
   it('re-validates the root before exporting anything', () => {
@@ -250,7 +252,9 @@ describe('launcher environment', () => {
 
 describe('environment preparation', () => {
   it('creates only the directories of the plan and nothing else', () => {
-    expect(PREPARE_ISOLATION_SCRIPT).toContain('for d in runtime/bin dsh-home agents cache tmp workspace; do');
+    expect(PREPARE_ISOLATION_SCRIPT).toContain('for d in dsh-home agents cache tmp workspace update; do');
+    // No private runtime is created any more (issue #17).
+    expect(PREPARE_ISOLATION_SCRIPT).not.toContain('runtime/bin');
     expect(PREPARE_ISOLATION_SCRIPT).toContain('umask 077');
     expect(PREPARE_ISOLATION_SCRIPT).not.toMatch(/\b(apt|dpkg|npm|pnpm|pip|curl|wget|rm|mv|cp|chmod|chown)\b/);
     expect(PREPARE_ISOLATION_SCRIPT).not.toContain('sudo');
@@ -272,40 +276,54 @@ describe('environment preparation', () => {
     }
   });
 
-  it('resolves dsh/node read-only and prefers the isolated runtime', () => {
+  it("resolves the distribution's own dsh, never a private copy", () => {
     const argv = buildResolveRuntimeArgs('Ubuntu', ROOT);
     expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', RESOLVE_RUNTIME_SCRIPT]);
-    expect(argv.slice(-2)).toEqual([SCRIPT_ARGV0, ROOT]);
-    const isolatedIndex = RESOLVE_RUNTIME_SCRIPT.indexOf('runtime/bin/dsh');
-    const systemIndex = RESOLVE_RUNTIME_SCRIPT.indexOf('/usr/local/bin/dsh');
-    expect(isolatedIndex).toBeGreaterThan(-1);
-    expect(isolatedIndex).toBeLessThan(systemIndex);
+    expect(argv.slice(-3)).toEqual([SCRIPT_ARGV0, ROOT, '-']);
+    // The login-shell lookup comes first: it is what an ordinary terminal does.
+    const loginIndex = RESOLVE_RUNTIME_SCRIPT.indexOf('bash -lc "command -v dsh"');
+    const fallbackIndex = RESOLVE_RUNTIME_SCRIPT.indexOf('"$HOME/.local/bin/dsh"');
+    expect(loginIndex).toBeGreaterThan(-1);
+    expect(loginIndex).toBeLessThan(fallbackIndex);
+    // The retired private runtime is only reported, never selected.
+    expect(RESOLVE_RUNTIME_SCRIPT).not.toContain('runtime/bin/dsh" ]; then dsh=');
+    expect(RESOLVE_RUNTIME_SCRIPT).toContain('legacy=');
     expect(RESOLVE_RUNTIME_SCRIPT).not.toMatch(/\b(apt|apt-get|dpkg|curl|wget|pnpm)\b/);
     expect(RESOLVE_RUNTIME_SCRIPT).not.toMatch(/npm\s+(i|in|install|add)\b/);
   });
 
+  it('passes a pinned executable as its own argument', () => {
+    const argv = buildResolveRuntimeArgs('Ubuntu', ROOT, '/usr/local/bin/dsh');
+    expect(argv.slice(-3)).toEqual([SCRIPT_ARGV0, ROOT, '/usr/local/bin/dsh']);
+    expect(() => buildResolveRuntimeArgs('Ubuntu', ROOT, 'bin/dsh')).toThrow(ArgumentError);
+  });
+
   it('parses the runtime probe and drops unsafe values', () => {
+    const empty = { dshPath: null, nodePath: null, rootPath: null, source: null, legacyRuntimePresent: false };
     expect(parseRuntimeProbe('dsh=/usr/bin/dsh\nnode=/usr/bin/node\n')).toEqual({
+      ...empty,
       dshPath: '/usr/bin/dsh',
       nodePath: '/usr/bin/node',
-      rootPath: null,
     });
-    expect(parseRuntimeProbe('dsh=\nnode=\n')).toEqual({ dshPath: null, nodePath: null, rootPath: null });
-    expect(parseRuntimeProbe('dsh=relative/dsh\nnode=/usr/../node\n')).toEqual({
-      dshPath: null,
-      nodePath: null,
-      rootPath: null,
+    expect(parseRuntimeProbe('dsh=\nnode=\n')).toEqual(empty);
+    expect(parseRuntimeProbe('dsh=relative/dsh\nnode=/usr/../node\n')).toEqual(empty);
+    expect(parseRuntimeProbe('dsh=/usr/bin/dsh\nsource=login-shell\nlegacy=yes\n')).toEqual({
+      ...empty,
+      dshPath: '/usr/bin/dsh',
+      source: 'login-shell',
+      legacyRuntimePresent: true,
     });
     expect(parseRuntimeProbe('garbage\r\ndsh=/opt/dsh\r\n')).toEqual({
+      ...empty,
       dshPath: '/opt/dsh',
-      nodePath: null,
-      rootPath: null,
     });
     // The canonical isolation root is reported by the same probe (issue #12).
-    expect(parseRuntimeProbe('root=/home/u/.local/share/wsl-web-shell\ndsh=/home/u/.local/share/wsl-web-shell/runtime/bin/dsh\n')).toEqual({
-      dshPath: '/home/u/.local/share/wsl-web-shell/runtime/bin/dsh',
+    expect(parseRuntimeProbe('root=/home/u/.local/share/wsl-web-shell\ndsh=/usr/bin/dsh\n')).toEqual({
+      dshPath: '/usr/bin/dsh',
       nodePath: null,
       rootPath: '/home/u/.local/share/wsl-web-shell',
+      source: null,
+      legacyRuntimePresent: false,
     });
   });
 });
@@ -468,8 +486,8 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
       expect(result.status).toBe(0);
       const root = join(home, '.local/share/wsl-web-shell');
       expect(result.stdout.trim()).toBe(root);
-      expect(readdirSync(root).sort()).toEqual(['agents', 'cache', 'dsh-home', 'runtime', 'tmp', 'workspace']);
-      expect(readdirSync(join(root, 'runtime'))).toEqual(['bin']);
+      expect(readdirSync(root).sort()).toEqual(['agents', 'cache', 'dsh-home', 'tmp', 'update', 'workspace']);
+      expect(existsSync(join(root, 'runtime'))).toBe(false);
       expect(statSync(root).mode & 0o777).toBe(0o700);
       expect(statSync(join(root, 'dsh-home')).mode & 0o777).toBe(0o700);
       // Nothing outside the root was created.
@@ -573,7 +591,7 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
   });
 
   it('refuses a symlinked managed subdirectory instead of writing through it', () => {
-    for (const managed of ['agents', 'dsh-home', 'cache', 'tmp', 'workspace', 'runtime']) {
+    for (const managed of ['agents', 'dsh-home', 'cache', 'tmp', 'workspace', 'update']) {
       const home = sandbox();
       try {
         const outside = join(home, 'outside');
@@ -585,8 +603,14 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
         const result = runScript(PREPARE_ISOLATION_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
         expect(result.status, `managed=${managed}`).toBe(67);
         expect(readdirSync(outside), `managed=${managed}`).toEqual([]);
-        // Other managed directories are still absent: the run stopped early.
-        expect(existsSync(join(root, 'workspace'))).toBe(managed === 'workspace');
+        // Nothing was written through the link and nothing else was created.
+        for (const other of ['agents', 'dsh-home', 'cache', 'tmp', 'workspace', 'update']) {
+          if (other === managed) continue;
+          if (existsSync(join(root, other))) {
+            // Only directories legitimately created before the failure.
+            expect(readdirSync(join(root, other)), `managed=${managed}`).toEqual([]);
+          }
+        }
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
@@ -633,7 +657,9 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
       expect(env.XDG_CACHE_HOME).toBe(join(root, 'cache'));
       expect(env.TMPDIR).toBe(join(root, 'tmp'));
       expect(env.ISOLATION_ROOT).toBe(root);
-      expect(env.PATH?.startsWith(`${join(root, 'runtime/bin')}:/usr/bin:`)).toBe(true);
+      // Only the resolved Node.js directory is prepended; nothing app-private.
+      expect(env.PATH?.startsWith('/usr/bin:')).toBe(true);
+      expect(env.PATH).not.toContain('runtime/bin');
       expect(env.ARGS).toBe('web --host 127.0.0.1 --port 3080 --no-open');
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -748,7 +774,7 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
     }
   });
 
-  it('resolves the isolated dsh before any system install', () => {
+  it('never selects a private runtime copy over the installed one', () => {
     const home = sandbox();
     try {
       const root = join(home, '.local/share/wsl-web-shell');
@@ -759,9 +785,14 @@ describe.skipIf(!shellAvailable)('launcher scripts execute as designed', () => {
       writeStub(isolatedDsh, '#!/bin/sh\nexit 0\n');
       writeStub(systemDsh, '#!/bin/sh\nexit 0\n');
 
-      const result = runScript(RESOLVE_RUNTIME_SCRIPT, [SCRIPT_ARGV0, ROOT], home);
+      // A login shell does not exist in the sandbox PATH, so the resolver falls
+      // back to the conventional locations — but it must never pick the retired
+      // private runtime, and it reports that the legacy copy exists.
+      const result = runScript(RESOLVE_RUNTIME_SCRIPT, [SCRIPT_ARGV0, ROOT, '-'], home);
       expect(result.status).toBe(0);
-      expect(result.stdout).toContain(`dsh=${isolatedDsh}`);
+      expect(result.stdout).toContain(`dsh=${systemDsh}`);
+      expect(result.stdout).not.toContain(`dsh=${isolatedDsh}`);
+      expect(result.stdout).toContain('legacy=yes');
       // The probe never modifies the filesystem.
       expect(readdirSync(join(home, '.local/bin'))).toEqual(['dsh']);
     } finally {

@@ -10,9 +10,10 @@
 const installedEl = document.getElementById('installed');
 const targetEl = document.getElementById('target');
 const distroEl = document.getElementById('distro');
-const rootEl = document.getElementById('root');
-const rollbackEl = document.getElementById('rollback');
+const binaryEl = document.getElementById('binary');
+const scopeEl = document.getElementById('scope');
 const blockedEl = document.getElementById('blocked');
+const manualEl = document.getElementById('manual');
 const startButton = document.getElementById('start');
 const cancelButton = document.getElementById('cancel');
 
@@ -20,8 +21,11 @@ function render(probe) {
   installedEl.textContent = probe.installed ?? 'unknown';
   targetEl.textContent = probe.target ?? 'unknown';
   distroEl.textContent = probe.distro;
-  rootEl.textContent = probe.runtimeRoot;
-  rollbackEl.textContent = probe.rollbackPath ?? 'kept next to the runtime';
+  binaryEl.textContent = probe.dshPath ?? 'not found';
+  scopeEl.textContent =
+    probe.installManager === 'npm'
+      ? `npm, global ${probe.installScope}`
+      : `${probe.installManager} (not updateable from the app)`;
   if (probe.eligible) {
     blockedEl.hidden = true;
     startButton.disabled = false;
@@ -29,6 +33,13 @@ function render(probe) {
     blockedEl.hidden = false;
     blockedEl.textContent = probe.description ?? 'This update cannot be started safely.';
     startButton.disabled = true;
+  }
+  if (probe.manualCommand !== null) {
+    manualEl.hidden = false;
+    manualEl.textContent = `To update it yourself, run inside WSL: ${probe.manualCommand}`;
+  } else {
+    manualEl.hidden = true;
+    manualEl.textContent = '';
   }
   if (probe.running) {
     blockedEl.hidden = false;

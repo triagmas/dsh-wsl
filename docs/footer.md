@@ -36,7 +36,7 @@ Rules:
 
 - The GitHub lookup is **informational only**: it downloads nothing and sends no
   credentials or cookies. The only action it enables is the explicit, confirmed
-  update described in [update.md](update.md), which happens in the isolated runtime
+  update described in [update.md](update.md), which changes the shared WSL installation
   and only when the user clicks Update.
 - Results are cached in `userData/versions-cache.json` for 18 h so a restart or a
   network outage never blocks or delays startup. A failed refresh keeps the last good

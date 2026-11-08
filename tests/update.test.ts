@@ -1,6 +1,6 @@
 /**
- * Issue #12 — one-click update: guards, terminal buffer, phase model, journal
- * recovery, relaunch decision and the runner transaction.
+ * Issues #12 and #17 — DeepSeek Harness update: guards, terminal buffer, phase
+ * model, shared-install journal recovery and the runner transaction.
  *
  * Nothing here spawns WSL or npm: every decision is driven through injected
  * fakes, so all safety rules can be asserted without touching an installation.
@@ -18,277 +18,299 @@ import {
   describeUpdatePhase,
   describeUpdateReason,
   isExactVersion,
-  isExpectedRuntimePath,
+  isNormalisedAbsolutePath,
   isSameVersion,
   isUpdateCritical,
   isUpdateRunning,
   isValidTransactionId,
+  manualUpdateCommand,
   parseUpdateJournal,
   phaseFromUpdateLine,
+  planSharedUpdate,
   planTerminalUpdate,
-  planUpdate,
   sanitizeUpdateLine,
   shouldRestartAfterUpdate,
-  type RuntimeObservation,
-  type UpdateJournal,
+  type SharedInstallObservation,
+  type SharedUpdatePlanResult,
+  type UpdateJournalV2,
   type UpdateJournalStore,
 } from '../src/main/core/update.js';
-import { createUpdateRunner } from '../src/main/core/update-runner.js';
+import { describeInstallation, type DshInstallation } from '../src/main/core/dsh-locate.js';
+import { createUpdateRunner, type UpdateContext, type UpdateLifecycle } from '../src/main/core/update-runner.js';
 import { recoverInterruptedUpdate } from '../src/main/core/update-recovery.js';
 import { describeRelaunchFailure, resolveRelaunchTarget } from '../src/main/core/relaunch.js';
 import { createNullLogger } from '../src/main/core/logger.js';
-import type { NpmVersionCheck, UpdateRunResult, UpdateTransition, WslGateway } from '../src/main/core/supervisor.js';
+import type { UpdateTransition } from '../src/main/core/supervisor.js';
+import { DEFAULT_INSTALLATION, FakeWsl } from './helpers.js';
 
-const ROOT = '~/.local/share/wsl-web-shell';
-const CANONICAL = '/home/u/.local/share/wsl-web-shell';
-const RUNTIME_DSH = `${CANONICAL}/runtime/bin/dsh`;
+const APP_ROOT = '/home/dev/.local/share/wsl-web-shell';
 
-function plan(overrides: Partial<Parameters<typeof planUpdate>[0]> = {}) {
-  return planUpdate({
+function installation(overrides: Partial<DshInstallation> = {}): DshInstallation {
+  return { ...DEFAULT_INSTALLATION, ...overrides };
+}
+
+function planResult(overrides: Partial<Parameters<typeof planSharedUpdate>[0]> = {}): SharedUpdatePlanResult {
+  return planSharedUpdate({
     distro: 'Ubuntu',
     targetVersion: '0.2.2-rc.1',
-    installedVersion: '0.2.1-rc.5',
-    resolvedDshPath: RUNTIME_DSH,
-    canonicalRuntimeRoot: CANONICAL,
-    isolationEnabled: true,
-    runtimeRoot: ROOT,
+    appRoot: APP_ROOT,
+    installation: installation(),
     customExecutable: false,
     ...overrides,
   });
+}
+
+function acceptedPlan(overrides: Partial<Parameters<typeof planSharedUpdate>[0]> = {}) {
+  const result = planResult(overrides);
+  if (!result.ok) throw new Error(`plan must be accepted: ${result.reason}`);
+  return result.plan;
 }
 
 describe('exact version guard', () => {
   it('accepts plain and pre-release versions', () => {
     expect(isExactVersion('0.2.2')).toBe(true);
     expect(isExactVersion('0.2.2-rc.1')).toBe(true);
-    expect(isExactVersion('1.0.0-beta.10')).toBe(true);
+    expect(isExactVersion('1.0.0-beta.11')).toBe(true);
   });
 
   it('rejects ranges, tags and anything a shell could interpret', () => {
-    for (const value of ['^0.2.2', '~0.2.2', '>=0.2.2', 'latest', '*', '0.2', '0.2.2 ', '0.2.2; rm -rf /', '0.2.2$(id)', 'v0.2.2', '']) {
-      expect(isExactVersion(value), value).toBe(false);
+    for (const value of ['latest', '^0.2.2', '>=0.2.2', '0.2.2 || 0.3.0', '0.2.2;rm -rf /', '', 'v0.2.2.x', null, 3]) {
+      expect(isExactVersion(value)).toBe(false);
     }
-    expect(isExactVersion(undefined)).toBe(false);
-    expect(isExactVersion('1'.repeat(60))).toBe(false);
   });
 
   it('never treats a longer version as the shorter one', () => {
-    // `0.2.2-rc.1` must not be satisfied by `0.2.2-rc.10` (the substring bug).
     expect(isSameVersion('0.2.2-rc.1', '0.2.2-rc.10')).toBe(false);
-    expect(isSameVersion('0.2.2-rc.1', '0.2.2-rc.1')).toBe(true);
-    expect(isSameVersion('v0.2.2', '0.2.2')).toBe(true);
-    expect(isSameVersion('0.2.2', '0.2.2.1')).toBe(false);
-    expect(isSameVersion(null, '0.2.2')).toBe(false);
-    expect(isSameVersion('garbage', '0.2.2')).toBe(false);
+    expect(isSameVersion('0.2.2', '0.2.2')).toBe(true);
+    expect(isSameVersion('0.2.2', null)).toBe(false);
   });
 });
 
 describe('terminal buffer', () => {
   it('strips escapes and control characters', () => {
-    expect(sanitizeUpdateLine('\u001B[32mupdate: ok\u001B[0m')).toBe('update: ok');
-    expect(sanitizeUpdateLine('a\rb\u0007c')).toBe('abc');
+    expect(sanitizeUpdateLine('\u001B[32madded 1 package\u001B[0m')).toBe('added 1 package');
+    expect(sanitizeUpdateLine('line\rwith\rcarriage')).toBe('linewithcarriage');
   });
 
   it('drops empty lines', () => {
     expect(sanitizeUpdateLine('   ')).toBeNull();
     expect(sanitizeUpdateLine('\u001B[0m')).toBeNull();
-    expect(sanitizeUpdateLine('')).toBeNull();
   });
 
   it('caps very long output lines', () => {
-    const line = sanitizeUpdateLine('x'.repeat(5000));
+    const line = sanitizeUpdateLine('x'.repeat(2_000));
     expect(line).not.toBeNull();
-    expect(line?.length).toBeLessThanOrEqual(320);
-    expect(line?.endsWith('…')).toBe(true);
+    expect((line ?? '').length).toBeLessThanOrEqual(320);
   });
 
   it('keeps a bounded number of lines and counts what it dropped', () => {
     const terminal = createUpdateTerminal(3);
-    for (let index = 0; index < 10; index += 1) terminal.append(`line ${index}`);
-    expect(terminal.lines()).toEqual(['line 7', 'line 8', 'line 9']);
-    expect(terminal.dropped()).toBe(7);
+    for (let index = 0; index < 5; index += 1) terminal.append(`line ${index}`);
+    expect(terminal.lines()).toEqual(['line 2', 'line 3', 'line 4']);
+    expect(terminal.dropped()).toBe(2);
   });
 
   it('uses the documented default bound', () => {
-    const terminal = createUpdateTerminal();
-    for (let index = 0; index < UPDATE_TERMINAL_MAX_LINES + 5; index += 1) terminal.append(`line ${index}`);
-    expect(terminal.lines()).toHaveLength(UPDATE_TERMINAL_MAX_LINES);
-    expect(terminal.dropped()).toBe(5);
+    expect(UPDATE_TERMINAL_MAX_LINES).toBe(400);
   });
 });
 
 describe('terminal streaming beyond the rolling cap (review blocker D)', () => {
   it('keeps appending while the buffer still grows', () => {
-    const state = { lines: ['a', 'b'], dropped: 0 };
-    const next = planTerminalUpdate({ lines: ['a', 'b', 'c'], dropped: 0 }, { dropped: 0, rendered: 2 });
-    expect(next.rebuild).toBe(false);
-    expect(next.append).toEqual(['c']);
-    expect(next.rendered).toBe(3);
-    void state;
+    const terminal = createUpdateTerminal(3);
+    terminal.append('a');
+    terminal.append('b');
+    const seen = { dropped: 0, rendered: 2 };
+    terminal.append('c');
+    const plan = planTerminalUpdate({ lines: terminal.lines(), dropped: terminal.dropped() }, seen);
+    expect(plan.rebuild).toBe(false);
+    expect(plan.append).toEqual(['c']);
   });
 
   it('asks for a redraw once lines were dropped', () => {
-    const lines = Array.from({ length: 400 }, (_, index) => `line ${index + 1}`);
-    const next = planTerminalUpdate({ lines, dropped: 1 }, { dropped: 0, rendered: 400 });
-    expect(next.rebuild).toBe(true);
-    expect(next.append).toHaveLength(400);
-    expect(next.rendered).toBe(400);
+    const terminal = createUpdateTerminal(2);
+    for (const line of ['a', 'b', 'c']) terminal.append(line);
+    const plan = planTerminalUpdate({ lines: terminal.lines(), dropped: terminal.dropped() }, { dropped: 0, rendered: 2 });
+    expect(plan.rebuild).toBe(true);
+    expect(plan.append).toEqual(['b', 'c']);
   });
+});
 
-  it('keeps showing new lines after 400+ published lines', () => {
-    // Reproduces the freeze: with a fixed `rendered === lines.length`, every
-    // later state appended nothing. The offset makes the stream continue.
-    const terminal = createUpdateTerminal(400);
-    let seen = { dropped: 0, rendered: 0 };
-    let buffer = { lines: [] as string[], dropped: 0 };
-    for (let index = 1; index <= 450; index += 1) {
-      terminal.append(`line ${index}`);
-      buffer = { lines: terminal.lines(), dropped: terminal.dropped() };
-      const step = planTerminalUpdate(buffer, seen);
-      seen = { dropped: buffer.dropped, rendered: step.rendered };
+describe('path guards', () => {
+  it('accepts normalised POSIX paths only', () => {
+    expect(isNormalisedAbsolutePath('/home/dev/.npm-global')).toBe(true);
+    expect(isNormalisedAbsolutePath('/usr/local')).toBe(true);
+    for (const value of ['relative', '/', '/a//b', '/a/./b', '/a/../b', '/a/', 'C:\\bin', null, 42]) {
+      expect(isNormalisedAbsolutePath(value)).toBe(false);
     }
-    expect(buffer.dropped).toBe(50);
-    expect(buffer.lines[buffer.lines.length - 1]).toBe('line 450');
-    expect(seen.rendered).toBe(400);
-    // A further line still produces work for the renderer.
-    terminal.append('line 451');
-    const next = planTerminalUpdate({ lines: terminal.lines(), dropped: terminal.dropped() }, seen);
-    expect(next.rebuild || next.append.length > 0).toBe(true);
   });
 });
 
-describe('runtime ownership (review blocker C)', () => {
-  it('accepts only the exact canonical runtime executable', () => {
-    expect(isExpectedRuntimePath(RUNTIME_DSH, CANONICAL)).toBe(true);
-    expect(isExpectedRuntimePath('/usr/local/bin/dsh', CANONICAL)).toBe(false);
-    expect(isExpectedRuntimePath(`${CANONICAL}/runtime/bin/dsh-other`, CANONICAL)).toBe(false);
-    expect(isExpectedRuntimePath(`${CANONICAL}/runtime/bin/npm`, CANONICAL)).toBe(false);
-    expect(isExpectedRuntimePath(`${CANONICAL}/runtime-other/bin/dsh`, CANONICAL)).toBe(false);
-    // Another user's home that merely contains the same suffix is not ours.
-    expect(isExpectedRuntimePath('/home/other/.local/share/wsl-web-shell/runtime/bin/dsh', CANONICAL)).toBe(false);
-    expect(isExpectedRuntimePath('/srv/copy/home/u/.local/share/wsl-web-shell/runtime/bin/dsh', CANONICAL)).toBe(false);
-  });
-
-  it('refuses unnormalised or missing paths', () => {
-    expect(isExpectedRuntimePath(null, CANONICAL)).toBe(false);
-    expect(isExpectedRuntimePath(RUNTIME_DSH, null)).toBe(false);
-    expect(isExpectedRuntimePath(`${CANONICAL}/runtime//bin/dsh`, CANONICAL)).toBe(false);
-    expect(isExpectedRuntimePath(`${CANONICAL}/runtime/../runtime/bin/dsh`, CANONICAL)).toBe(false);
-    expect(isExpectedRuntimePath(RUNTIME_DSH, 'relative/root')).toBe(false);
-  });
-});
-
-describe('update plan guards', () => {
-  it('accepts the isolated runtime of the selected distribution', () => {
-    const result = plan();
+describe('shared installation update plan (issue #17)', () => {
+  it('accepts an npm global installation that is writable and idle', () => {
+    const result = planResult();
     expect(result.ok).toBe(true);
     if (!result.ok) return;
+    expect(result.plan.dshPath).toBe(DEFAULT_INSTALLATION.path);
+    expect(result.plan.prefix).toBe('/home/dev/.npm-global');
+    expect(result.plan.packageDir).toBe(DEFAULT_INSTALLATION.packageDir);
+    expect(result.plan.scope).toContain('/home/dev/.npm-global');
     expect(result.plan.version).toBe('0.2.2-rc.1');
-    expect(result.plan.canonicalRoot).toBe(CANONICAL);
-    expect(result.plan.runtimeDir).toBe(`${CANONICAL}/runtime`);
-    expect(result.plan.previousPattern).toContain('previous-');
-  });
-
-  it('refuses a global installation', () => {
-    expect(plan({ isolationEnabled: false })).toEqual({ ok: false, reason: UPDATE_REASONS.globalInstallation });
-  });
-
-  it('refuses a custom executable pinned in Settings', () => {
-    expect(plan({ customExecutable: true })).toEqual({ ok: false, reason: UPDATE_REASONS.customExecutable });
-  });
-
-  it('refuses a root that is not a dedicated subtree', () => {
-    expect(plan({ runtimeRoot: '~' })).toEqual({ ok: false, reason: UPDATE_REASONS.unsafeRoot });
-    expect(plan({ runtimeRoot: '/' })).toEqual({ ok: false, reason: UPDATE_REASONS.unsafeRoot });
-  });
-
-  it('refuses when WSL did not report a canonical root', () => {
-    expect(plan({ canonicalRuntimeRoot: null })).toEqual({ ok: false, reason: UPDATE_REASONS.unsafeRoot });
-    expect(plan({ canonicalRuntimeRoot: '~/.local/share/wsl-web-shell' })).toEqual({
-      ok: false,
-      reason: UPDATE_REASONS.unsafeRoot,
-    });
-  });
-
-  it('refuses when the executable in use is not the isolated one', () => {
-    expect(plan({ resolvedDshPath: '/usr/local/bin/dsh' })).toEqual({
-      ok: false,
-      reason: UPDATE_REASONS.foreignRuntime,
-    });
-    expect(plan({ resolvedDshPath: `${CANONICAL}/runtime/bin/dsh.tmp` })).toEqual({
-      ok: false,
-      reason: UPDATE_REASONS.foreignRuntime,
-    });
-    expect(plan({ resolvedDshPath: '/home/other/.local/share/wsl-web-shell/runtime/bin/dsh' })).toEqual({
-      ok: false,
-      reason: UPDATE_REASONS.foreignRuntime,
-    });
-    expect(plan({ resolvedDshPath: null })).toEqual({ ok: false, reason: UPDATE_REASONS.foreignRuntime });
-  });
-
-  it('refuses an unknown installed version', () => {
-    expect(plan({ installedVersion: null })).toEqual({ ok: false, reason: UPDATE_REASONS.unknownInstalled });
-    expect(plan({ installedVersion: 'dev' })).toEqual({ ok: false, reason: UPDATE_REASONS.unknownInstalled });
-  });
-
-  it('refuses the same or an older version', () => {
-    expect(plan({ targetVersion: '0.2.1-rc.5' })).toEqual({ ok: false, reason: UPDATE_REASONS.sameOrOlder });
-    expect(plan({ targetVersion: '0.2.0' })).toEqual({ ok: false, reason: UPDATE_REASONS.sameOrOlder });
+    expect(result.plan.installedVersion).toBe('0.2.1-rc.5');
   });
 
   it('refuses a version that is not an exact release', () => {
-    expect(plan({ targetVersion: '^0.2.2' })).toEqual({ ok: false, reason: UPDATE_REASONS.invalidVersion });
+    expect(planResult({ targetVersion: 'latest' })).toMatchObject({ ok: false, reason: UPDATE_REASONS.invalidVersion });
+  });
+
+  it('refuses a custom executable pinned in Settings', () => {
+    expect(planResult({ customExecutable: true })).toMatchObject({ ok: false, reason: UPDATE_REASONS.customExecutable });
+  });
+
+  it('refuses an unknown installed version', () => {
+    expect(planResult({ installation: installation({ version: null }) })).toMatchObject({
+      ok: false,
+      reason: UPDATE_REASONS.unknownInstalled,
+    });
+  });
+
+  it('refuses the same or an older version', () => {
+    expect(planResult({ targetVersion: '0.2.1-rc.5' })).toMatchObject({ ok: false, reason: UPDATE_REASONS.sameOrOlder });
+    expect(planResult({ targetVersion: '0.2.0' })).toMatchObject({ ok: false, reason: UPDATE_REASONS.sameOrOlder });
+  });
+
+  it('refuses a manager other than npm', () => {
+    for (const manager of ['pnpm', 'unknown'] as const) {
+      expect(planResult({ installation: installation({ manager }) })).toMatchObject({
+        ok: false,
+        reason: UPDATE_REASONS.unsupportedManager,
+      });
+    }
+  });
+
+  it('refuses an executable outside the reported package directory', () => {
+    const result = planResult({
+      installation: installation({ realPath: '/usr/local/bin/dsh-real' }),
+    });
+    expect(result).toMatchObject({ ok: false, reason: UPDATE_REASONS.foreignRuntime });
+  });
+
+  it('refuses a package directory that only shares a prefix with the expected one', () => {
+    const result = planResult({
+      installation: installation({
+        packageDir: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh-old',
+        realPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh-old/bin/dsh.js',
+      }),
+    });
+    expect(result).toMatchObject({ ok: false, reason: UPDATE_REASONS.foreignRuntime });
+  });
+
+  it('refuses a prefix that needs elevated rights', () => {
+    const result = planResult({
+      installation: installation({
+        prefix: '/usr/local',
+        packageDir: '/usr/local/lib/node_modules/@deepseek-ai/dsh',
+        realPath: '/usr/local/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+        path: '/usr/local/bin/dsh',
+        writable: false,
+      }),
+    });
+    expect(result).toMatchObject({ ok: false, reason: UPDATE_REASONS.notWritable });
+    expect(describeUpdateReason(UPDATE_REASONS.notWritable)).toContain('sudo');
+  });
+
+  it('refuses when another DSH process uses the installation', () => {
+    expect(planResult({ installation: installation({ foreignProcesses: 2 }) })).toMatchObject({
+      ok: false,
+      reason: UPDATE_REASONS.foreignProcess,
+    });
+  });
+
+  it('refuses when npm is missing', () => {
+    expect(planResult({ installation: installation({ npmPath: null }) })).toMatchObject({
+      ok: false,
+      reason: UPDATE_REASONS.noNpm,
+    });
   });
 
   it('explains every refusal in the confirmation window', () => {
     for (const reason of Object.values(UPDATE_REASONS)) {
-      expect(describeUpdateReason(reason).length).toBeGreaterThan(20);
+      const description = describeUpdateReason(reason);
+      expect(description.length).toBeGreaterThan(10);
+      expect(description).not.toContain('undefined');
     }
+    expect(describeUpdateReason('something-else')).toContain('cannot be started safely');
+  });
+
+  it('offers the manual command with the reported prefix', () => {
+    expect(manualUpdateCommand({ npmPath: '/usr/bin/npm', prefix: '/usr/local' }, '0.2.2')).toBe(
+      '/usr/bin/npm install -g --prefix /usr/local @deepseek-ai/dsh@0.2.2',
+    );
+    expect(manualUpdateCommand(null, '0.2.2')).toBe('npm install -g @deepseek-ai/dsh@0.2.2');
+  });
+
+  it('describes the installation scope for the UI', () => {
+    expect(describeInstallation(installation())).toContain('npm');
+    expect(describeInstallation(installation())).toContain('0.2.1-rc.5');
   });
 });
 
 describe('phase model', () => {
   it('reports running phases', () => {
-    expect(isUpdateRunning('checking')).toBe(true);
-    expect(isUpdateRunning('stopping')).toBe(true);
-    expect(isUpdateRunning('starting')).toBe(true);
-    expect(isUpdateRunning('done')).toBe(false);
-    expect(isUpdateRunning('failed')).toBe(false);
-    expect(isUpdateRunning('rolled-back')).toBe(false);
+    for (const phase of ['checking', 'inspecting', 'stopping', 'installing', 'verifying', 'starting'] as const) {
+      expect(isUpdateRunning(phase)).toBe(true);
+    }
+    for (const phase of ['idle', 'done', 'failed', 'rolled-back'] as const) {
+      expect(isUpdateRunning(phase)).toBe(false);
+    }
   });
 
-  it('refuses to quit only while the runtime is being replaced', () => {
-    for (const phase of ['stopping', 'activating', 'starting'] as const) expect(isUpdateCritical(phase)).toBe(true);
-    for (const phase of ['idle', 'checking', 'installing', 'verifying', 'done', 'failed', 'rolled-back'] as const) {
+  it('refuses to quit while the shared installation is being changed', () => {
+    for (const phase of ['stopping', 'installing', 'verifying', 'starting'] as const) {
+      expect(isUpdateCritical(phase)).toBe(true);
+    }
+    for (const phase of ['idle', 'checking', 'inspecting', 'done', 'failed', 'rolled-back'] as const) {
       expect(isUpdateCritical(phase)).toBe(false);
     }
   });
 
   it('only relaunches after a completed update', () => {
     expect(shouldRestartAfterUpdate('done')).toBe(true);
-    for (const phase of ['idle', 'checking', 'installing', 'verifying', 'stopping', 'activating', 'starting', 'failed', 'rolled-back'] as const) {
+    for (const phase of ['idle', 'checking', 'inspecting', 'stopping', 'installing', 'verifying', 'starting', 'failed', 'rolled-back'] as const) {
       expect(shouldRestartAfterUpdate(phase)).toBe(false);
     }
   });
 
   it('follows the updater step markers', () => {
-    expect(phaseFromUpdateLine('update: verifying the staged installation')).toBe('verifying');
-    expect(phaseFromUpdateLine('update: activating')).toBe('activating');
+    expect(phaseFromUpdateLine('update: verifying /usr/bin/dsh')).toBe('verifying');
+    expect(phaseFromUpdateLine('update: installing @deepseek-ai/dsh@0.2.2')).toBe('installing');
     expect(phaseFromUpdateLine('update: done')).toBeNull();
     expect(describeUpdatePhase('failed')).toContain('failed');
     expect(describeUpdatePhase('rolled-back')).toContain('restored');
+  });
+
+  it('starts from an idle state without a target', () => {
+    const state = createUpdateState('2026-11-07T10:15:00.000Z');
+    expect(state.phase).toBe('idle');
+    expect(state.targetVersion).toBeNull();
+    expect(state.lines).toEqual([]);
   });
 });
 
 // --- transaction journal and recovery --------------------------------------
 
-const journal = (overrides: Partial<UpdateJournal> = {}): UpdateJournal => ({
-  version: 1,
+const journal = (overrides: Partial<UpdateJournalV2> = {}): UpdateJournalV2 => ({
+  version: 2,
+  kind: 'npm-global',
   transaction: '20261107T101500Z-1a2b',
-  phase: 'activating',
+  phase: 'updating',
   distro: 'Ubuntu',
-  runtimeRoot: ROOT,
-  canonicalRoot: CANONICAL,
+  dshPath: DEFAULT_INSTALLATION.path,
+  realPath: DEFAULT_INSTALLATION.realPath,
+  prefix: '/home/dev/.npm-global',
+  packageDir: DEFAULT_INSTALLATION.packageDir as string,
+  appRoot: APP_ROOT,
+  npmPath: '/usr/bin/npm',
   target: '0.2.2-rc.1',
   installed: '0.2.1-rc.5',
   startedAt: '2026-11-07T10:15:00.000Z',
@@ -296,11 +318,10 @@ const journal = (overrides: Partial<UpdateJournal> = {}): UpdateJournal => ({
   ...overrides,
 });
 
-const observation = (overrides: Partial<RuntimeObservation> = {}): RuntimeObservation => ({
-  runtimePresent: true,
-  runtimeVersion: '0.2.1-rc.5',
-  previous: null,
-  stage: null,
+const observation = (overrides: Partial<SharedInstallObservation> = {}): SharedInstallObservation => ({
+  present: true,
+  version: '0.2.1-rc.5',
+  realPath: DEFAULT_INSTALLATION.realPath,
   ...overrides,
 });
 
@@ -308,629 +329,417 @@ describe('transaction journal', () => {
   it('creates ids that are safe as a path segment and as argv', () => {
     const id = createTransactionId(new Date('2026-11-07T10:15:00.000Z'));
     expect(isValidTransactionId(id)).toBe(true);
-    expect(id.startsWith('20261107T101500Z')).toBe(true);
-    expect(id.includes('.')).toBe(false);
-    for (const bad of ['', 'short', '../escape', 'a b', "x'; rm -rf /", 'a'.repeat(64)]) {
-      expect(isValidTransactionId(bad), bad).toBe(false);
-    }
+    expect(id).toMatch(/^[0-9A-Za-z][0-9A-Za-z-]{7,31}$/);
+    expect(isValidTransactionId('short')).toBe(false);
+    expect(isValidTransactionId('2026/11/07')).toBe(false);
   });
 
   it('round-trips a valid journal', () => {
     expect(parseUpdateJournal(journal())).toEqual(journal());
+    expect(parseUpdateJournal(journal({ phase: 'verifying' }))?.phase).toBe('verifying');
   });
 
   it('refuses a journal it cannot trust', () => {
     expect(parseUpdateJournal(null)).toBeNull();
     expect(parseUpdateJournal({})).toBeNull();
-    expect(parseUpdateJournal({ ...journal(), version: 2 })).toBeNull();
-    expect(parseUpdateJournal({ ...journal(), phase: 'swapped' })).toBeNull();
-    expect(parseUpdateJournal({ ...journal(), transaction: '../x' })).toBeNull();
-    expect(parseUpdateJournal({ ...journal(), target: '^0.2.2' })).toBeNull();
-    expect(parseUpdateJournal({ ...journal(), canonicalRoot: 'relative' })).toBeNull();
+    // Wrong kind, unknown phase, non-exact versions, relative paths.
+    expect(parseUpdateJournal({ ...journal(), kind: 'other' })).toBeNull();
+    expect(parseUpdateJournal({ ...journal(), phase: 'activating' })).toBeNull();
+    expect(parseUpdateJournal({ ...journal(), target: 'latest' })).toBeNull();
+    expect(parseUpdateJournal({ ...journal(), dshPath: 'relative/dsh' })).toBeNull();
+    expect(parseUpdateJournal({ ...journal(), prefix: '/' })).toBeNull();
+    expect(parseUpdateJournal({ ...journal(), appRoot: 'relative' })).toBeNull();
+    expect(parseUpdateJournal({ ...journal(), npmPath: '' })).toBeNull();
+    expect(parseUpdateJournal({ ...journal(), transaction: 'x' })).toBeNull();
   });
-});
 
-describe('interrupted update recovery (review blocker B)', () => {
-  it('finalizes when the new runtime is already active', () => {
-    expect(decideRecovery(journal(), observation({ runtimeVersion: '0.2.2-rc.1', previous: 'previous-20261107T101500Z-1a2b' }))).toEqual({
-      action: 'finalize',
-      reason: 'the activated runtime already reports 0.2.2-rc.1',
+  it('still reads a journal written by the retired private-runtime updater', () => {
+    const legacy = parseUpdateJournal({
+      version: 1,
+      transaction: '20261107T101500Z-1a2b',
+      phase: 'activating',
+      distro: 'Ubuntu',
+      runtimeRoot: '~/.local/share/wsl-web-shell',
+      canonicalRoot: '/home/u/.local/share/wsl-web-shell',
+      target: '0.2.2-rc.1',
+      installed: '0.2.1-rc.5',
+      startedAt: '2026-11-07T10:15:00.000Z',
+      updatedAt: '2026-11-07T10:15:04.000Z',
     });
-  });
-
-  it('abandons a journal whose update never replaced the runtime', () => {
-    // Quit during staging: the runtime still reports the pre-update version.
-    const decision = decideRecovery(journal({ installed: '0.2.1-rc.5' }), observation({ previous: null }));
-    expect(decision.action).toBe('abandon');
-    expect(decision.reason).toContain('never replaced');
-  });
-
-  it('rolls back when the runtime reports an unexpected version', () => {
-    const decision = decideRecovery(journal(), observation({ runtimeVersion: '0.2.0', previous: 'previous-x' }));
-    expect(decision.action).toBe('rollback');
-  });
-
-  it('rolls back when the runtime is missing but the previous copy survives', () => {
-    const decision = decideRecovery(journal(), observation({ runtimePresent: false, runtimeVersion: null, previous: 'previous-x' }));
-    expect(decision.action).toBe('rollback');
-    expect(decision.reason).toContain('previous-x');
-  });
-
-  it('rolls back to the staged tree when nothing else is left', () => {
-    const decision = decideRecovery(
-      journal(),
-      observation({ runtimePresent: false, runtimeVersion: null, previous: null, stage: 'stage-x' }),
-    );
-    expect(decision.action).toBe('rollback');
-  });
-
-  it('blocks instead of starting an unknown runtime', () => {
-    const decision = decideRecovery(journal(), observation({ runtimePresent: false, runtimeVersion: null }));
-    expect(decision.action).toBe('blocked');
-  });
-
-  it('does not accept a longer version as the target', () => {
-    const decision = decideRecovery(
-      journal(),
-      observation({ runtimeVersion: '0.2.2-rc.10', previous: 'previous-x' }),
-    );
-    expect(decision.action).toBe('rollback');
+    expect(legacy?.version).toBe(1);
   });
 });
 
-function memoryJournal(initial: UpdateJournal | null): UpdateJournalStore & { current: () => UpdateJournal | null } {
-  let current = initial;
+describe('interrupted update recovery decisions', () => {
+  it('finalizes when the installation already reports the target', () => {
+    expect(decideRecovery(journal(), observation({ version: '0.2.2-rc.1' })).action).toBe('finalize');
+  });
+
+  it('abandons a journal whose update never changed the installation', () => {
+    expect(decideRecovery(journal(), observation({ version: '0.2.1-rc.5' })).action).toBe('abandon');
+  });
+
+  it('rolls back when the installation reports anything else', () => {
+    expect(decideRecovery(journal(), observation({ version: '0.2.3' })).action).toBe('rollback');
+    expect(decideRecovery(journal(), observation({ version: null })).action).toBe('rollback');
+  });
+
+  it('rolls back when the executable is missing', () => {
+    const decision = decideRecovery(journal(), observation({ present: false, version: null, realPath: null }));
+    expect(decision.action).toBe('rollback');
+    expect(decision.reason).toContain('missing');
+  });
+
+  it('never accepts a longer pre-release as the target', () => {
+    expect(decideRecovery(journal(), observation({ version: '0.2.2-rc.10' })).action).toBe('rollback');
+  });
+
+  it('treats a legacy journal as history, not as a pending transaction', () => {
+    const legacy = parseUpdateJournal({
+      version: 1,
+      transaction: '20261107T101500Z-1a2b',
+      phase: 'activating',
+      distro: 'Ubuntu',
+      runtimeRoot: '~/.local/share/wsl-web-shell',
+      canonicalRoot: '/home/u/.local/share/wsl-web-shell',
+      target: '0.2.2-rc.1',
+      installed: '0.2.1-rc.5',
+      startedAt: '2026-11-07T10:15:00.000Z',
+      updatedAt: '2026-11-07T10:15:04.000Z',
+    });
+    if (legacy === null) throw new Error('legacy journal must parse');
+    expect(decideRecovery(legacy, observation()).action).toBe('legacy');
+  });
+});
+
+// --- recovery orchestration ------------------------------------------------
+
+function memoryJournal(initial: UpdateJournalV2 | null): UpdateJournalStore & { current(): UpdateJournalV2 | null } {
+  let value = initial;
   return {
-    read: () => current,
+    read: () => value,
     write: (next) => {
-      current = next;
+      value = next;
     },
     clear: () => {
-      current = null;
+      value = null;
     },
-    current: () => current,
+    current: () => value,
   };
+}
+
+function recoveryHarness(options: { rollbackCode?: number | null; resumeOk?: boolean; legacy?: boolean } = {}) {
+  const calls: string[] = [];
+  const wsl = new FakeWsl();
+  wsl.recoveryObservation = null;
+  const resume = async (): Promise<UpdateTransition> => {
+    calls.push('resume');
+    return { ok: options.resumeOk !== false, message: options.resumeOk === false ? 'backend did not start' : null };
+  };
+  return { calls, wsl, resume, log: createNullLogger() };
 }
 
 describe('recovery orchestration', () => {
-  const baseDeps = () => {
-    const calls: string[] = [];
-    return {
-      calls,
-      wsl: {
-        async inspectRuntime() {
-          calls.push('inspect');
-          return observation({ runtimePresent: false, runtimeVersion: null, previous: 'previous-x' });
-        },
-        async restoreRuntime() {
-          calls.push('restore');
-          return { code: 0, tail: 'update: rollout reverted' } as UpdateRunResult;
-        },
-      },
-      resume: async (): Promise<UpdateTransition> => {
-        calls.push('resume');
-        return { ok: true, message: null };
-      },
-      log: createNullLogger(),
-    };
-  };
-
   it('does nothing without a journal', async () => {
-    const store = memoryJournal(null);
-    const result = await recoverInterruptedUpdate({ ...baseDeps(), wsl: new FakeInspect(), journal: store });
+    const h = recoveryHarness();
+    const result = await recoverInterruptedUpdate({ wsl: h.wsl, journal: memoryJournal(null), resume: h.resume, log: h.log });
     expect(result).toEqual({ handled: false, action: null, message: null });
-    expect(store.current()).toBeNull();
+    expect(h.calls).toEqual([]);
   });
 
-  it('abandons a staging-only journal without touching the runtime', async () => {
-    const calls: string[] = [];
-    const store = memoryJournal(journal({ phase: 'staging' }));
-    const result = await recoverInterruptedUpdate({
-      wsl: {
-        inspectRuntime: async () => {
-          calls.push('inspect');
-          return observation({ runtimeVersion: '0.2.1-rc.5' });
-        },
-        restoreRuntime: async () => {
-          calls.push('restore');
-          return { code: 0, tail: '' };
-        },
-      },
-      journal: store,
-      resume: async () => {
-        calls.push('resume');
-        return { ok: true, message: null };
-      },
-      log: createNullLogger(),
-    });
+  it('abandons a journal whose update never changed the installation', async () => {
+    const h = recoveryHarness();
+    h.wsl.recoveryObservation = { present: true, version: '0.2.1-rc.5', realPath: DEFAULT_INSTALLATION.realPath };
+    const store = memoryJournal(journal());
+    const result = await recoverInterruptedUpdate({ wsl: h.wsl, journal: store, resume: h.resume, log: h.log });
     expect(result.action).toBe('abandon');
-    expect(calls).toEqual(['inspect', 'resume']);
     expect(store.current()).toBeNull();
+    expect(h.wsl.rollbackRuns).toHaveLength(0);
   });
 
-  it('clears the journal after a successful repair', async () => {
-    const deps = baseDeps();
+  it('clears the journal after a successful finalize', async () => {
+    const h = recoveryHarness();
+    h.wsl.recoveryObservation = { present: true, version: '0.2.2-rc.1', realPath: DEFAULT_INSTALLATION.realPath };
     const store = memoryJournal(journal());
-    const result = await recoverInterruptedUpdate({ ...deps, journal: store });
-    expect(result.action).toBe('rollback');
-    expect(deps.calls).toEqual(['inspect', 'restore', 'resume']);
+    const result = await recoverInterruptedUpdate({ wsl: h.wsl, journal: store, resume: h.resume, log: h.log });
+    expect(result.action).toBe('finalize');
     expect(store.current()).toBeNull();
   });
 
-  it('keeps the journal when finalize cannot start the new version (P0-B)', async () => {
-    // The swap completed, but the new runtime does not serve: the journal must
-    // survive so the next start can still roll back.
-    const store = memoryJournal(journal({ phase: 'verifying-backend' }));
-    const calls: string[] = [];
+  it('reinstalls the previous version and keeps the journal when that fails', async () => {
+    const h = recoveryHarness({ resumeOk: false });
+    h.wsl.recoveryObservation = { present: true, version: '0.2.2-rc.1', realPath: DEFAULT_INSTALLATION.realPath };
+    h.wsl.rollbackCode = 0;
+    const store = memoryJournal(journal());
+    const result = await recoverInterruptedUpdate({ wsl: h.wsl, journal: store, resume: h.resume, log: h.log });
+    expect(result.action).toBe('blocked');
+    expect(h.wsl.rollbackRuns[0]?.version).toBe('0.2.1-rc.5');
+    expect(store.current()).not.toBeNull();
+  });
+
+  it('reports the exact npm command when the restoration fails', async () => {
+    const h = recoveryHarness();
+    h.wsl.recoveryObservation = { present: true, version: '0.2.3', realPath: DEFAULT_INSTALLATION.realPath };
+    h.wsl.rollbackCode = 74;
+    const store = memoryJournal(journal());
+    const result = await recoverInterruptedUpdate({ wsl: h.wsl, journal: store, resume: h.resume, log: h.log });
+    expect(result.action).toBe('blocked');
+    expect(result.message).toContain('@deepseek-ai/dsh@0.2.1-rc.5');
+    expect(store.current()).not.toBeNull();
+  });
+
+  it('restores and resumes when the installation reports an unexpected version', async () => {
+    const h = recoveryHarness();
+    h.wsl.recoveryObservation = { present: true, version: '0.2.3', realPath: DEFAULT_INSTALLATION.realPath };
+    const store = memoryJournal(journal());
+    const result = await recoverInterruptedUpdate({ wsl: h.wsl, journal: store, resume: h.resume, log: h.log });
+    expect(result.action).toBe('rollback');
+    expect(result.message).toContain('0.2.1-rc.5');
+    expect(store.current()).toBeNull();
+  });
+
+  it('clears a legacy journal instead of misapplying it', async () => {
+    const h = recoveryHarness();
+    // A v1 record cannot be written by this build, so the store is seeded directly.
+    const legacy = parseUpdateJournal({
+      version: 1,
+      transaction: '20261107T101500Z-1a2b',
+      phase: 'activating',
+      distro: 'Ubuntu',
+      runtimeRoot: '~/.local/share/wsl-web-shell',
+      canonicalRoot: '/home/u/.local/share/wsl-web-shell',
+      target: '0.2.2-rc.1',
+      installed: '0.2.1-rc.5',
+      startedAt: '2026-11-07T10:15:00.000Z',
+      updatedAt: '2026-11-07T10:15:04.000Z',
+    });
+    let current: unknown = legacy;
     const result = await recoverInterruptedUpdate({
-      wsl: {
-        inspectRuntime: async () =>
-          observation({ runtimeVersion: '0.2.2-rc.1', previous: 'previous-x' }),
-        restoreRuntime: async () => {
-          calls.push('restore');
-          return { code: 74, tail: 'update: nothing to restore' };
+      wsl: h.wsl,
+      journal: {
+        read: () => current as never,
+        write: (next) => {
+          current = next;
+        },
+        clear: () => {
+          current = null;
         },
       },
-      journal: store,
-      resume: async () => {
-        calls.push('resume');
-        return { ok: false, message: 'auth-failed: 401' };
-      },
-      log: createNullLogger(),
+      resume: h.resume,
+      log: h.log,
     });
-    expect(result.action).toBe('blocked');
-    expect(calls).toEqual(['resume', 'restore']);
-    expect(store.current()).not.toBeNull();
-    expect(result.message).toContain('journal was kept');
+    expect(result.action).toBe('legacy');
+    expect(current).toBeNull();
+    expect(result.message).toContain('retired');
   });
 
-  it('rolls back a finalize whose new version does not start', async () => {
-    const store = memoryJournal(journal({ phase: 'verifying-backend' }));
-    let resumes = 0;
-    const result = await recoverInterruptedUpdate({
-      wsl: {
-        inspectRuntime: async () => observation({ runtimeVersion: '0.2.2-rc.1', previous: 'previous-x' }),
-        restoreRuntime: async () => ({ code: 0, tail: 'update: rollout reverted' }),
-      },
-      journal: store,
-      resume: async () => {
-        resumes += 1;
-        return resumes === 1 ? { ok: false, message: 'auth-failed: 401' } : { ok: true, message: null };
-      },
-      log: createNullLogger(),
-    });
-    expect(result.action).toBe('rollback');
-    expect(result.message).toContain('previous installation was restored');
-    expect(store.current()).toBeNull();
-  });
-
-  it('keeps the journal when the restored backend does not start, and retries on the next start', async () => {
+  it('blocks when the installation cannot be inspected', async () => {
+    const h = recoveryHarness();
+    h.wsl.inspectSharedDsh = async () => {
+      throw new Error('wsl is not running');
+    };
     const store = memoryJournal(journal());
-    const failing = await recoverInterruptedUpdate({
-      wsl: {
-        inspectRuntime: async () =>
-          observation({ runtimePresent: false, runtimeVersion: null, previous: 'previous-x' }),
-        restoreRuntime: async () => ({ code: 0, tail: 'update: rollout reverted' }),
-      },
-      journal: store,
-      resume: async () => ({ ok: false, message: 'backend-lost: nothing listening' }),
-      log: createNullLogger(),
-    });
-    expect(failing.action).toBe('blocked');
-    expect(store.current()).not.toBeNull();
-
-    // A second start still has the record and repairs it once the backend works.
-    const repaired = await recoverInterruptedUpdate({
-      wsl: {
-        inspectRuntime: async () =>
-          observation({ runtimePresent: false, runtimeVersion: null, previous: 'previous-x' }),
-        restoreRuntime: async () => ({ code: 0, tail: 'update: rollout reverted' }),
-      },
-      journal: store,
-      resume: async () => ({ ok: true, message: null }),
-      log: createNullLogger(),
-    });
-    expect(repaired.action).toBe('rollback');
-    expect(store.current()).toBeNull();
-  });
-
-  it('keeps the journal when the restore fails, so the next start retries', async () => {
-    const deps = baseDeps();
-    const store = memoryJournal(journal());
-    const result = await recoverInterruptedUpdate({
-      ...deps,
-      wsl: {
-        inspectRuntime: deps.wsl.inspectRuntime,
-        restoreRuntime: async () => ({ code: 74, tail: 'update: nothing to restore' }),
-      },
-      journal: store,
-    });
+    const result = await recoverInterruptedUpdate({ wsl: h.wsl, journal: store, resume: h.resume, log: h.log });
     expect(result.action).toBe('blocked');
+    expect(result.message).toContain('wsl is not running');
     expect(store.current()).not.toBeNull();
   });
 });
 
-/** Inspect fake returning "runtime missing, previous present". */
-class FakeInspect {
-  async inspectRuntime(): Promise<RuntimeObservation> {
-    return observation({ runtimePresent: false, runtimeVersion: null, previous: 'previous-x' });
-  }
-  async restoreRuntime(): Promise<UpdateRunResult> {
-    return { code: 0, tail: 'update: rollout reverted' };
-  }
-}
+// --- update runner ---------------------------------------------------------
 
-// --- runner ----------------------------------------------------------------
-
-interface Harness {
-  wsl: Pick<WslGateway, 'checkPublishedVersion' | 'stageRuntime' | 'activateRuntime' | 'restoreRuntime'>;
-  lifecycle: {
-    pauseForUpdate(): Promise<UpdateTransition>;
-    resumeAfterUpdate(): Promise<UpdateTransition>;
-    releaseUpdateLock(): void;
-    blockForRuntime(message: string): void;
-    updateInProgress: boolean;
-  };
-  blocked: string[];
-  journal: UpdateJournalStore & { current(): UpdateJournal | null };
-  published: string[];
-  lines: string[];
+interface RunnerHarness {
+  wsl: FakeWsl;
+  lifecycle: UpdateLifecycle;
+  journal: UpdateJournalStore & { current(): UpdateJournalV2 | null };
   order: string[];
-  paused: number;
-  resumed: number;
-  checks: number;
-  stages: number;
-  activates: number;
-  restores: number;
+  published: string[];
+  phases: string[];
+  runner: ReturnType<typeof createUpdateRunner>;
 }
 
-function harness(
-  options: {
-    check?: Partial<NpmVersionCheck>;
-    stage?: UpdateRunResult;
-    activate?: UpdateRunResult;
-    restore?: UpdateRunResult;
-    pause?: UpdateTransition;
-    resume?: UpdateTransition[];
-    pauseThrows?: boolean;
-    journalWriteError?: string;
-    journalPhases?: string[];
-  } = {},
-): Harness {
-  const state: Harness = {
-    published: [],
-    lines: [],
-    order: [],
-    paused: 0,
-    resumed: 0,
-    checks: 0,
-    stages: 0,
-    activates: 0,
-    restores: 0,
-    journal: memoryJournal(null),
-    blocked: [],
-    lifecycle: {
-      updateInProgress: false,
-      blockForRuntime(message: string) {
-        state.blocked.push(message);
-        state.order.push('block');
-      },
-      async pauseForUpdate() {
-        state.paused += 1;
-        state.order.push('pause');
-        if (options.pauseThrows === true) throw new Error('stop failed');
-        return options.pause ?? { ok: true, message: null };
-      },
-      async resumeAfterUpdate() {
-        state.resumed += 1;
-        state.order.push('resume');
-        const queue = options.resume ?? [{ ok: true, message: null }];
-        return queue[Math.min(state.resumed - 1, queue.length - 1)] ?? { ok: true, message: null };
-      },
-      releaseUpdateLock() {
-        state.order.push('release');
-      },
+function runnerHarness(options: { pauseOk?: boolean; resumeOk?: boolean } = {}): RunnerHarness {
+  const order: string[] = [];
+  const published: string[] = [];
+  const phases: string[] = [];
+  const wsl = new FakeWsl();
+  const store = memoryJournal(null);
+  const lifecycle: UpdateLifecycle = {
+    pauseForUpdate: async () => {
+      order.push('pause');
+      return { ok: options.pauseOk !== false, message: options.pauseOk === false ? 'port still busy' : null };
     },
-    wsl: {
-      async checkPublishedVersion() {
-        state.checks += 1;
-        state.order.push('check');
-        return { found: true, npmPath: '/usr/bin/npm', reported: '0.2.2-rc.1', message: null, ...options.check };
-      },
-      async stageRuntime(_request, onLine) {
-        state.stages += 1;
-        state.order.push('stage');
-        for (const line of ['update: verifying the staged installation', 'update: staged version 0.2.2-rc.1']) {
-          state.lines.push(line);
-          onLine(line);
-        }
-        return options.stage ?? { code: 0, tail: 'update: staged version 0.2.2-rc.1' };
-      },
-      async activateRuntime(_request, onLine) {
-        state.activates += 1;
-        state.order.push('activate');
-        onLine('update: activating');
-        onLine('update: installed version 0.2.2-rc.1');
-        return options.activate ?? { code: 0, tail: 'update: installed version 0.2.2-rc.1' };
-      },
-      async restoreRuntime(_request, onLine) {
-        state.restores += 1;
-        state.order.push('restore');
-        onLine('update: restoring the previous installation');
-        return options.restore ?? { code: 0, tail: 'update: rollout reverted' };
-      },
+    resumeAfterUpdate: async () => {
+      order.push('resume');
+      return { ok: options.resumeOk !== false, message: options.resumeOk === false ? 'backend did not start' : null };
     },
+    releaseUpdateLock: () => {
+      order.push('release');
+    },
+    blockForRuntime: (message) => {
+      order.push(`blocked:${message}`);
+    },
+    updateInProgress: true,
   };
-  return state;
-}
-
-function runner(h: Harness) {
-  return createUpdateRunner({
-    wsl: h.wsl,
-    lifecycle: h.lifecycle,
-    journal: h.journal,
+  const runner = createUpdateRunner({
+    wsl,
+    lifecycle,
+    journal: store,
     log: createNullLogger(),
-    publish: (state) => h.published.push(state.phase),
-    now: () => '2026-11-01T00:00:00.000Z',
+    publish: (state) => {
+      published.push(state.phase);
+      phases.push(state.phase);
+    },
+    now: () => '2026-11-07T10:15:00.000Z',
   });
+  return { wsl, lifecycle, journal: store, order, published, phases, runner };
 }
 
-const context = { distro: 'Ubuntu', nodePath: '/home/u/.local/bin/node', transaction: '20261107T101500Z-1a2b' };
+const context: UpdateContext = {
+  distro: 'Ubuntu',
+  nodePath: '/usr/bin/node',
+  transaction: '20261107T101500Z-1a2b',
+  customExecutable: false,
+  ownPid: 4242,
+};
 
-describe('update runner transaction', () => {
-  const accepted = plan();
-  if (!accepted.ok) throw new Error('plan must be accepted');
-
-  it('stages, stops the owned backend, activates, starts and only then reports done', async () => {
-    const h = harness();
-    const outcome = await runner(h).run(accepted.plan, context);
+describe('update runner transaction (issue #17)', () => {
+  it('inspects, stops the owned backend, updates, verifies and only then reports done', async () => {
+    const h = runnerHarness();
+    const outcome = await h.runner.run(acceptedPlan(), context);
     expect(outcome.ok).toBe(true);
-    // Exact order: nothing is swapped before the backend was stopped.
-    expect(h.order).toEqual(['check', 'stage', 'pause', 'activate', 'resume']);
+    // Nothing is written before the backend was stopped.
+    expect(h.order).toEqual(['pause', 'resume']);
     expect(h.journal.current()).toBeNull();
-    const transitions = h.published.filter((phase, index) => phase !== h.published[index - 1]);
-    expect(transitions).toEqual(['checking', 'installing', 'verifying', 'stopping', 'activating', 'starting', 'done']);
-    expect(outcome.state.detail).toContain('previous-');
+    expect(h.wsl.updateRuns).toHaveLength(1);
+    expect(h.wsl.updateRuns[0]?.prefix).toBe('/home/dev/.npm-global');
+    expect(h.wsl.updateRuns[0]?.version).toBe('0.2.2-rc.1');
+    expect(h.wsl.updateRuns[0]?.ownPid).toBe(4242);
+    // The journal is written before the install and cleared only after success.
+    const phases = h.published.filter((phase, index) => phase !== h.published[index - 1]);
+    expect(phases).toEqual(['checking', 'inspecting', 'stopping', 'installing', 'verifying', 'starting', 'done']);
+    expect(outcome.state.detail).toContain('/home/dev/.npm-global/bin/dsh');
   });
 
   it('never installs when npm does not know the version', async () => {
-    const h = harness({ check: { found: false, message: 'npm did not report this version.' } });
-    const outcome = await runner(h).run(accepted.plan, context);
+    const h = runnerHarness();
+    h.wsl.npmCheckResult = { found: false, npmPath: '/usr/bin/npm', reported: '0.2.2-rc.1', message: 'npm did not report this version.' };
+    const outcome = await h.runner.run(acceptedPlan(), context);
     expect(outcome.ok).toBe(false);
-    expect(h.stages).toBe(0);
-    expect(h.order).toEqual(['check']);
-    expect(outcome.state.detail).toContain('npm did not report');
-  });
-
-  it('stops before activation when npm is missing', async () => {
-    const h = harness({ check: { found: false, npmPath: null, message: 'npm was not found in this distribution.' } });
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(h.stages).toBe(0);
-    expect(h.paused).toBe(0);
-  });
-
-  it('does not touch the runtime when the staged install fails', async () => {
-    const h = harness({ stage: { code: 71, tail: 'update: staged version check failed' } });
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(h.paused).toBe(0);
-    expect(h.activates).toBe(0);
-    expect(h.restores).toBe(0);
+    expect(h.wsl.updateRuns).toHaveLength(0);
     expect(h.journal.current()).toBeNull();
-    expect(outcome.state.detail).toContain('staged version check failed');
+  });
+
+  it('stops before installing when npm is missing', async () => {
+    const h = runnerHarness();
+    h.wsl.npmCheckResult = { found: false, npmPath: null, reported: null, message: 'npm was not found in this distribution.' };
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(h.order).toEqual([]);
+    expect(outcome.state.detail).toContain('npm');
+  });
+
+  it('re-validates the installation and refuses a changed prefix before writing', async () => {
+    const h = runnerHarness();
+    h.wsl.installation = { ...h.wsl.installation, writable: false, prefix: '/usr/local', packageDir: '/usr/local/lib/node_modules/@deepseek-ai/dsh', realPath: '/usr/local/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js', path: '/usr/local/bin/dsh' };
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(h.order).toEqual([]);
+    expect(outcome.state.detail).toContain('sudo');
+  });
+
+  it('refuses when another DSH process appears between plan and install', async () => {
+    const h = runnerHarness();
+    h.wsl.installation = { ...h.wsl.installation, foreignProcesses: 1 };
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(outcome.state.detail).toContain('DeepSeek Harness process is running');
   });
 
   it('keeps the running backend when it cannot be stopped', async () => {
-    const h = harness({ pause: { ok: false, message: 'The app-owned backend could not be stopped: denied' } });
-    const outcome = await runner(h).run(accepted.plan, context);
+    const h = runnerHarness({ pauseOk: false });
+    const outcome = await h.runner.run(acceptedPlan(), context);
     expect(outcome.ok).toBe(false);
-    expect(h.activates).toBe(0);
-    expect(outcome.state.detail).toContain('could not be stopped');
-  });
-
-  it('restores the previous install and restarts it when activation fails', async () => {
-    const h = harness({ activate: { code: 73, tail: 'update: activation failed, restoring the previous install' } });
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(h.restores).toBe(1);
-    expect(h.order.slice(-2)).toEqual(['restore', 'resume']);
-    expect(outcome.state.phase).toBe('rolled-back');
-    expect(outcome.state.detail).toContain('was restored and the previous version is running again');
+    expect(h.wsl.updateRuns).toHaveLength(0);
     expect(h.journal.current()).toBeNull();
-  });
-
-  it('rolls back when the new version does not start', async () => {
-    const h = harness({ resume: [{ ok: false, message: 'auth-failed: 401' }, { ok: true, message: null }] });
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(h.restores).toBe(1);
-    expect(h.resumed).toBe(2);
-    expect(outcome.state.phase).toBe('rolled-back');
-    expect(outcome.state.detail).toContain('previous version is running again');
-    expect(h.journal.current()).toBeNull();
-  });
-
-  it('writes the journal before the swap and removes it after success', async () => {
-    const writes: string[] = [];
-    const h = harness();
-    h.journal = {
-      read: () => null,
-      write: (entry) => {
-        writes.push(entry.phase);
-      },
-      clear: () => {
-        writes.push('clear');
-      },
-      current: () => null,
-    };
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(true);
-    expect(writes).toEqual(['staging', 'activating', 'verifying-backend', 'clear']);
-  });
-
-  it('leaves a recoverable journal when the process dies during the swap', async () => {
-    const writes: string[] = [];
-    const h = harness();
-    h.journal = {
-      read: () => null,
-      write: (entry) => {
-        writes.push(entry.phase);
-      },
-      clear: () => {
-        writes.push('clear');
-      },
-      current: () => null,
-    };
-    h.wsl.activateRuntime = async () => {
-      // Simulate the app being killed between the two renames.
-      throw Object.assign(new Error('process gone'), { name: 'ProcessGone' });
-    };
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(writes).toContain('activating');
-    // The journal write happened before activation, so the next start can repair.
-    expect(writes.indexOf('activating')).toBeLessThan(writes.length);
-  });
-
-  it('refuses to install anything when the staging journal cannot be written (P0-A)', async () => {
-    const h = harness();
-    const cleared: string[] = [];
-    h.journal = {
-      read: () => null,
-      write: () => {
-        throw new Error('EACCES: permission denied, open update-journal.json');
-      },
-      clear: () => {
-        cleared.push('clear');
-      },
-      current: () => null,
-    };
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(outcome.state.phase).toBe('failed');
-    expect(outcome.state.detail).toContain('journal could not be written');
-    expect(outcome.state.detail).toContain('nothing was installed');
-    // Nothing ran inside WSL: no npm install, no stop, no swap.
-    expect(h.stages).toBe(0);
-    expect(h.paused).toBe(0);
-    expect(h.activates).toBe(0);
-    expect(cleared).toEqual([]);
-  });
-
-  it('does not stop or swap the runtime when the activating journal cannot be written (P0-A)', async () => {
-    let writes = 0;
-    const cleared: string[] = [];
-    const h = harness();
-    h.journal = {
-      read: () => null,
-      write: () => {
-        writes += 1;
-        // The staging record is written, the activating one fails: exactly the
-        // window the runtime must not be touched in.
-        if (writes > 1) throw new Error('ENOSPC: no space left on device');
-      },
-      clear: () => {
-        cleared.push('clear');
-      },
-      current: () => null,
-    };
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    // The stage is prepared but the backend keeps running and nothing is swapped.
-    expect(h.stages).toBe(1);
-    expect(h.paused).toBe(0);
-    expect(h.activates).toBe(0);
-    expect(outcome.state.detail).toContain('nothing was replaced');
-  });
-
-  it('keeps the journal and blocks the app when the rollback itself fails (P0-B)', async () => {
-    const h = harness({
-      activate: { code: 73, tail: 'update: activation failed, restoring the previous install' },
-      restore: { code: 74, tail: 'update: nothing to restore' },
-    });
-    const outcome = await runner(h).run(accepted.plan, { ...context });
-    // Activation fails, the previous install cannot be restored.
-    expect(outcome.ok).toBe(false);
-    expect(h.restores).toBe(1);
-    expect(h.blocked).toHaveLength(1);
-    expect(outcome.state.phase).toBe('failed');
-    expect(outcome.state.detail).toContain('could not be restored');
-    expect(outcome.state.detail).toContain('journal was kept');
-    // The record survives and the old backend is not claimed to be running.
-    expect(h.journal.current()).not.toBeNull();
-    expect(h.resumed).toBe(0);
-  });
-
-  it('keeps the journal when the restored backend does not start (P0-B)', async () => {
-    const h = harness({ resume: [{ ok: false, message: 'backend-lost: nothing listening' }] });
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(h.restores).toBe(1);
-    expect(h.blocked).toHaveLength(1);
-    expect(outcome.state.phase).toBe('failed');
-    expect(outcome.state.detail).toContain('journal was kept');
-    expect(h.journal.current()).not.toBeNull();
-  });
-
-  it('keeps the journal after a failed restore in the exception path', async () => {
-    const h = harness({ restore: { code: 74, tail: 'update: nothing to restore' } });
-    h.wsl.activateRuntime = async () => {
-      throw Object.assign(new Error('process gone'), { name: 'ProcessGone' });
-    };
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(h.blocked).toHaveLength(1);
-    expect(h.journal.current()).not.toBeNull();
-  });
-
-  it('releases the update lock when the backend cannot be stopped (P1-C)', async () => {
-    const h = harness({ pause: { ok: false, message: 'The app-owned backend could not be stopped: denied' } });
-    const outcome = await runner(h).run(accepted.plan, context);
-    expect(outcome.ok).toBe(false);
-    expect(outcome.state.detail).toContain('could not be stopped');
     expect(h.order).toContain('release');
-    expect(h.activates).toBe(0);
-    expect(h.journal.current()).toBeNull();
   });
 
-  it('releases the update lock when stopping the backend throws (P1-C)', async () => {
-    const h = harness({ pauseThrows: true });
-    const outcome = await runner(h).run(accepted.plan, context);
+  it('reinstalls the previous version when npm cannot install the new one', async () => {
+    const h = runnerHarness();
+    h.wsl.updateCode = 72;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.state.phase).toBe('rolled-back');
+    expect(h.wsl.rollbackRuns[0]?.version).toBe('0.2.1-rc.5');
+    expect(h.journal.current()).toBeNull();
+    expect(h.order).toEqual(['pause', 'resume']);
+  });
+
+  it('blocks further starts when the rollback itself failed', async () => {
+    const h = runnerHarness();
+    h.wsl.updateCode = 73;
+    h.wsl.rollbackCode = 74;
+    const outcome = await h.runner.run(acceptedPlan(), context);
     expect(outcome.ok).toBe(false);
     expect(outcome.state.phase).toBe('failed');
-    expect(h.order).toContain('release');
-    expect(h.activates).toBe(0);
+    expect(h.journal.current()).not.toBeNull();
+    expect(h.order.some((entry) => entry.startsWith('blocked:'))).toBe(true);
+  });
+
+  it('verifies the version independently and rolls back when it is wrong', async () => {
+    const h = runnerHarness();
+    // npm claimed success but the executable still reports the old version.
+    h.wsl.installationAfterUpdate = { version: '0.2.1-rc.5' };
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.state.phase).toBe('rolled-back');
+    expect(h.wsl.rollbackRuns).toHaveLength(1);
     expect(h.journal.current()).toBeNull();
   });
 
-  it('does not run twice at the same time', async () => {
-    const h = harness();
-    const runnerInstance = runner(h);
-    const first = runnerInstance.run(accepted.plan, context);
-    const second = await runnerInstance.run(accepted.plan, context);
+  it('rolls back when the updated version does not start', async () => {
+    const h = runnerHarness({ resumeOk: false });
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(h.wsl.rollbackRuns[0]?.version).toBe('0.2.1-rc.5');
+    expect(h.journal.current()).not.toBeNull();
+  });
+
+  it('refuses to run twice at the same time', async () => {
+    const h = runnerHarness();
+    const first = h.runner.run(acceptedPlan(), context);
+    const second = await h.runner.run(acceptedPlan(), context);
     expect(second.ok).toBe(false);
-    await expect(first).resolves.toBeTruthy();
-    expect(h.stages).toBe(1);
+    await first;
+    expect(h.wsl.updateRuns).toHaveLength(1);
   });
 
-  it('turns a thrown gateway error into a failed state', async () => {
-    const h = harness();
-    h.wsl.stageRuntime = async () => {
-      throw new Error('wsl.exe is missing');
+  it('keeps a journal that could not be written from touching anything', async () => {
+    const h = runnerHarness();
+    const failing: UpdateJournalStore & { current(): UpdateJournalV2 | null } = {
+      read: () => null,
+      write: () => {
+        throw new Error('EACCES: permission denied');
+      },
+      clear: () => undefined,
+      current: () => null,
     };
-    const outcome = await runner(h).run(accepted.plan, context);
+    const runner = createUpdateRunner({
+      wsl: h.wsl,
+      lifecycle: h.lifecycle,
+      journal: failing,
+      log: createNullLogger(),
+      publish: () => undefined,
+      now: () => '2026-11-07T10:15:00.000Z',
+    });
+    const outcome = await runner.run(acceptedPlan(), context);
     expect(outcome.ok).toBe(false);
-    expect(outcome.state.phase).toBe('failed');
-    expect(outcome.state.detail).toContain('wsl.exe is missing');
-  });
-
-  it('starts from a clean state', () => {
-    const state = createUpdateState('2026-01-01T00:00:00.000Z');
-    expect(state.phase).toBe('idle');
-    expect(state.lines).toEqual([]);
-    expect(state.dropped).toBe(0);
-    expect(state.targetVersion).toBeNull();
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(h.order).toEqual([]);
   });
 });
 

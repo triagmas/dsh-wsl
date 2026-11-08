@@ -51,7 +51,7 @@ Additional states: `HIDDEN_IN_TRAY` (window hidden, still supervised), `RECOVERI
 - Clicking X hides to tray (never kills WSL/DSH), the background main process continues health checks. Tray click/Open re-shows, performs immediate health check, shows the recovering overlay until backend is ready, and restores the original WebUI.
 - Unexpected exit or failed health => attempt controlled restart **of app-owned process** with capped retries and cooldown. If externally managed backend cannot be authenticated as app-owned, display failure and do not terminate/restart it.
 - Tray menu: Open, Connection Status, Restart WebUI, Settings, Quit. Restart is allowed only for owned process. Quit ends Electron and gracefully stops **only** app-owned backend if set by policy, never the distro. Persist only app config/browser session under a dedicated app profile.
-- Missing WSL, distro, Node or DSH: show steps to install; never fetch binaries or mutate a global runtime silently.
+- Missing WSL, distro, Node or DSH: show steps to install; never fetch binaries or install a private copy silently. DSH WSL runs the `dsh` the distribution already has (issue #17); the in-app update changes exactly that installation, only after an explicit confirmation.
 
 ## Security boundaries
 

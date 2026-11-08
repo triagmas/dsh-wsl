@@ -34,8 +34,12 @@ export interface RuntimeProbe {
   dshPath: string | null;
   /** Absolute path of the node binary used by the launcher PATH. */
   nodePath: string | null;
-  /** Canonical (symlink-resolved) isolation root, null when isolation is off. */
+  /** Canonical (symlink-resolved) isolated data root, null when isolation is off. */
   rootPath: string | null;
+  /** Where the executable was found (issue #17). */
+  source: 'login-shell' | 'path' | 'fallback' | 'custom' | null;
+  /** True when an older private `<root>/runtime/bin/dsh` still exists. */
+  legacyRuntimePresent: boolean;
 }
 
 function asAbsolutePath(value: string): string | null {
@@ -47,12 +51,26 @@ function asAbsolutePath(value: string): string | null {
 
 /** Parse the `dsh=`/`node=` lines printed by the read-only runtime probe. */
 export function parseRuntimeProbe(text: string): RuntimeProbe {
-  const probe: RuntimeProbe = { dshPath: null, nodePath: null, rootPath: null };
+  const probe: RuntimeProbe = {
+    dshPath: null,
+    nodePath: null,
+    rootPath: null,
+    source: null,
+    legacyRuntimePresent: false,
+  };
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.replace(/\0/g, '').trim();
     if (line.startsWith('dsh=')) probe.dshPath = asAbsolutePath(line.slice(4));
     else if (line.startsWith('node=')) probe.nodePath = asAbsolutePath(line.slice(5));
     else if (line.startsWith('root=')) probe.rootPath = asAbsolutePath(line.slice(5));
+    else if (line.startsWith('legacy=')) probe.legacyRuntimePresent = line.slice(7).trim() === 'yes';
+    else if (line.startsWith('source=')) {
+      const value = line.slice(7).trim();
+      probe.source =
+        value === 'login-shell' || value === 'path' || value === 'fallback' || value === 'custom'
+          ? value
+          : null;
+    }
   }
   return probe;
 }

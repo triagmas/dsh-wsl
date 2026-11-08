@@ -1,20 +1,37 @@
 import type {
   ExitInfo,
+  InspectSharedRequest,
   NpmVersionCheck,
   ResolvedRuntime,
   ServerHandle,
+  SharedRollbackRequest,
+  SharedUpdateRunRequest,
   StartServerRequest,
-  UpdateRunRequest,
   UpdateRunResult,
-  UpdateRestoreRequest,
   WslGateway,
 } from '../src/main/core/supervisor.js';
 import type { ProcessProbe } from '../src/main/wsl/output.js';
-import type { RuntimeObservation } from '../src/main/core/update.js';
+import type { SharedInstallObservation } from '../src/main/core/update.js';
+import type { DshInstallation, SharedDshReport } from '../src/main/core/dsh-locate.js';
 import type { WebClient } from '../src/main/core/supervisor.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
 import { createNullLogger } from '../src/main/core/logger.js';
 import { DEFAULT_CONFIG, type AppConfig, type ShellStatus } from '../src/shared/types.js';
+
+/** A realistic npm-global installation used by the update tests. */
+export const DEFAULT_INSTALLATION: DshInstallation = {
+  path: '/home/dev/.npm-global/bin/dsh',
+  realPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+  symlink: true,
+  version: '0.2.1-rc.5',
+  manager: 'npm',
+  prefix: '/home/dev/.npm-global',
+  packageDir: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh',
+  writable: true,
+  npmPath: '/usr/bin/npm',
+  source: 'login-shell',
+  foreignProcesses: 0,
+};
 
 export const BACKEND_PID = 4242;
 export type PortState = 'free' | 'occupied';
@@ -120,28 +137,27 @@ export class FakeWsl implements WslGateway {
   dshVersionValue: string | null = '0.2.1-rc.5';
   readonly versionQueries: { distro: string; dshPath: string; nodePath: string | null }[] = [];
 
-  /** Update-related fake state (issue #12). */
+  /** Update-related fake state (issues #12 and #17). */
   npmCheckResult: NpmVersionCheck = { found: true, npmPath: '/usr/bin/npm', reported: '0.2.2-rc.1', message: null };
-  /** Per-step exit codes: staged install, activation, restore. */
-  stageCode: number | null = 0;
-  activateCode: number | null = 0;
-  restoreCode: number | null = 0;
-  updateRunLines: string[] = ['update: verifying the staged installation', 'update: staged version 0.2.2-rc.1'];
-  /** What `inspectRuntime` reports (journal recovery tests). */
-  runtimeObservation: RuntimeObservation = {
-    runtimePresent: true,
-    runtimeVersion: '0.2.1-rc.5',
-    previous: null,
-    stage: null,
-  };
-  readonly stageRuns: UpdateRunRequest[] = [];
-  readonly activateRuns: UpdateRunRequest[] = [];
-  readonly restoreRuns: UpdateRestoreRequest[] = [];
-  readonly npmChecks: { distro: string; isolationRoot: string; version: string; nodePath: string | null }[] = [];
+  /** Exit code of the shared-install update, and the lines it streams. */
+  updateCode: number | null = 0;
+  rollbackCode: number | null = 0;
+  updateRunLines: string[] = ['update: installing @deepseek-ai/dsh@0.2.2-rc.1 into /home/dev/.npm-global'];
+  /** What the inspection reports before the update. */
+  installation: DshInstallation = { ...DEFAULT_INSTALLATION };
+  /** What it reports afterwards (the runner verifies the target version). */
+  installationAfterUpdate: Partial<DshInstallation> = { version: '0.2.2-rc.1' };
+  /** What the recovery inspection reports (`null` = use `installation`). */
+  recoveryObservation: SharedInstallObservation | null = null;
+  legacyRuntimePresent = false;
+  readonly updateRuns: SharedUpdateRunRequest[] = [];
+  readonly rollbackRuns: { request: SharedRollbackRequest; version: string; transaction: string }[] = [];
+  readonly npmChecks: { distro: string; appRoot: string; version: string; nodePath: string | null }[] = [];
+  readonly inspections: InspectSharedRequest[] = [];
 
   async checkPublishedVersion(request: {
     distro: string;
-    isolationRoot: string;
+    appRoot: string;
     version: string;
     nodePath: string | null;
   }): Promise<NpmVersionCheck> {
@@ -149,26 +165,43 @@ export class FakeWsl implements WslGateway {
     return { ...this.npmCheckResult, reported: this.npmCheckResult.reported ?? request.version };
   }
 
-  async stageRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
-    this.stageRuns.push(request);
+  async inspectSharedDsh(request: InspectSharedRequest): Promise<SharedDshReport> {
+    this.inspections.push(request);
+    if (this.recoveryObservation !== null) {
+      const observation = this.recoveryObservation;
+      return {
+        found: observation.present,
+        legacyRuntimePresent: this.legacyRuntimePresent,
+        installation: observation.present
+          ? { ...this.installation, version: observation.version, realPath: observation.realPath ?? this.installation.realPath }
+          : null,
+      };
+    }
+    return { found: true, installation: { ...this.installation }, legacyRuntimePresent: this.legacyRuntimePresent };
+  }
+
+  async updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
+    this.updateRuns.push(request);
     for (const line of this.updateRunLines) onLine(line);
-    return { code: this.stageCode, tail: this.updateRunLines.slice(-2).join(' ') };
+    if (this.updateCode === 0) {
+      // The executable really reports the new version afterwards.
+      this.installation = { ...this.installation, ...this.installationAfterUpdate };
+    }
+    return { code: this.updateCode, tail: this.updateRunLines.slice(-2).join(' ') };
   }
 
-  async activateRuntime(request: UpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
-    this.activateRuns.push(request);
-    onLine('update: activating');
-    return { code: this.activateCode, tail: this.activateCode === 0 ? 'update: installed version 0.2.2-rc.1' : 'update: activation failed' };
-  }
-
-  async restoreRuntime(request: UpdateRestoreRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
-    this.restoreRuns.push(request);
-    onLine('update: restoring the previous installation');
-    return { code: this.restoreCode, tail: this.restoreCode === 0 ? 'update: rollout reverted' : 'update: nothing to restore' };
-  }
-
-  async inspectRuntime(): Promise<RuntimeObservation> {
-    return { ...this.runtimeObservation };
+  async rollbackSharedDsh(
+    request: SharedRollbackRequest,
+    version: string,
+    transaction: string,
+    onLine: (line: string) => void,
+  ): Promise<UpdateRunResult> {
+    this.rollbackRuns.push({ request, version, transaction });
+    onLine(`update: restoring @deepseek-ai/dsh@${version}`);
+    if (this.rollbackCode === 0) {
+      this.installation = { ...this.installation, version };
+    }
+    return { code: this.rollbackCode, tail: this.rollbackCode === 0 ? `update: restored ${version}` : 'update: the previous version could not be restored' };
   }
 
   async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {

@@ -4,8 +4,11 @@
  * The shell never lets the backend fall back to a shared `~/.dsh`, a shared
  * agents root, or the distro-wide PATH. Instead every launch root is derived
  * from one validated directory (`~/.local/share/wsl-web-shell` by default) that
- * holds the private runtime, `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files
- * and the test workspace.
+ * holds `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files, the test workspace and
+ * the app's own update journal directory.
+ *
+ * Since issue #17 this is **data** isolation only: the executable is the one the
+ * WSL distribution already installs, and no private runtime lives here.
  *
  * Pure module: no fs, no Electron, no process spawning.
  */
@@ -91,7 +94,12 @@ export interface IsolationPlan {
   enabled: boolean;
   /** Root directory inside the distribution (`~`-relative or absolute). */
   root: string;
-  /** Private npm prefix / runtime binaries (isolated `dsh` install lives here). */
+  /**
+   * Legacy private runtime directory (`<root>/runtime/bin`).
+   *
+   * No longer created or used (issue #17); kept in the plan so the app can report
+   * that an old copy exists without ever selecting it.
+   */
   runtimeBin: string;
   /** `DSH_HOME` — harness config, credentials and sessions. */
   dshHome: string;

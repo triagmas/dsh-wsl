@@ -22,6 +22,12 @@ export const WSL_EXE = 'wsl.exe';
  * `$0` = resolved dsh path, `$1` = host, `$2` = port, `$3` = isolation root
  * (or `-`), `$4` = resolved node binary (or `-`), `$5` = workspace.
  *
+ * Isolation here is **data** isolation only (`DSH_HOME`, `DSH_AGENTS_HOME`,
+ * caches, temp, workspace). The executable is the one the distribution already
+ * has, selected by `RESOLVE_RUNTIME_SCRIPT`; nothing is prepended to `PATH` from
+ * an app-private runtime, so `dsh` inside the backend is the same installation
+ * an ordinary terminal runs (issue #17).
+ *
  * Everything path-related happens here, inside the distribution: `~` expands
  * against the Linux home and the working directory is entered by the shell, so
  * the launch does not depend on `wsl.exe --cd` understanding a tilde-prefixed
@@ -43,7 +49,7 @@ export const START_WRAPPER_SCRIPT = [
   'case "$rz" in */*) ;; *) echo "wsl-web-shell: isolation root must be a dedicated subtree" >&2; exit 66;; esac;',
   'if [ -n "$rbase" ]; then iroot="$HOME/$rz"; else iroot="/$rz"; fi;',
   '[ -d "$iroot" ] && [ ! -L "$iroot" ] || { echo "wsl-web-shell: isolation root is missing or a symlink" >&2; exit 67; };',
-  'for d in dsh-home agents cache tmp workspace; do [ -d "$iroot/$d" ] && [ ! -L "$iroot/$d" ] || { echo "wsl-web-shell: isolation directory is missing or a symlink" >&2; exit 67; }; done;',
+  'for d in dsh-home agents cache tmp workspace update; do [ -d "$iroot/$d" ] && [ ! -L "$iroot/$d" ] || { echo "wsl-web-shell: isolation directory is missing or a symlink" >&2; exit 67; }; done;',
   'fi;',
   'case "$ws" in "~") if [ -n "$iroot" ]; then ws="$iroot/workspace"; else ws="$HOME"; fi;; "~/"*) ws="$HOME/${ws#"~/"}";; /*) ;; *) echo "wsl-web-shell: rejected workspace" >&2; exit 64;; esac;',
   '[ -d "$ws" ] || { echo "wsl-web-shell: workspace directory not found" >&2; exit 65; };',
@@ -54,7 +60,7 @@ export const START_WRAPPER_SCRIPT = [
   'export XDG_CACHE_HOME="$iroot/cache";',
   'export TMPDIR="$iroot/tmp";',
   'export WSL_WEB_SHELL_ISOLATION_ROOT="$iroot";',
-  'if [ "$node" != "-" ]; then export PATH="$iroot/runtime/bin:$(dirname "$node"):$PATH"; else export PATH="$iroot/runtime/bin:$PATH"; fi;',
+  'if [ "$node" != "-" ]; then export PATH="$(dirname "$node"):$PATH"; fi;',
   'fi;',
   'printf "%s %s\\n" "__dsh_web_shell_pid__" "$$";',
   'exec "$dsh" web --host "$host" --port "$port" --no-open',
@@ -70,8 +76,10 @@ export const PID_MARKER = '__dsh_web_shell_pid__';
 export const SCRIPT_ARGV0 = 'wsl-web-shell';
 
 /**
- * Create the isolated environment (private runtime, DSH_HOME, agents home,
- * caches, temp, workspace) before the backend starts.
+ * Create the isolated **data** environment (`DSH_HOME`, agents home, caches,
+ * temp, workspace and the app-owned update journal directory) before the
+ * backend starts. No package is installed and no executable is copied here: the
+ * backend runs the distribution's own `dsh` (issue #17).
  *
  * Safety rules, all enforced before the first write:
  * - the root must be a dedicated subtree (`/`, `~`, `~/`, `~/x`, `/x` are
@@ -104,7 +112,7 @@ export const PREPARE_ISOLATION_SCRIPT = [
   '[ ! -L "$expected" ] || { echo "wsl-web-shell: isolation root is a symlink" >&2; exit 67; };',
   'real=$(cd "$expected" && pwd -P) || exit 67;',
   '[ "$real" = "$expected" ] || { echo "wsl-web-shell: isolation root resolves outside its configured path" >&2; exit 67; };',
-  'for d in runtime/bin dsh-home agents cache tmp workspace; do',
+  'for d in dsh-home agents cache tmp workspace update; do',
   'cur="$expected"; for seg in $(printf "%s" "$d" | tr "/" " "); do cur="$cur/$seg"; if [ -L "$cur" ]; then echo "wsl-web-shell: isolation directory is a symlink" >&2; exit 67; fi; done;',
   'mkdir -p "$expected/$d" || exit 70;',
   '[ ! -L "$expected/$d" ] || { echo "wsl-web-shell: isolation directory is a symlink" >&2; exit 67; };',
@@ -114,32 +122,52 @@ export const PREPARE_ISOLATION_SCRIPT = [
 ].join(' ');
 
 /**
- * Locate the backend executable and a node runtime inside the distribution.
- * `$1` = isolation root (`-` when disabled); the isolated runtime is preferred
- * over system installs. Diagnostics only: read-only filesystem tests.
+ * Locate the DeepSeek Harness executable that this distribution already has.
+ *
+ * Order is the order an ordinary terminal sees (issue #17):
+ * 1. a configured absolute path, when the user pinned one;
+ * 2. `command -v dsh` in a **login shell** — the same lookup `dsh web` uses in
+ *    the user's terminal, so the app and the terminal share one installation;
+ * 3. `command -v dsh` in the minimal `--exec` environment;
+ * 4. the conventional install locations as a last resort.
+ *
+ * There is deliberately **no** app-private runtime: the app never ships, copies
+ * or prefers its own `dsh`, and never silently installs one. `legacy=yes` only
+ * reports that an older private runtime is still on disk; it is not selected.
+ *
+ * `$0` = isolation root (`-` when disabled), `$1` = configured executable (`-`).
  */
 export const RESOLVE_RUNTIME_SCRIPT = [
-  'iso="$1";',
-  'case "$iso" in "~") iso="$HOME";; "~/"*) iso="$HOME/${iso#"~/"}";; /*) ;; *) iso="";; esac;',
-  // Canonical root: `pwd -P` resolves a symlinked `$HOME`, so the updater can
-  // compare the executable path exactly instead of guessing with substrings.
+  'iso="$1"; want="$2";',
+  'case "$iso" in "~") iso="$HOME";; "~/"*) iso="$HOME/${iso#"~/"}" ;; /*) ;; *) iso="";; esac;',
+  // Canonical root: `pwd -P` resolves a symlinked `$HOME`, so the app can report
+  // exactly where the isolated data lives.
   'root="";',
   'if [ -n "$iso" ] && [ -d "$iso" ]; then root="$(cd "$iso" && pwd -P 2>/dev/null)" || root=""; fi;',
   'printf "root=%s\n" "$root";',
-  'dsh="";',
-  'if [ -n "$iso" ] && [ -x "$iso/runtime/bin/dsh" ]; then dsh="$iso/runtime/bin/dsh"; fi;',
-  'if [ -z "$dsh" ]; then for c in "$HOME/.local/bin/dsh" /usr/local/bin/dsh /usr/bin/dsh "$HOME/.npm-global/bin/dsh"; do',
-  'if [ -x "$c" ]; then dsh="$c"; break; fi; done; fi;',
-  'if [ -z "$dsh" ]; then for c in "$HOME"/.nvm/versions/node/*/bin/dsh "$HOME"/.volta/bin/dsh; do',
-  '[ -x "$c" ] && { dsh="$c"; break; }; done; fi;',
-  'if [ -z "$dsh" ]; then p=$(command -v dsh 2>/dev/null) && [ -x "$p" ] && dsh="$p"; fi;',
-  'if [ -z "$dsh" ]; then p=$(bash -lc "command -v dsh" 2>/dev/null | tail -n 1) && [ -x "$p" ] && dsh="$p"; fi;',
+  'legacy=no; if [ -n "$root" ] && [ -x "$root/runtime/bin/dsh" ]; then legacy=yes; fi;',
+  'printf "legacy=%s\n" "$legacy";',
   'node="";',
   'for c in "$HOME/.local/bin/node" /usr/local/bin/node /usr/bin/node; do',
   'if [ -x "$c" ]; then node="$c"; break; fi; done;',
   'if [ -z "$node" ]; then p=$(command -v node 2>/dev/null) && [ -x "$p" ] && node="$p"; fi;',
-  'printf "dsh=%s\\n" "$dsh";',
-  'printf "node=%s\\n" "$node";',
+  'printf "node=%s\n" "$node";',
+  // npm-installed shims start with `#!/usr/bin/env node`, so `--version` and the
+  // login-shell lookup need node on PATH even in the minimal `--exec` environment.
+  'if [ -n "$node" ]; then PATH="$(dirname "$node"):$PATH"; export PATH; fi;',
+  'dsh=""; source="";',
+  'case "$want" in',
+  '-|"") ;;',
+  '/*) if [ -x "$want" ]; then dsh="$want"; source="custom"; fi;;',
+  'esac;',
+  'if [ -z "$dsh" ] && { [ -z "$want" ] || [ "$want" = "-" ]; }; then',
+  'if command -v bash >/dev/null 2>&1; then p=$(bash -lc "command -v dsh" 2>/dev/null | tr -d "\r" | tail -n 1); [ -n "$p" ] && [ -x "$p" ] && { dsh="$p"; source="login-shell"; }; fi;',
+  'fi;',
+  'if [ -z "$dsh" ]; then p=$(command -v dsh 2>/dev/null); [ -n "$p" ] && [ -x "$p" ] && { dsh="$p"; source="path"; }; fi;',
+  'if [ -z "$dsh" ]; then for c in "$HOME/.local/bin/dsh" /usr/local/bin/dsh /usr/bin/dsh "$HOME/.npm-global/bin/dsh" "$HOME"/.nvm/versions/node/*/bin/dsh "$HOME"/.volta/bin/dsh; do',
+  '[ -x "$c" ] && { dsh="$c"; source="fallback"; break; }; done; fi;',
+  'printf "dsh=%s\n" "$dsh";',
+  'printf "source=%s\n" "$source";',
   'exit 0',
 ].join(' ');
 
@@ -304,11 +332,31 @@ export function buildPrepareIsolationArgs(distro: string, root: string): string[
   return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', PREPARE_ISOLATION_SCRIPT, SCRIPT_ARGV0, root];
 }
 
-/** Resolve `dsh` and `node` inside the distribution (read-only). */
-export function buildResolveRuntimeArgs(distro: string, isolationRoot: string | null): string[] {
+/**
+ * Resolve the existing `dsh` and `node` inside the distribution (read-only).
+ *
+ * `configuredPath` is a user-pinned executable; it is validated but never
+ * invented by the app. Without it the distribution's own installation is used.
+ */
+export function buildResolveRuntimeArgs(
+  distro: string,
+  isolationRoot: string | null,
+  configuredPath: string | null = null,
+): string[] {
   const iso = isolationRoot === null ? ISOLATION_DISABLED : isolationRoot;
   if (iso !== ISOLATION_DISABLED && !isValidIsolationRoot(iso)) throw new ArgumentError('invalid-isolation-root');
-  return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', RESOLVE_RUNTIME_SCRIPT, SCRIPT_ARGV0, iso];
+  const want = configuredPath === null ? ISOLATION_DISABLED : assertDshPath(configuredPath);
+  return [
+    '-d',
+    assertDistroName(distro),
+    '--exec',
+    '/bin/sh',
+    '-c',
+    RESOLVE_RUNTIME_SCRIPT,
+    SCRIPT_ARGV0,
+    iso,
+    want,
+  ];
 }
 
 export function buildProbeProcessArgs(distro: string, pid: number): string[] {
