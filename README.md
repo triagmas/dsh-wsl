@@ -16,18 +16,36 @@
 
 ![DSH WSL showing the original DeepSeek Harness WebUI with the app-owned footer bar](docs/media/hero.png)
 
+<p align="center">
+  <a href="https://github.com/triagmas/wsl-web-shell/releases"><b>⬇ Download for Windows (x64)</b></a>
+</p>
+
 DSH WSL is a small Electron shell for WebUIs that run inside WSL2. The first backend
 is the native **DeepSeek Harness** (`dsh web`): DSH WSL starts it in your existing
-distribution and displays the **untouched official WebUI** — same composer, same
-sessions, same projects — in a desktop window without browser tabs or an address bar.
+distribution and displays the **untouched official WebUI** — the same interface with
+the same capabilities — in a desktop window without browser tabs or an address bar.
 No replica UI, no patched upstream build, no duplicated chat interface.
+
+By default that backend runs in DSH WSL's **own isolated profile and runtime**
+(`~/.local/share/wsl-web-shell`, with its own `DSH_HOME`), so existing sessions,
+projects and credentials from a globally installed `dsh` or from the official Windows
+DeepSeek Harness are **not imported automatically**. Isolation can be switched off in
+the settings to use your globally installed `dsh` and its data instead.
+
+> **Release status.** The newest published prerelease is
+> [`v0.1.0-beta.1`](https://github.com/triagmas/wsl-web-shell/releases/tag/v0.1.0-beta.1).
+> It predates the rename, so it ships a single portable EXE under the old
+> `WSL-Web-Shell-…` name — no Setup EXE. The **DSH WSL Portable + Setup** pair with
+> `SHA256SUMS.txt` is **not published yet**; Windows CI builds it as the
+> `dsh-wsl-windows-x64` artifact of every successful run.
 
 ## What you get
 
 **Your own WSL, your own data.** Agents, models, tools and project files stay inside
-your Linux distribution. DSH WSL never installs or upgrades WSL, Node.js or the DeepSeek
-Harness on its own, never touches the official Windows DeepSeek Harness installation,
-your global `npm` prefix or your projects.
+your Linux distribution. DSH WSL never silently changes WSL, Node.js or a globally
+installed `dsh`, and it never touches the official Windows DeepSeek Harness installation,
+your global `npm` prefix or your projects. The only thing it may install or update — and
+only after you confirm it in the app — is **its own isolated DSH runtime**.
 
 **A window that behaves like an app.**
 
@@ -78,9 +96,12 @@ Details, installer behaviour and CI checks: [docs/packaging.md](docs/packaging.m
 `Ubuntu`) and the DeepSeek Harness CLI `dsh` installed **by you** inside it — globally
 or in DSH WSL's isolated runtime.
 
-1. Download `DSH-WSL-<version>-x64-Portable.exe` (no install) or
-   `DSH-WSL-<version>-x64-Setup.exe`, and verify it against `SHA256SUMS.txt`.
-   The binaries are unsigned, so SmartScreen may warn about an unknown publisher.
+1. Open the [releases page](https://github.com/triagmas/wsl-web-shell/releases) and
+   download `DSH-WSL-<version>-x64-Portable.exe` (no install) or
+   `DSH-WSL-<version>-x64-Setup.exe`, then verify it against `SHA256SUMS.txt`. Until
+   that release is published, both files are available in the `dsh-wsl-windows-x64`
+   artifact of the latest successful Windows CI run. The binaries are unsigned, so
+   SmartScreen may warn about an unknown publisher.
 2. Start DSH WSL. The orbital splash shows the real startup stages: WSL check,
    runtime resolution, backend start, token exchange.
 3. The official WebUI appears as soon as the backend is ready. Change the

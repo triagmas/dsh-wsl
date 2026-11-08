@@ -14,8 +14,12 @@ files live.
 | Uninstall | delete the EXE | Uninstall from Installed Apps or the Start-menu entry |
 | Relaunch after an in-app DSH update | restarts the Portable EXE | restarts the installed EXE |
 
-Both packages use the same `appId` (`com.triagmas.wslwebshell`), so a newer Setup EXE
-upgrades an existing installation instead of creating a second one.
+Both packages use the same `appId` (`com.triagmas.wslwebshell`). The id was kept stable
+across the rename so the application identity and the profile stay the same.
+That is **not** a promise of an in-place upgrade: migrating an installation created by an
+earlier build (for example the pre-rename `WSL Web Shell` installer) has **not been
+verified**. The old and the new installation directories may coexist, and a previous
+installation may have to be uninstalled manually.
 
 ## Installer behaviour
 
@@ -32,7 +36,9 @@ upgrades an existing installation instead of creating a second one.
 ## Shared profile
 
 Both variants use the **same profile directory** `%APPDATA%\wsl-web-shell` and the
-same isolated runtime inside WSL. Running both under one Windows account therefore
+same isolated runtime inside WSL. (This is about the two files of one release, not about
+sharing data with a globally installed `dsh` or with the official Windows DeepSeek
+Harness: the isolated `DSH_HOME` starts empty.) Running both under one Windows account therefore
 shares settings, logs, the owned-backend registry, the update journal and the
 installed DSH version; only one instance can run at a time, and an update performed
 in one variant is visible in the other.
