@@ -378,7 +378,7 @@ export class Windows {
       skipTaskbar: true,
       show: false,
       parent: window,
-      title: 'WSL Web Shell — Settings',
+      title: 'DSH WSL — Settings',
       backgroundColor: '#11161f',
       hasShadow: true,
       webPreferences: {
@@ -499,7 +499,7 @@ export class Windows {
       skipTaskbar: true,
       show: false,
       backgroundColor: '#0b0f16',
-      title: 'WSL Web Shell',
+      title: 'DSH WSL',
       webPreferences: {
         preload: join(this.options.preloadDir, 'splash.js'),
         nodeIntegration: false,
@@ -567,7 +567,7 @@ export class Windows {
       minimizable: true,
       maximizable: false,
       fullscreenable: false,
-      title: 'WSL Web Shell — Settings',
+      title: 'DSH WSL — Settings',
       backgroundColor: '#0b0f16',
       parent: parent ?? undefined,
       webPreferences: {
@@ -687,7 +687,7 @@ export class Windows {
       page: 'confirm.html',
       width: 560,
       height: 460,
-      title: 'WSL Web Shell — Update DeepSeek Harness',
+      title: 'DSH WSL — Update DeepSeek Harness',
       modal: true,
     });
     window.on('closed', () => {
@@ -707,7 +707,7 @@ export class Windows {
       page: 'progress.html',
       width: 720,
       height: 520,
-      title: 'WSL Web Shell — Updating DeepSeek Harness',
+      title: 'DSH WSL — Updating DeepSeek Harness',
       modal: true,
     });
     // The window must not disappear while the runtime is being swapped: a user

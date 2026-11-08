@@ -8,7 +8,7 @@ Implementation notes for M1 (`R00` + `R01`). The product contract lives in
 
 ```text
 Windows
-└─ WSL Web Shell.exe (Electron main + isolated Chromium renderers)
+└─ DSH WSL.exe (Electron main + isolated Chromium renderers)
    ├─ Supervisor (main process, no renderer code)
    │  ├─ wsl.exe gateway: distro list/start, dsh resolution, spawn, /proc probe, signals
    │  ├─ loopback port probe + owned-PID registry (userData/owned-server.json)

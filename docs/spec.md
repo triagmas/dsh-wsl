@@ -1,4 +1,4 @@
-# WSL Web Shell — Product & Architecture Contract
+# DSH WSL — Product & Architecture Contract
 
 Version: 0.1 / M1. Source of truth: [Issue #1](https://github.com/triagmas/wsl-web-shell/issues/1). Status: specification only; **not yet a working application**.
 
@@ -10,7 +10,7 @@ Provide a standalone Windows Electron app, a single native window hosting a back
 
 ```text
 Windows taskbar / system tray
- └─ WSL Web Shell.exe (Electron main process)
+ └─ DSH WSL.exe (Electron main process)
     ├─ supervisor: startup, liveness, retry, process ownership
     ├─ tiny local splash: progress, connection/reconnect, actionable error
     └─ sandboxed Chromium BrowserWindow (original unmodified DSH WebUI)

@@ -1,194 +1,139 @@
-# WSL Web Shell
+<p align="center"><img src="docs/media/logo.png" width="104" alt="DSH WSL logo"></p>
 
-**Open-source Windows desktop wrapper for local WSL WebUIs.**
+<h1 align="center">DSH WSL</h1>
 
-Launch a small Electron application on Windows, automatically start a supported WebUI backend inside your **existing WSL2 distro**, and use the **original browser-based interface** in a standalone desktop window — without browser tabs or an address bar.
+<p align="center"><b>The original DeepSeek Harness WebUI in a real Windows window, running on your own WSL2.</b></p>
 
-**Project status: M1 release candidate.** `R00` (scaffold, CI, upstream contract), `R01`/`R01.1` (launcher, supervisor, tray, recovery, Windows EXE), `R02-A` (read-only environment inventory) and `R02-B` (isolated backend environment, real WebUI/tray acceptance) are implemented on `feat/m1-electron-shell`. A real acceptance run against a live Windows 11 + Ubuntu WSL2 machine **passed** on a packaged EXE; it is recorded in [docs/evidence/r02.md](docs/evidence/r02.md) with the exact artifact, SHA-256 and the gates that were checked.
+<p align="center"><b>English</b> · <a href="README.ru.md">Русский</a></p>
 
-**No release exists yet.** No installer, no code signing, no auto-update, no merge to `main`.
+<p align="center">
+  <a href="https://github.com/triagmas/wsl-web-shell/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/triagmas/wsl-web-shell/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/triagmas/wsl-web-shell/releases"><img alt="Release" src="https://img.shields.io/github/v/release/triagmas/wsl-web-shell?include_prereleases&label=release"></a>
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6">
+  <img alt="Electron" src="https://img.shields.io/badge/electron-45.2.3-2B2E3A">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/triagmas/wsl-web-shell?label=license"></a>
+</p>
 
-## First supported backend: DeepSeek Harness
+![DSH WSL showing the original DeepSeek Harness WebUI with the app-owned footer bar](docs/media/hero.png)
 
-- Native `dsh web` runs **inside Ubuntu WSL2**; agents, models, tools, sessions and project files stay in Linux.
-- Electron's bundled Chromium displays the **unchanged official WebUI**, including its real chat composer. No replica and no modified official Windows Desktop.
-- Default local endpoint: `127.0.0.1:3080` (port configurable in app settings, no arbitrary navigation).
-- Start on demand, supervisor/health checks, hide window to tray on X, reopen with auto-reconnect if needed, Quit via tray to exit.
-- Thin permanent bottom bar with the live connection state, the running `DSH`
-  version and the latest GitHub release, plus a gear that opens a compact settings
-  popover. It is app-owned chrome; the WebUI itself is never modified.
-- Lightweight orbital startup/recovery screen; no fake progress percentages.
-- Original WebUI auth bootstrap is handled privately: the tokenized startup URL is exchanged for a session cookie in the main process, so the token never reaches the window, the history or the logs.
+<p align="center">
+  <a href="https://github.com/triagmas/wsl-web-shell/releases"><b>⬇ Download for Windows (x64)</b></a>
+</p>
 
-Planned later: other trusted WSL WebUI backend presets. **Not** a general-purpose browser, reverse proxy or GUI redesign.
+DSH WSL is a small Electron shell for WebUIs that run inside WSL2. The first backend
+is the native **DeepSeek Harness** (`dsh web`): DSH WSL starts it in your existing
+distribution and displays the **untouched official WebUI** — the same interface with
+the same capabilities — in a desktop window without browser tabs or an address bar.
+No replica UI, no patched upstream build, no duplicated chat interface.
 
-## How it runs
+By default that backend runs in DSH WSL's **own isolated profile and runtime**
+(`~/.local/share/wsl-web-shell`, with its own `DSH_HOME`), so existing sessions,
+projects and credentials from a globally installed `dsh` or from the official Windows
+DeepSeek Harness are **not imported automatically**. Isolation can be switched off in
+the settings to use your globally installed `dsh` and its data instead.
 
-```text
-WSL Web Shell.exe
- └─ supervisor: start distro → resolve dsh → start `dsh web` → read startup URL → cookie → health
-     ├─ local splash / reconnect overlay (orbital loader, reduced-motion aware)
-     └─ sandboxed window with the original WebUI at http://127.0.0.1:3080
-```
+> **Release status.** The newest published prerelease is
+> [`v0.1.0-beta.1`](https://github.com/triagmas/wsl-web-shell/releases/tag/v0.1.0-beta.1).
+> It predates the rename, so it ships a single portable EXE under the old
+> `WSL-Web-Shell-…` name — no Setup EXE. The **DSH WSL Portable + Setup** pair with
+> `SHA256SUMS.txt` is **not published yet**; Windows CI builds it as the
+> `dsh-wsl-windows-x64` artifact of every successful run.
 
-The backend runs in an isolated environment under `~/.local/share/wsl-web-shell`:
-private runtime (`runtime/bin`), `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files
-and the test workspace. Variables are exported inside WSL by the start wrapper, so
-nothing depends on Windows environment forwarding and the shared `~/.dsh` /
-`~/.agents` are never touched. The root must be a dedicated subtree: `/`, `~`,
-one-level paths, traversal and symlinked components are rejected before anything
-is created. Disable it in Settings if you want the distro-wide environment instead.
+## What you get
 
-This is variable/prefix isolation, **not an OS sandbox**: npm install scripts and
-`dsh` tools still run with your Linux user permissions.
+**Your own WSL, your own data.** Agents, models, tools and project files stay inside
+your Linux distribution. DSH WSL never silently changes WSL, Node.js or a globally
+installed `dsh`, and it never touches the official Windows DeepSeek Harness installation,
+your global `npm` prefix or your projects. The only thing it may install or update — and
+only after you confirm it in the app — is **its own isolated DSH runtime**.
 
-Lifecycle: `CHECKING → STARTING_WSL → STARTING_WEB → CONNECTING → READY ↔ HIDDEN_IN_TRAY`,
-with `RECOVERING`, `ERROR`, `QUITTING`. Closing the window hides it to the tray and
-the state follows; a later successful start never re-opens a window you closed.
-Recovery reloads the original WebUI, reclaims only a verified app-owned backend and
-re-checks PID identity before any forced kill. Details:
-[docs/architecture.md](docs/architecture.md).
+**A window that behaves like an app.**
 
-## Verified in a real run
+<p align="center"><img src="docs/media/tray-menu.png" width="300" alt="The tray menu: Focus window, Status, Restart WebUI, Settings, Quit"></p>
 
-Acceptance was executed on the packaged portable EXE inside the owner's own
-Windows 11 + Ubuntu WSL2 environment (details and evidence in
-[docs/evidence/r02.md](docs/evidence/r02.md)):
+Closing the window keeps the app in the tray: *Focus window*, live *Status*,
+*Restart WebUI*, *Settings*, *Quit*. The backend is supervised — if it dies, DSH WSL
+restarts it with bounded retries and shows an honest reconnecting state instead of a
+blank page.
 
-| Checked | Result |
+**A thin status bar, never a second UI.** The app-owned 32 px bar shows the live
+connection state, the running DSH version and the latest GitHub release. The gear
+opens a compact settings popover (distribution, port, isolation, workspace) — the
+WebUI itself is never modified.
+
+| Footer bar | Settings popover |
 |---|---|
-| Backend starts from the isolated runtime, token exchanged in the main process | pass (`token exchange status=200`, `backend ready`) |
-| The window shows the **original** DeepSeek Harness WebUI, no duplicate UI | pass (title `DeepSeek Harness`, `http://127.0.0.1:3080/`, upstream onboarding screen) |
-| Token never exposed | pass (unauthenticated `GET /` answers `401`) |
-| X closes to tray, app and backend keep running | pass (tray tooltip `Connected (window hidden)`) |
-| Tray `Open` / `Restart WebUI` / `Settings…` / `Quit` | pass (each action logged, backend restarted and stopped through the app) |
-| Recovery after the backend dies | pass (`recovery succeeded on attempt 1`, new PID, page reloaded) |
-| Isolated environment holds | pass (`DSH_HOME`, agents, caches, temp and workspace under the isolation root) |
-| Owner's other software untouched | pass (no global packages changed, official Windows Harness install/profile not modified) |
+| ![Footer bar](docs/media/footer-bar.png) | ![Settings popover](docs/media/footer-settings.png) |
 
-Not covered by that run: a model provider and agent sessions (the UI stops at the
-onboarding screen), signing, installer, auto-update, other distros, non-default ports.
-The footer bar and the settings popover described below were added afterwards and have
-not been part of that acceptance run: they are covered by unit tests, a headless
-render smoke (`npm run chrome:smoke`) and the screenshots in
-[docs/footer.md](docs/footer.md).
+**One-click DeepSeek Harness update.** When a newer published release exists, the bar
+offers it. The exact version is staged next to the running runtime, the app-owned
+backend is stopped only for the swap, the previous installation is kept for rollback,
+and the new version is reported only after it actually served the WebUI. An
+interrupted swap is repaired on the next start.
 
-![Footer bar over a mock upstream surface](docs/media/footer-bar.png)
+![Update confirmation](docs/media/update-confirm.png)
 
-When GitHub reports a newer release, the bar also offers a one-click update of the
-isolated runtime: the exact published version is staged below the app's own runtime
-root, the app-owned backend is stopped only for the swap, the previous installation
-is kept for rollback and an interrupted swap is repaired on the next start. The new
-version is reported as successful only after it served the WebUI, and the portable
-EXE then restarts itself. The global `dsh`, the official Windows Harness and the
-projects are never touched. Details in [docs/update.md](docs/update.md).
+## Portable or Setup
 
-| Before | During / after |
-|---|---|
-| ![Update confirmation](docs/media/update-confirm.png) | ![Update terminal](docs/media/update-terminal.png) |
+Both packages are built from the same commit and behave the same; pick how you want
+the app to live on your machine.
 
-### Diagnostics for support
+| | **Portable** | **Setup** |
+|---|---|---|
+| File | `DSH-WSL-<version>-x64-Portable.exe` | `DSH-WSL-<version>-x64-Setup.exe` |
+| Installation | none — double-click to run | normal Windows setup wizard |
+| Admin rights | none | none (per-user) |
+| Shortcuts | none | Start-menu entry, optional desktop shortcut |
+| Uninstall | delete the EXE | Installed apps → *DSH WSL* → Uninstall |
 
-When a window disappears or the app exits, the log now distinguishes the cause
-without recording content: `window <surface> <event>` lines with
-`visible/focused/quitting/session-ending` flags, a `previous session: …` line on
-start-up that reports whether the last run ended through the app's own quit path,
-fatal-error messages (name and message only, no stack), and Electron
-child-process failures. Launch tokens and local user directories are redacted.
+Both share the same profile (`%APPDATA%\wsl-web-shell`) and the same isolated WSL
+runtime, so settings and the installed DSH version are the same whichever you start.
+Details, installer behaviour and CI checks: [docs/packaging.md](docs/packaging.md).
 
-## Requirements
+## Quick start
 
-- Windows 10/11 with WSL2 and an existing distribution (default preset: `Ubuntu`).
-- DeepSeek Harness CLI installed **by you** inside that distribution (`dsh`), either
-  globally or into the app's isolated runtime under `~/.local/share/wsl-web-shell`.
-- The app never installs or upgrades Node, `dsh`, WSL or distributions. Missing
-  prerequisites produce an actionable error instead.
+**You need:** Windows 10/11 x64 with WSL2, an existing distribution (default preset
+`Ubuntu`) and the DeepSeek Harness CLI `dsh` installed **by you** inside it — globally
+or in DSH WSL's isolated runtime.
 
-## Development
-
-```sh
-npm ci
-npm run typecheck     # tsc --noEmit
-npm run lint          # eslint
-npm test              # vitest (unit tests only, no WSL/Electron needed)
-npm run build         # esbuild -> dist/ (main, preloads, local pages, icons)
-npm start             # build + run Electron on the current platform
-npm run smoke:headless  # Linux/WSL: launch the built app under Xvfb with a
-                        # sanitised PATH/HOME; must reach a clean terminal error
-npm run chrome:smoke    # Linux/WSL: render the footer, settings popover and the
-                        # update windows with fixed test data and assert what
-                        # they show (no WSL)
-npm run screenshots     # same render, writes docs/media/*.png
-npm run composition:smoke  # real BrowserWindow + WebContentsView composition
-                        # against a local test server: bar, bounds, resize, session,
-                        # cold-start attach order
-node scripts/check-relaunch.cjs <dir> <exe>
-                        # Windows CI only: verifies that the packaged EXE
-                        # relaunches itself from the portable file, not from the
-                        # temporary extraction directory
-npm run paint:probe     # real screen pixels of a composed window: the remote
-                        # WebUI must be visible above the bar (needs a display;
-                        # CI uses xvfb on Linux and a desktop session on Windows)
-```
-
-Windows packaging (x64, portable EXE):
-
-```sh
-npm run dist          # release/WSL-Web-Shell-<version>-x64.exe
-npm run dist:dir      # unpacked app for inspection
-```
-
-Packaging cross-builds from Linux/WSL as well; the executable is unsigned.
-Code-signing and an installer are future release work.
-
-## Report / verification format
-
-Every implementation report includes: exact HEAD, changed file counts with
-`+added/-deleted` lines, test and CI evidence, packager output path, SHA-256 of
-the artifact, and explicit "not run / blocked" items. Source-level green checks
-are never presented as a real Windows/WSL acceptance PASS.
-
-## Security and privacy
-
-- Backend binds to `127.0.0.1` only; the app refuses to load an unknown listener
-  on the configured port and never kills processes it cannot prove it started.
-- Electron renders remote content sandboxed: no Node integration, context
-  isolation on, exact-origin navigation allowlist, popups denied, tiny
-  permission allowlist, downloads blocked.
-- No silent installs, no touching the official Windows DeepSeek Harness
-  installation, profiles or plugins, no `wsl --shutdown`, no system proxy changes.
-- Existing WSL distributions and Linux projects are never deleted or shut down.
-- Local profile only: `config.json`, the ownership record, the redacted log and
-  the isolated browser session live in the app's own `userData`.
-- The version lookup is informational: one GitHub API call, no credentials, cached
-  for 18 h, never an auto-update and never a request from the renderer.
-- Diagnostics record causes, not content: window show/hide/close events with
-  boolean flags, tray actions, clean/unclean shutdown of the previous run, fatal
-  error messages without stacks, and Electron child-process failures. Page text,
-  cookies, launch tokens and local user directories never reach the log.
+1. Open the [releases page](https://github.com/triagmas/wsl-web-shell/releases) and
+   download `DSH-WSL-<version>-x64-Portable.exe` (no install) or
+   `DSH-WSL-<version>-x64-Setup.exe`, then verify it against `SHA256SUMS.txt`. Until
+   that release is published, both files are available in the `dsh-wsl-windows-x64`
+   artifact of the latest successful Windows CI run. The binaries are unsigned, so
+   SmartScreen may warn about an unknown publisher.
+2. Start DSH WSL. The orbital splash shows the real startup stages: WSL check,
+   runtime resolution, backend start, token exchange.
+3. The official WebUI appears as soon as the backend is ready. Change the
+   distribution, port or isolation mode from the gear if needed.
+4. When a new DeepSeek Harness release is published, use the pill in the status bar;
+   DSH WSL updates the isolated runtime and restarts itself.
 
 ## Documentation
 
-- [Product & architecture contract](docs/spec.md)
-- [Architecture / implementation notes](docs/architecture.md)
-- [Upstream `dsh web` contract and unknowns](docs/upstream-dsh-web.md)
-- [Footer bar, versions and settings popover](docs/footer.md)
-- [One-click update of the isolated runtime](docs/update.md)
-- [Issue #9 evidence (build, checks, artifact)](docs/evidence/r09.md)
-- [M1 issue](https://github.com/triagmas/wsl-web-shell/issues/1) and [agent guidance](AGENTS.md)
+| | |
+|---|---|
+| [Packaging: Portable and Setup](docs/packaging.md) | artifacts, installer, CI, relaunch targets |
+| [Architecture](docs/architecture.md) | process model, supervisor, window composition |
+| [Specification](docs/spec.md) | state machine, tray lifecycle, security rules |
+| [Footer bar and settings](docs/footer.md) | the app-owned chrome |
+| [One-click runtime update](docs/update.md) | transaction, journal, rollback |
+| [Upstream contract](docs/upstream-dsh-web.md) | how `dsh web` is started and verified |
+| [Diagnostics and support](docs/diagnostics.md) | logs, profile, failure states |
+| [Development](docs/development.md) | commands, tests, layout |
+| [Evidence](docs/evidence/r02.md) | real acceptance runs with artifact and SHA-256 |
 
-## Artifact provenance
+## Verification
 
-The portable EXE is built by the `windows-package` CI job (Windows runner,
-`npm run dist`), which records `sha256` in the job summary and uploads
-`SHA256SUMS.txt` next to the EXE. Locally built EXEs are byte-different (packager
-metadata), so a digest is only meaningful together with its source commit and run.
-Pinned release-candidate artifact, its commit and its digest are listed in
-[docs/evidence/r02.md](docs/evidence/r02.md).
+CI runs typecheck, lint, unit tests (source-invariant and Electron-free logic), render
+smoke tests of the app-owned surfaces, a real-screen paint probe and the Windows
+packaging job that installs, relaunches and uninstalls both variants. Real acceptance
+runs on a live Windows 11 + Ubuntu WSL2 machine are recorded in
+[docs/evidence/r02.md](docs/evidence/r02.md), [docs/evidence/r09.md](docs/evidence/r09.md)
+and [docs/evidence/r091.md](docs/evidence/r091.md). Source-level green checks are never
+presented as a substitute for those runs.
 
-A packaged EXE, CI and real acceptance evidence are acceptance requirements. CI
-covers typecheck, lint, unit tests and the Windows package build; the real GUI/WSL
-acceptance for M1 was executed separately and is recorded with its exact artifact.
-Source-level green checks are still never presented as acceptance on their own.
+## License
 
-Licensed MIT. No DeepSeek model weights or official Windows Desktop binaries are redistributed.
+MIT — see [LICENSE](LICENSE). No DeepSeek model weights and no official Windows
+desktop binaries are redistributed.

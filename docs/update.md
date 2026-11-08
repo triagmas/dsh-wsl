@@ -10,7 +10,7 @@ footer pill (only while an update exists)
    -> confirmation window  (facts + Update/Cancel)
    -> terminal window      (streamed output; Close only when the run finished)
    -> backend stopped, runtime swapped, new version started and auth-checked
-   -> app relaunches the portable EXE (or says it cannot)
+   -> app relaunches the packaged EXE (or says it cannot)
 ```
 
 ## When the offer appears
@@ -132,18 +132,29 @@ finished or rolled-back run is closable.
 
 ## Relaunch
 
-`resolveRelaunchTarget()` (pure) only accepts `PORTABLE_EXECUTABLE_FILE` when it
-is an existing `.exe`, because a portable build runs from a temporary extraction
-directory and relaunching `process.execPath` would start a copy that is deleted
-right after exit. When no portable path is available the app **does not** claim
-to restart itself: the terminal window explains that the update succeeded and
-the app has to be started again.
+Two packages exist (portable EXE and NSIS Setup EXE) and they restart differently;
+`resolveRelaunchTarget()` (pure) decides which target is safe:
 
-The Windows CI job proves this on the packaged build:
+- **Portable** — `PORTABLE_EXECUTABLE_FILE` must be an existing `.exe`. A portable
+  build runs from a temporary extraction directory, so relaunching
+  `process.execPath` would start a copy that is deleted right after exit.
+- **Installed** — the app runs in place, so `process.execPath` is the file the user
+  started. It is only accepted when the build is packaged (`app.isPackaged`) and the
+  `resources` directory (with its `app.asar`) belongs to that same executable.
+- **Anything else** (development run, unpacked tree, unverifiable installation) —
+  the app **does not** claim to restart itself: the terminal window explains that
+  the update succeeded and the app has to be started again.
+
+The Windows CI job proves both paths on packaged builds:
 
 ```powershell
-WSL-Web-Shell-0.1.0-x64.exe --relaunch-probe=<dir>
-node scripts/check-relaunch.cjs <dir> <portable-exe>
+# portable
+DSH-WSL-0.1.0-x64-Portable.exe --relaunch-probe=<dir>
+node scripts/check-relaunch.cjs <dir> <portable-exe> --mode=portable
+
+# installed (after the Setup EXE installed it)
+"<install>\DSH WSL.exe" --relaunch-probe=<dir>
+node scripts/check-relaunch.cjs <dir> "<install>\DSH WSL.exe" --mode=installed
 ```
 
 The parent records its own paths, decides the target with the same function the
@@ -155,7 +166,10 @@ A portable build always starts from a fresh extraction directory, so the child's
 `process.execPath` would be wrong. The portable launcher re-establishes the
 origin, so the check asserts that the child still reports
 `PORTABLE_EXECUTABLE_FILE` as the portable EXE (a child started from the inner
-copy would report nothing) and that it is a new process.
+copy would report nothing) and that it is a new process. An installed build has no
+portable origin at all, so the installed check asserts the opposite: no
+`PORTABLE_EXECUTABLE_FILE`, and the child runs from the same installation
+directory as the parent.
 
 ## Windows and IPC
 

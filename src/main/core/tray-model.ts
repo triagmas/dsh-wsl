@@ -53,5 +53,5 @@ export function buildTrayMenu(status: ShellStatus, options: TrayMenuOptions): Tr
 }
 
 export function trayTooltip(status: ShellStatus): string {
-  return `WSL Web Shell — ${describeStatus(status)}`;
+  return `DSH WSL — ${describeStatus(status)}`;
 }
