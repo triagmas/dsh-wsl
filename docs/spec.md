@@ -1,6 +1,6 @@
 # DSH WSL — Product & Architecture Contract
 
-Version: 0.1 / M1. Source of truth: [Issue #1](https://github.com/triagmas/wsl-web-shell/issues/1). Status: specification only; **not yet a working application**.
+Version: 0.1 / M1. Source of truth: [Issue #1](https://github.com/triagmas/dsh-wsl/issues/1). Status: specification only; **not yet a working application**.
 
 ## Purpose
 
@@ -79,4 +79,4 @@ The main window keeps a thin permanent bottom bar (30–34 px) owned by the app:
 
 ## Governance
 
-The source repo is `triagmas/wsl-web-shell` (public, MIT), a fresh product, **not a migration of old plugin code**. Previous plugin repository `triagmas/dsh-wsl-native` stays intact as history. GitHub = source of truth. Do not merge PR or publish release without owner approval. All code/docs in English; user-facing Pi reports in Russian, with HEAD, changed file and +/− lines, tests and explicit blocked/not-run items.
+The source repo is `triagmas/dsh-wsl` (public, MIT), a fresh product, **not a migration of old plugin code**. Previous plugin repository `triagmas/dsh-wsl-native` stays intact as history. GitHub = source of truth. Do not merge PR or publish release without owner approval. All code/docs in English; user-facing Pi reports in Russian, with HEAD, changed file and +/− lines, tests and explicit blocked/not-run items.

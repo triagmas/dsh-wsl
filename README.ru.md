@@ -7,17 +7,17 @@
 <p align="center"><a href="README.md">English</a> · <b>Русский</b></p>
 
 <p align="center">
-  <a href="https://github.com/triagmas/wsl-web-shell/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/triagmas/wsl-web-shell/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://github.com/triagmas/wsl-web-shell/releases"><img alt="Релиз" src="https://img.shields.io/github/v/release/triagmas/wsl-web-shell?include_prereleases&label=release"></a>
+  <a href="https://github.com/triagmas/dsh-wsl/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/triagmas/dsh-wsl/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/triagmas/dsh-wsl/releases"><img alt="Релиз" src="https://img.shields.io/github/v/release/triagmas/dsh-wsl?include_prereleases&label=release"></a>
   <img alt="Платформа" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6">
   <img alt="Electron" src="https://img.shields.io/badge/electron-45.2.3-2B2E3A">
-  <a href="LICENSE"><img alt="Лицензия" src="https://img.shields.io/github/license/triagmas/wsl-web-shell?label=license"></a>
+  <a href="LICENSE"><img alt="Лицензия" src="https://img.shields.io/github/license/triagmas/dsh-wsl?label=license"></a>
 </p>
 
 ![DSH WSL с оригинальным веб-интерфейсом DeepSeek Harness и панелью состояния](docs/media/hero.png)
 
 <p align="center">
-  <a href="https://github.com/triagmas/wsl-web-shell/releases"><b>⬇ Скачать для Windows (x64)</b></a>
+  <a href="https://github.com/triagmas/dsh-wsl/releases"><b>⬇ Скачать для Windows (x64)</b></a>
 </p>
 
 DSH WSL — небольшая оболочка на Electron для веб-интерфейсов, работающих внутри WSL2.
@@ -33,7 +33,7 @@ DSH WSL — небольшая оболочка на Electron для веб-ин
 чтобы использовать глобально установленный `dsh` и его данные.
 
 > **Статус релиза.** Новейший опубликованный пререлиз —
-> [`v0.1.0-beta.1`](https://github.com/triagmas/wsl-web-shell/releases/tag/v0.1.0-beta.1).
+> [`v0.1.0-beta.1`](https://github.com/triagmas/dsh-wsl/releases/tag/v0.1.0-beta.1).
 > Он выпущен до переименования, поэтому содержит единственный portable EXE со старым
 > именем `WSL-Web-Shell-…` — без Setup EXE. Пара **DSH WSL Portable + Setup** с
 > `SHA256SUMS.txt` пока **не опубликована**; Windows CI собирает её как артефакт
@@ -97,7 +97,7 @@ runtime в WSL, поэтому настройки и версия DSH общие
 `Ubuntu`) и установленный **вами** DeepSeek Harness CLI `dsh` внутри него — глобально
 или в изолированном runtime DSH WSL.
 
-1. Откройте [страницу релизов](https://github.com/triagmas/wsl-web-shell/releases) и
+1. Откройте [страницу релизов](https://github.com/triagmas/dsh-wsl/releases) и
    скачайте `DSH-WSL-<version>-x64-Portable.exe` (без установки) или
    `DSH-WSL-<version>-x64-Setup.exe`, затем сверьте файл с `SHA256SUMS.txt`. Пока этот
    релиз не опубликован, оба файла лежат в артефакте `dsh-wsl-windows-x64` последнего

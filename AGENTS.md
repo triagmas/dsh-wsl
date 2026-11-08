@@ -1,6 +1,6 @@
 # Agent development contract (Pi and other coding assistants)
 
-**Read first:** [docs/spec.md](docs/spec.md) and [Issue #1](https://github.com/triagmas/wsl-web-shell/issues/1).
+**Read first:** [docs/spec.md](docs/spec.md) and [Issue #1](https://github.com/triagmas/dsh-wsl/issues/1).
 
 ## Objective
 
@@ -8,7 +8,7 @@ Build a **small standalone Windows Electron application for WSL WebUIs**. The fi
 
 ## Repo/workflow
 
-- Source of truth: `triagmas/wsl-web-shell`. Implement in `feat/m1-electron-shell`, base `main`.
+- Source of truth: `triagmas/dsh-wsl`. Implement in `feat/m1-electron-shell`, base `main`.
 - Current main is a fresh MIT repo. **Do not import old `dsh-wsl-native` internals**. Do not modify `triagmas/dsh-wsl-native`, its closed PRs, or this repo's `main` except via a separately approved merge.
 - R00/R01 only: implement, run non-destructive build/tests, report. **No real execution inside owner's Ubuntu WSL, installation/upgrade, process killing or network/package fetching beyond normal isolated development needs without explicit owner approval**. Do not assume personal Windows paths are available from GitHub.
 - No merge, release, repository rename or tag without owner approval. Keep changes in reasonably sized macro packages, not dozens of micro-PRs.
