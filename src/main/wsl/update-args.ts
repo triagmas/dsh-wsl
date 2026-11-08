@@ -155,6 +155,70 @@ const BACKUP_BASE_HELPER = [
   '}',
 ].join('\n');
 
+/**
+ * Is the directory a real directory that canonicalises to itself?
+ *
+ * Used before anything is deleted or replaced: a symlinked ancestor of the
+ * package directory (`<prefix>/lib`, `<prefix>/lib/node_modules`,
+ * `…/@deepseek-ai`) would otherwise redirect `rm -rf` outside the approved
+ * installation (review C2).
+ */
+const REAL_DIR_HELPER = [
+  'real_dir() {',
+  '[ -d "$1" ] && [ ! -L "$1" ] || return 1',
+  '[ "$(cd "$1" 2>/dev/null && pwd -P)" = "$1" ] || return 1',
+  'return 0',
+  '}',
+].join('\n');
+
+/**
+ * Refuse any redirected or symlinked ancestry of the mutation target (C2).
+ *
+ * `$1` = npm prefix, `$2` = package directory, `$3` = executable shim.
+ */
+const DEST_TRUSTED_HELPER = [
+  'dest_trusted() {',
+  'pfx="$1"; target="$2"; shim="$3"',
+  'real_dir "$pfx" || { echo "update: the npm prefix $pfx is not a real directory" >&2; return 1; }',
+  'case "$target" in "$pfx"/lib/node_modules/?*|"$pfx"/node_modules/?*) ;; *) echo "update: $target is outside the npm prefix $pfx" >&2; return 1 ;; esac',
+  'parent="$(dirname "$target")"',
+  'rest="${parent#"$pfx"/}"',
+  '[ -n "$rest" ] || { echo "update: unexpected package location $target" >&2; return 1; }',
+  'cur="$pfx"',
+  'while :; do',
+  'case "$rest" in */*) part="${rest%%/*}"; rest="${rest#*/}" ;; *) part="$rest"; rest="" ;; esac',
+  'cur="$cur/$part"',
+  'real_dir "$cur" || { echo "update: $cur is not a real directory (symlinked or redirected)" >&2; return 1; }',
+  '[ -z "$rest" ] && break',
+  'done',
+  '[ ! -L "$target" ] || { echo "update: $target is a symlink" >&2; return 1; }',
+  'shim_dir="$(dirname "$shim")"',
+  'real_dir "$shim_dir" || { echo "update: the executable directory $shim_dir is not a real directory" >&2; return 1; }',
+  'return 0',
+  '}',
+].join('\n');
+
+/**
+ * Deterministic content manifest of a snapshot payload and its verification.
+ *
+ * `cksum` (POSIX) over a sorted relative file list detects truncated, altered or
+ * removed files, so a snapshot that merely *looks* present can never be used to
+ * delete a working installation (review C3).
+ */
+const MANIFEST_HELPER = [
+  'manifest_of() {',
+  '( cd "$1" && find . -type f -print | LC_ALL=C sort | while IFS= read -r f; do cksum "$f"; done )',
+  '}',
+  'manifest_ok() {',
+  '[ -d "$1/payload" ] && [ -f "$1/manifest" ] || return 1',
+  'manifest_of "$1/payload" 2>/dev/null | cmp -s - "$1/manifest" || return 1',
+  'want="$(meta_value files "$1/meta")"',
+  'have="$(wc -l < "$1/manifest" 2>/dev/null | tr -d " ")"',
+  '[ -z "$want" ] || [ "$want" = "$have" ] || return 1',
+  'return 0',
+  '}',
+].join('\n');
+
 /** Read one `key=value` line from a snapshot `meta` file. */
 const META_HELPER = [
   'meta_value() {',
@@ -186,6 +250,7 @@ const SNAPSHOT_HELPER = [
   'se="$(meta_value entry "$sn/meta")" || return 1',
   '[ -n "$se" ] || return 1',
   '[ -f "$sn/payload/$se" ] || return 1',
+  'manifest_ok "$sn" || { echo "update: the snapshot at $sn failed its integrity check" >&2; return 1; }',
   'return 0',
   '}',
 ].join('\n');
@@ -344,39 +409,48 @@ export const PREPARE_BACKUP_SCRIPT = [
   'case "$real_path" in /*) ;; *) echo "backup: rejected real path" >&2; exit 64 ;; esac',
   VERSION_HELPER,
   META_HELPER,
+  MANIFEST_HELPER,
+  REAL_DIR_HELPER,
+  DEST_TRUSTED_HELPER,
+  SNAPSHOT_HELPER,
   BACKUP_BASE_HELPER,
   'backup_base "$app_root" || exit 79',
   'sn="$upd/shared-backup-$tx"',
-  '[ ! -L "$sn" ] || { echo "backup: $sn is a symlink" >&2; exit 79; }',
-  '[ ! -L "$sn.tmp" ] || { echo "backup: $sn.tmp is a symlink" >&2; exit 79; }',
+  // C3: a pre-existing directory with this transaction's name is not ours.
   '[ -e "$sn" ] && { echo "backup: $sn already exists" >&2; exit 79; }',
+  '[ -L "$sn" ] && { echo "backup: $sn is a symlink" >&2; exit 79; }',
+  '[ -e "$sn.tmp" ] && { echo "backup: $sn.tmp already exists" >&2; exit 79; }',
+  '[ -L "$sn.tmp" ] && { echo "backup: $sn.tmp is a symlink" >&2; exit 79; }',
   // Identity of the installation we are about to snapshot.
   'real="$(readlink -f "$dsh" 2>/dev/null)" || real=""',
   '[ "$real" = "$real_path" ] || { echo "backup: $dsh resolves to [$real] instead of [$real_path]" >&2; exit 81; }',
   '[ -d "$pkg" ] && [ ! -L "$pkg" ] || { echo "backup: $pkg is not a real directory" >&2; exit 81; }',
   'pkg_canon="$(cd "$pkg" && pwd -P)" || { echo "backup: $pkg cannot be resolved" >&2; exit 81; }',
   '[ "$pkg_canon" = "$pkg" ] || { echo "backup: $pkg resolves to $pkg_canon" >&2; exit 81; }',
-  'case "$pkg" in "$prefix"/lib/node_modules/*|"$prefix"/node_modules/*) ;; *) echo "backup: $pkg is not inside the npm prefix $prefix" >&2; exit 81 ;; esac',
+  'dest_trusted "$prefix" "$pkg" "$dsh" || exit 81',
   'case "$real" in "$pkg"/*) ;; *) echo "backup: $dsh is outside the package $pkg" >&2; exit 81 ;; esac',
   'grep -q "\\"name\\"[[:space:]]*:[[:space:]]*\\"' + NPM_PACKAGE + '\\"" "$pkg/package.json" 2>/dev/null || { echo "backup: $pkg is not ' + NPM_PACKAGE + '" >&2; exit 81; }',
   'have="$(version_of "$dsh")"',
   '[ "$have" = "$installed" ] || { echo "backup: $dsh reports [$have] instead of [$installed]" >&2; exit 81; }',
   'entry="${real#"$pkg"/}"',
   '[ -n "$entry" ] && [ "$entry" != "$real" ] || { echo "backup: the executable is not inside the package" >&2; exit 81; }',
-  // Copy and verify.
-  'rm -rf "$sn.tmp" 2>/dev/null || { echo "backup: $sn.tmp cannot be removed" >&2; exit 80; }',
+  // Copy and verify. Only a directory this invocation created is ever removed.
+  'created=no',
+  'cleanup() { [ "$created" = "yes" ] && rm -rf "$sn.tmp" 2>/dev/null; }',
   'mkdir -p "$sn.tmp/payload" 2>/dev/null || { echo "backup: $sn.tmp cannot be created" >&2; exit 80; }',
-  'if ! cp -a "$pkg/." "$sn.tmp/payload/" 2>/dev/null; then echo "backup: the package could not be copied (free space?)" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; fi',
-  '[ -f "$sn.tmp/payload/package.json" ] || { echo "backup: the copied package is incomplete" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }',
-  '[ -f "$sn.tmp/payload/$entry" ] || { echo "backup: the copied entry point $entry is missing" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }',
+  'created=yes',
+  'if ! cp -a "$pkg/." "$sn.tmp/payload/" 2>/dev/null; then echo "backup: the package could not be copied (free space?)" >&2; cleanup; exit 80; fi',
+  '[ -f "$sn.tmp/payload/package.json" ] || { echo "backup: the copied package is incomplete" >&2; cleanup; exit 80; }',
+  '[ -f "$sn.tmp/payload/$entry" ] || { echo "backup: the copied entry point $entry is missing" >&2; cleanup; exit 80; }',
   'copied="$(version_of "$sn.tmp/payload/$entry")"',
-  '[ "$copied" = "$installed" ] || { echo "backup: the copied executable reports [$copied] instead of [$installed]" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }',
-  'files="$(find "$sn.tmp/payload" -type f 2>/dev/null | wc -l | tr -d " ")"',
-  '[ -n "$files" ] && [ "$files" -gt 0 ] || { echo "backup: the copied package contains no files" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }',
+  '[ "$copied" = "$installed" ] || { echo "backup: the copied executable reports [$copied] instead of [$installed]" >&2; cleanup; exit 80; }',
+  'manifest_of "$sn.tmp/payload" > "$sn.tmp/manifest" 2>/dev/null || { echo "backup: the content manifest could not be written" >&2; cleanup; exit 80; }',
+  'files="$(wc -l < "$sn.tmp/manifest" 2>/dev/null | tr -d " ")"',
+  '[ -n "$files" ] && [ "$files" -gt 0 ] || { echo "backup: the copied package contains no files" >&2; cleanup; exit 80; }',
   // Executable state: a symlink target or a copy of the shim file.
   'link=no; link_target="-"',
-  'if [ -L "$dsh" ]; then link=yes; link_target="$(readlink "$dsh")"; [ -n "$link_target" ] || { echo "backup: the shim $dsh has no target" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }; printf "%s" "$link_target" > "$sn.tmp/dsh.link" || exit 80; fi',
-  'if [ "$link" = "no" ]; then [ -f "$dsh" ] || { echo "backup: $dsh is neither a file nor a symlink" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }; cp -a "$dsh" "$sn.tmp/dsh" || { echo "backup: $dsh could not be copied" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }; fi',
+  'if [ -L "$dsh" ]; then link=yes; link_target="$(readlink "$dsh")"; [ -n "$link_target" ] || { echo "backup: the shim $dsh has no target" >&2; cleanup; exit 80; }; printf "%s" "$link_target" > "$sn.tmp/dsh.link" || { cleanup; exit 80; }; fi',
+  'if [ "$link" = "no" ]; then [ -f "$dsh" ] || { echo "backup: $dsh is neither a file nor a symlink" >&2; cleanup; exit 80; }; cp -a "$dsh" "$sn.tmp/dsh" || { echo "backup: $dsh could not be copied" >&2; cleanup; exit 80; }; fi',
   '{',
   'printf "version=%s\\n" "$installed"',
   'printf "real=%s\\n" "$real_path"',
@@ -388,9 +462,10 @@ export const PREPARE_BACKUP_SCRIPT = [
   'printf "entry=%s\\n" "$entry"',
   'printf "files=%s\\n" "$files"',
   'printf "transaction=%s\\n" "$tx"',
-  '} > "$sn.tmp/meta" || { echo "backup: the snapshot record could not be written" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }',
-  'mv "$sn.tmp" "$sn" 2>/dev/null || { echo "backup: the snapshot could not be moved into place" >&2; rm -rf "$sn.tmp" 2>/dev/null || true; exit 80; }',
-  '[ -d "$sn" ] && [ ! -L "$sn" ] || { echo "backup: the snapshot is not a real directory" >&2; exit 80; }',
+  '} > "$sn.tmp/meta" || { echo "backup: the snapshot record could not be written" >&2; cleanup; exit 80; }',
+  'mv "$sn.tmp" "$sn" 2>/dev/null || { echo "backup: the snapshot could not be moved into place" >&2; cleanup; exit 80; }',
+  'created=no',
+  'snapshot_ok "$sn" "$installed" || { echo "backup: the finished snapshot did not verify" >&2; exit 80; }',
   `printf "%s path=%s\\n" "${BACKUP_MARKER}" "$sn"`,
   `printf "%s version=%s\\n" "${BACKUP_MARKER}" "$installed"`,
   `printf "%s real=%s\\n" "${BACKUP_MARKER}" "$real_path"`,
@@ -446,6 +521,9 @@ export const UPDATE_SHARED_SCRIPT = [
   VERSION_HELPER,
   FOREIGN_HELPER,
   META_HELPER,
+  MANIFEST_HELPER,
+  REAL_DIR_HELPER,
+  DEST_TRUSTED_HELPER,
   BACKUP_BASE_HELPER,
   SNAPSHOT_HELPER,
   // 1. App-owned backup location and the verified snapshot of *this* installation.
@@ -470,6 +548,7 @@ export const UPDATE_SHARED_SCRIPT = [
   '[ "$pkg_canon" = "$pkg" ] || { echo "update: $pkg resolves to [$pkg_canon], so nothing was changed" >&2; exit 81; }',
   'case "$pkg" in "$prefix"/lib/node_modules/*|"$prefix"/node_modules/*) ;; *) echo "update: $pkg is not inside the npm prefix $prefix, so nothing was changed" >&2; exit 81 ;; esac',
   'case "$real" in "$pkg"/*) ;; *) echo "update: $dsh points outside the package $pkg, so nothing was changed" >&2; exit 81 ;; esac',
+  'dest_trusted "$prefix" "$pkg" "$dsh" || { echo "update: the installation path is redirected, so nothing was changed" >&2; exit 81; }',
   'grep -q "\\"name\\"[[:space:]]*:[[:space:]]*\\"' + NPM_PACKAGE + '\\"" "$pkg/package.json" 2>/dev/null || { echo "update: $pkg is not an ' + NPM_PACKAGE + ' package, so nothing was changed" >&2; exit 81; }',
   'now="$(version_of "$dsh")"',
   'if [ "$now" = "$ver" ]; then echo "update: the installation already reports $ver" >&2; exit 77; fi',
@@ -478,7 +557,12 @@ export const UPDATE_SHARED_SCRIPT = [
   'login=""; login_real="-"',
   'if command -v bash >/dev/null 2>&1; then login="$(bash -lc "command -v dsh" 2>/dev/null | tr -d "\\r" | tail -n 1)"; fi',
   'if [ -n "$login" ] && [ -x "$login" ]; then login_real="$(readlink -f "$login" 2>/dev/null)" || login_real="$login"; fi',
-  'if [ "$login_real" != "-" ] && [ "$login_real" != "$real" ]; then echo "update: a login shell resolves [$login] ($login_real) instead of the approved installation, so nothing was changed" >&2; exit 82; fi',
+  // C1: "unknown" is not agreement. No bash, no `dsh` on the shell PATH or an
+  // unparsable version all stop the update before anything is written.
+  'if [ -z "$login" ] || [ ! -x "$login" ]; then echo "update: a login shell cannot resolve dsh (bash -lc printed nothing), so the update cannot change the CLI you use in a terminal; nothing was changed" >&2; exit 82; fi',
+  'login_before="$(version_of "$login")"',
+  'if [ "$login_before" != "$installed" ]; then echo "update: a login shell reports [$login_before] for $login instead of [$installed], so nothing was changed" >&2; exit 82; fi',
+  'if [ "$login_real" != "$real" ]; then echo "update: a login shell resolves [$login] ($login_real) instead of the approved installation, so nothing was changed" >&2; exit 82; fi',
   // 5. Nobody else may be using the installation.
   'foreign="$(foreign_count "$real" "$own")"',
   'if [ "$foreign" != "0" ]; then echo "update: $foreign other DeepSeek Harness process(es) use $dsh" >&2; exit 78; fi',
@@ -486,8 +570,8 @@ export const UPDATE_SHARED_SCRIPT = [
   'restore_snapshot() {',
   'snapshot_ok "$snapshot" "$installed" || { echo "update: the snapshot is not usable any more" >&2; return 1; }',
   'target="$pkg"',
-  '[ ! -L "$target" ] || { echo "update: $target is a symlink, refusing to replace it" >&2; return 1; }',
-  'case "$target" in "$prefix"/lib/node_modules/*|"$prefix"/node_modules/*) ;; *) echo "update: $target is outside the npm prefix, refusing to replace it" >&2; return 1 ;; esac',
+  // C2: no symlinked ancestor and no redirected destination may be replaced.
+  'dest_trusted "$prefix" "$target" "$dsh" || { echo "update: refusing to restore into a redirected installation path" >&2; return 1; }',
   'mkdir -p "$(dirname "$target")" 2>/dev/null || return 1',
   'rm -rf "$target" || { echo "update: $target could not be replaced" >&2; return 1; }',
   'cp -a "$snapshot/payload/." "$target/" || { echo "update: the snapshot could not be copied back" >&2; return 1; }',
@@ -591,15 +675,18 @@ export const ROLLBACK_SHARED_SCRIPT = [
   'if [ "$node" != "-" ] && [ -n "$node" ]; then PATH="$(dirname "$node"):$PATH"; export PATH; fi',
   VERSION_HELPER,
   META_HELPER,
+  MANIFEST_HELPER,
+  REAL_DIR_HELPER,
+  DEST_TRUSTED_HELPER,
   BACKUP_BASE_HELPER,
   SNAPSHOT_HELPER,
   'backup_base "$app_root" || exit 79',
   'expected="$upd/shared-backup-$tx"',
   '[ "$snapshot" = "$expected" ] || { echo "update: the snapshot path [$snapshot] is not the expected [$expected]" >&2; exit 79; }',
   '[ ! -L "$snapshot" ] || { echo "update: the snapshot $snapshot is a symlink" >&2; exit 79; }',
-  // Destination ownership before any destructive step.
-  'case "$pkg" in "$prefix"/lib/node_modules/*|"$prefix"/node_modules/*) ;; *) echo "update: $pkg is outside the npm prefix $prefix" >&2; exit 81 ;; esac',
-  '[ ! -L "$pkg" ] || { echo "update: $pkg is a symlink, refusing to replace it" >&2; exit 81; }',
+  // Destination ownership before any destructive step (C2): the whole ancestry
+  // and the executable's directory must be real, canonical directories.
+  'dest_trusted "$prefix" "$pkg" "$dsh" || { echo "update: refusing to restore into a redirected installation path" >&2; exit 81; }',
   'if snapshot_ok "$snapshot" "$ver"; then',
   'snap_pkg="$(meta_value package "$snapshot/meta")"; snap_real="$(meta_value real "$snapshot/meta")"',
   'if [ "$snap_pkg" = "$pkg" ] && [ "$snap_real" = "$real_path" ]; then',

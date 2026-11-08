@@ -249,11 +249,52 @@ describe('backup script (B1)', () => {
     expect(argv.slice(6)).toEqual([DSH, PREFIX, PKG, REAL, '0.2.1-rc.5', '20261107T101500Z-1a2b', APP_ROOT]);
   });
 
-  it('refuses symlinked or pre-existing snapshot locations', () => {
+  it('refuses symlinked or pre-existing snapshot locations (C3)', () => {
     expect(PREPARE_BACKUP_SCRIPT).toContain('[ ! -L "$sn" ]');
-    expect(PREPARE_BACKUP_SCRIPT).toContain('[ ! -L "$sn.tmp" ]');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ -L "$sn.tmp" ]');
     expect(PREPARE_BACKUP_SCRIPT).toContain('[ -e "$sn" ] &&');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('[ -e "$sn.tmp" ] &&');
     expect(PREPARE_BACKUP_SCRIPT).toContain('exit 79');
+    // A pre-existing temp tree is never removed: cleanup only removes what this
+    // invocation created.
+    expect(PREPARE_BACKUP_SCRIPT).not.toContain('rm -rf "$sn.tmp" 2>/dev/null ||');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('cleanup() { [ "$created" = "yes" ]');
+    const removal = PREPARE_BACKUP_SCRIPT.slice(PREPARE_BACKUP_SCRIPT.indexOf('[ -e "$sn.tmp" ]'));
+    expect(removal.indexOf('rm -rf')).toBeGreaterThan(0);
+  });
+
+  it('writes a content manifest and re-verifies it (C3)', () => {
+    expect(PREPARE_BACKUP_SCRIPT).toContain('manifest_of "$sn.tmp/payload"');
+    expect(PREPARE_BACKUP_SCRIPT).toContain('snapshot_ok "$sn" "$installed"');
+    // Every consumer re-verifies the manifest before it deletes anything.
+    for (const script of [UPDATE_SHARED_SCRIPT, ROLLBACK_SHARED_SCRIPT]) {
+      expect(script).toContain('manifest_ok "$sn"');
+      expect(script).toContain('cksum');
+      expect(script).toContain('cmp -s -');
+      const check = script.indexOf('manifest_ok "$sn"');
+      expect(check).toBeGreaterThan(-1);
+    }
+    // The integrity check happens before the destructive restore.
+    expect(UPDATE_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$installed"')).toBeLessThan(
+      UPDATE_SHARED_SCRIPT.indexOf('rm -rf "$target"'),
+    );
+    expect(ROLLBACK_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$ver"')).toBeLessThan(
+      ROLLBACK_SHARED_SCRIPT.indexOf('rm -rf "$pkg"'),
+    );
+  });
+
+  it('refuses a redirected ancestry before replacing anything (C2)', () => {
+    for (const script of [UPDATE_SHARED_SCRIPT, ROLLBACK_SHARED_SCRIPT, PREPARE_BACKUP_SCRIPT]) {
+      expect(script).toContain('dest_trusted');
+      expect(script).toContain('real_dir');
+      expect(script).toContain('is not a real directory (symlinked or redirected)');
+    }
+    expect(UPDATE_SHARED_SCRIPT.indexOf('dest_trusted "$prefix" "$target"')).toBeLessThan(
+      UPDATE_SHARED_SCRIPT.indexOf('rm -rf "$target"'),
+    );
+    expect(ROLLBACK_SHARED_SCRIPT.indexOf('dest_trusted "$prefix" "$pkg"')).toBeLessThan(
+      ROLLBACK_SHARED_SCRIPT.indexOf('rm -rf "$pkg"'),
+    );
   });
 
   it('copies the package and the executable shim state, then verifies both', () => {
@@ -322,8 +363,9 @@ describe('rollback script', () => {
     expect(ROLLBACK_SHARED_SCRIPT.indexOf('snapshot_ok "$snapshot" "$ver"')).toBeLessThan(
       ROLLBACK_SHARED_SCRIPT.indexOf('install --global --prefix'),
     );
-    // A destination that is no longer the expected one is never replaced.
-    expect(ROLLBACK_SHARED_SCRIPT).toContain('[ ! -L "$pkg" ]');
+    // A destination that is no longer the expected one is never replaced, and
+    // neither is one whose ancestry was redirected (C2).
+    expect(ROLLBACK_SHARED_SCRIPT).toContain('dest_trusted "$prefix" "$pkg" "$dsh"');
     expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 81');
     expect(ROLLBACK_SHARED_SCRIPT).toContain('exit 74');
   });

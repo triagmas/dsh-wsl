@@ -59,6 +59,10 @@ validation, the same version verification, the same rollback.
 | Offline recovery works (B1) | after a simulated crash (package entry point and manifest removed) with the registry switched off, `ROLLBACK_SHARED_SCRIPT` restores the previous version from the snapshot alone and never calls npm; with the snapshot removed it fails explicitly (`74`) instead of guessing |
 | Changed identity is refused (B2) | re-pointing `bin/dsh` at a foreign package, replacing the package directory with a symlink, switching the npm prefix and replacing the package manifest each abort (`81`/`76`) with nothing written |
 | Login-shell divergence is a failure (B3) | a shell profile that resolves another `dsh` before the install exits `82`; a shadowing change that happens *during* a successful install exits `84`, restores the previous version and leaves it installed |
+| An unresolvable login shell is a failure (C1) | a profile without `dsh` exits `82` before anything is written; a shell whose `dsh` cannot report the installed version exits `82`; a profile that loses `dsh` *after* a successful install exits `84` and restores the previous version |
+| A redirected ancestry is never replaced (C2) | replacing `<prefix>/lib/node_modules/@deepseek-ai` with a symlink to an outside tree makes both the update and the rollback exit `81`; the outside sentinel and tree stay untouched |
+| Pre-existing backup temps are left alone (C3) | a `shared-backup-<tx>.tmp` directory created beforehand survives with its content and no snapshot is published (`79`) |
+| Corrupt snapshots are refused (C3) | changing one byte of the payload makes the update exit `80` and the rollback refuse the snapshot entirely (`74` with the registry off); the working installation and the CLI stay intact |
 
 ## Limits
 

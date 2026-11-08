@@ -998,6 +998,39 @@ describe('recovery snapshot and identity checks (review B1-B3)', () => {
     expect(outcome.state.detail).toContain('login shell');
   });
 
+  it('refuses a plan when a login shell cannot resolve the installation at all (C1)', () => {
+    for (const overrides of [
+      { loginShellRealPath: null },
+      { loginShellRealPath: null, loginShellVersion: null },
+      { loginShellVersion: null },
+      { loginShellVersion: '0.2.0' },
+    ]) {
+      const result = planSharedUpdate({
+        distro: 'Ubuntu',
+        targetVersion: '0.2.2-rc.1',
+        appRoot: '/home/dev/.local/share/wsl-web-shell',
+        installation: { ...DEFAULT_INSTALLATION, ...overrides },
+        customExecutable: false,
+      });
+      expect(result.ok).toBe(false);
+      expect(result.ok === false && result.reason).toBe('login-shell-mismatch');
+    }
+  });
+
+  it('rolls back when the login shell becomes unresolvable after the update (C1)', async () => {
+    const h = runnerHarness();
+    h.wsl.installationAfterUpdate = {
+      version: '0.2.2-rc.1',
+      loginShellRealPath: null,
+      loginShellVersion: null,
+    };
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.state.phase).not.toBe('done');
+    expect(h.wsl.rollbackRuns).toHaveLength(1);
+    expect(h.journal.current()).toBeNull();
+  });
+
   it('refuses a plan when the login shell resolves another installation', () => {
     const result = planSharedUpdate({
       distro: 'Ubuntu',

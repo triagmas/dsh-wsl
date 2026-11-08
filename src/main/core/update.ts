@@ -289,7 +289,7 @@ export function describeUpdateReason(reason: string): string {
     case UPDATE_REASONS.noNpm:
       return 'npm was not found in this WSL distribution, so the installation cannot be updated from the app.';
     case UPDATE_REASONS.loginShellMismatch:
-      return 'An ordinary WSL login shell resolves a different DeepSeek Harness executable than the one this app runs, so updating would not change the CLI you use in a terminal. Fix the PATH order in your shell profile (or clear a pinned path in Settings) and try again.';
+      return 'An ordinary WSL login shell does not resolve the same DeepSeek Harness executable this app runs (or cannot report its version), so updating would not change the CLI you use in a terminal. Make sure `bash -lc "command -v dsh"` prints the installation you expect, fix the PATH order in your shell profile, or clear a pinned path in Settings, then try again.';
     case UPDATE_REASONS.backupUnavailable:
       return 'The verified recovery snapshot could not be created, so nothing was changed. Check the free space and write access of the app data directory inside WSL and retry.';
     default:
@@ -346,7 +346,10 @@ export function planSharedUpdate(input: SharedUpdatePlanInput): SharedUpdatePlan
     return {
       ok: false,
       reason: UPDATE_REASONS.loginShellMismatch,
-      detail: installation.loginShellRealPath,
+      detail:
+        installation.loginShellRealPath === null
+          ? 'a login shell does not resolve dsh at all'
+          : `${installation.loginShellRealPath} (${installation.loginShellVersion ?? 'no version'})`,
     };
   }
   return {

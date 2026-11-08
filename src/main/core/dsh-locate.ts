@@ -180,14 +180,21 @@ export function isNpmGlobalInstallation(installation: DshInstallation): boolean 
 }
 
 /**
- * Does the ordinary terminal resolve exactly the installation the app runs?
+ * Does the ordinary terminal run exactly the installation the app runs?
  *
- * `true` when no login shell could be resolved at all (nothing to disagree
- * with), otherwise false unless both sides report the same real path.
+ * The product contract is that an update changes *the* DeepSeek Harness a WSL
+ * login shell uses. That contract cannot be verified when the shell resolves
+ * nothing (no `bash`, no `dsh` on its `PATH`, an unreadable profile) or when it
+ * cannot report a version — an unknown answer is not agreement (review C1), so
+ * those cases return `false` and the caller refuses to update.
  */
 export function loginShellAgrees(installation: DshInstallation): boolean {
-  if (installation.loginShellRealPath === null) return true;
-  return installation.loginShellRealPath === installation.realPath;
+  if (installation.loginShellRealPath === null) return false;
+  if (installation.loginShellRealPath !== installation.realPath) return false;
+  if (installation.loginShellVersion === null) return false;
+  if (installation.version === null) return false;
+  // Same file, same version: the shell must report what the app runs.
+  return installation.loginShellVersion === installation.version;
 }
 
 /** One-line description for logs: never contains tokens or session data. */

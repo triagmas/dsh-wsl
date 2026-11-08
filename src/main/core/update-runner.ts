@@ -464,9 +464,15 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         }
         const shellReal = after.installation?.loginShellRealPath ?? null;
         const shellVersion = after.installation?.loginShellVersion ?? null;
-        if (shellReal !== null && (shellReal !== verified.realPath || !isSameVersion(shellVersion, verified.version))) {
+        // C1: an unresolvable login shell is a failure, not an absence of evidence.
+        const shellOk =
+          shellReal !== null &&
+          shellVersion !== null &&
+          shellReal === verified.realPath &&
+          isSameVersion(shellVersion, verified.version);
+        if (!shellOk) {
           terminal.append(
-            `update: a login shell resolves ${shellReal} (${shellVersion ?? 'no version'}) instead of ${verified.realPath}`,
+            `update: a login shell resolves ${shellReal ?? 'nothing'} (${shellVersion ?? 'no version'}) instead of ${verified.realPath}`,
           );
           return await rollback(
             verified,

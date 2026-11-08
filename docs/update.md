@@ -61,7 +61,7 @@ does not exist.
 | `not-writable` | the prefix needs elevated rights; the window shows the exact `npm install -g --prefix …` command instead |
 | `foreign-process` | another `dsh` process runs from the same installation (the app never kills it) |
 | `no-npm` | npm is not available in that distribution |
-| `login-shell-mismatch` | a login shell resolves a different executable than the app runs, so updating would not change the CLI a terminal uses |
+| `login-shell-mismatch` | a login shell resolves a different executable than the app runs, cannot resolve one at all, or cannot report its version — so updating would not provably change the CLI a terminal uses |
 
 The provenance comes from a read-only inspection (`INSPECT_SHARED_SCRIPT`),
 never from guessing:
@@ -116,12 +116,26 @@ the path, and recovery restores from it, so **an interrupted install can be
 repaired with no registry access at all**. `npm install` of the previous version
 is only the fallback.
 
+The snapshot also carries a deterministic content manifest (`cksum` over the
+sorted relative file list, plus `meta`'s file count). `snapshot_ok()` recomputes
+it before **every** consumer runs, so a truncated or modified backup is refused
+instead of being copied over a working installation, and a `.tmp` directory that
+already exists is rejected before any removal — cleanup only ever removes a tree
+the current invocation created.
+
 ### Identity at the last safe moment (B2)
 
 `realPath` from the plan is passed into the mutating script and compared again
 right before the install, together with a re-canonicalised package directory, the
 expected npm package name in its `package.json`, containment in
 `<prefix>/lib/node_modules`, and the npm prefix reported by `npm prefix -g`.
+
+`dest_trusted()` additionally walks every ancestor between the prefix and the
+package directory and requires each one — and the executable's own directory — to
+be a real directory that canonicalises to itself, before any install, and again
+inside the restore path before a single `rm -rf`. A parent swapped for a symlink
+therefore aborts with `81` instead of writing through it; a foreign tree behind
+such a link is never touched.
 A moved symlink, a foreign package at that path, a symlinked package directory, a
 changed prefix or a changed installation manager aborts with `exit 81` and the
 message "nothing was changed". Rollback re-validates the destination the same way
@@ -130,10 +144,13 @@ before replacing anything, so no `rm -rf` can run through a redirected path.
 ### The login shell must run the update too (B3)
 
 Before and after the install the script resolves `dsh` through
-`bash -lc 'command -v dsh'`. A different real path before the install means the
-update would not change the CLI a terminal uses: it is refused (`82`). A different
-path or version after the install is a **failure**, not a warning: the snapshot is
-restored and the run exits `84`. The runner repeats the same comparison from a
+`bash -lc 'command -v dsh'`. **Unknown is not agreement:** a shell that resolves
+nothing (no `bash`, no `dsh` on the shell `PATH`, an unreadable profile) or cannot
+report the installed version stops the update before anything is written (`82`).
+A different path or version after the install is a **failure**, not a warning: the
+snapshot is restored and the run exits `84`; the runner refuses `done` unless a
+fresh inspection shows the login shell resolving and reporting the updated
+version. The runner repeats the same comparison from a
 fresh inspection (real path and login-shell version) before it reports success, so
 a green result always means "the app and an ordinary terminal run the same updated
 file".

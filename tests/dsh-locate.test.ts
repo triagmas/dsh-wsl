@@ -177,8 +177,13 @@ describe('login shell agreement (issue #17 review B3)', () => {
     expect(loginShellAgrees(installation({ loginShellRealPath: '/home/dev/other/bin/dsh' }))).toBe(false);
   });
 
-  it('does not invent a disagreement when there is no login shell', () => {
-    expect(loginShellAgrees(installation({ loginShellRealPath: null }))).toBe(true);
+  it('never treats an unresolvable login shell as agreement (C1)', () => {
+    // No bash, no `dsh` on the shell PATH or an unreadable profile: unknown is
+    // not agreement, so the update must be refused.
+    expect(loginShellAgrees(installation({ loginShellRealPath: null }))).toBe(false);
+    expect(loginShellAgrees(installation({ loginShellVersion: null }))).toBe(false);
+    expect(loginShellAgrees(installation({ loginShellVersion: '0.2.0' }))).toBe(false);
+    expect(loginShellAgrees(installation({ version: null }))).toBe(false);
   });
 
   it('parses the login-shell fields and ignores malformed ones', () => {
@@ -191,8 +196,9 @@ describe('login shell agreement (issue #17 review B3)', () => {
     );
     expect(broken.installation?.loginShellRealPath).toBeNull();
     expect(broken.installation?.loginShellVersion).toBeNull();
-    // The installation itself is still usable, so only the shell comparison is lost.
+    // The installation itself is still usable, but the update is refused: a shell
+    // value the app cannot trust cannot prove the terminal runs the same file.
     expect(broken.installation?.realPath).toBe(`${PKG}/bin/dsh.js`);
-    expect(loginShellAgrees(broken.installation as DshInstallation)).toBe(true);
+    expect(loginShellAgrees(broken.installation as DshInstallation)).toBe(false);
   });
 });
