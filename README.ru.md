@@ -31,7 +31,7 @@ DeepSeek Harness, не трогает официальную установку 
 
 **Окно, которое ведёт себя как приложение.**
 
-![Меню трея: Focus window, Status, Restart WebUI, Settings, Quit](docs/media/tray-menu.png)
+<p align="center"><img src="docs/media/tray-menu.png" width="300" alt="Меню трея: Focus window, Status, Restart WebUI, Settings, Quit"></p>
 
 Закрытие окна оставляет приложение в трее: *Focus window*, живой *Status*,
 *Restart WebUI*, *Settings*, *Quit*. Бэкенд под присмотром: если он упадёт, DSH WSL

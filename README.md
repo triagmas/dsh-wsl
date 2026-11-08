@@ -31,7 +31,7 @@ your global `npm` prefix or your projects.
 
 **A window that behaves like an app.**
 
-![The tray menu: Focus window, Status, Restart WebUI, Settings, Quit](docs/media/tray-menu.png)
+<p align="center"><img src="docs/media/tray-menu.png" width="300" alt="The tray menu: Focus window, Status, Restart WebUI, Settings, Quit"></p>
 
 Closing the window keeps the app in the tray: *Focus window*, live *Status*,
 *Restart WebUI*, *Settings*, *Quit*. The backend is supervised — if it dies, DSH WSL
