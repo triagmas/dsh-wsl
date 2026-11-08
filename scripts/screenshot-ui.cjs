@@ -400,6 +400,29 @@ async function checkUpdateWindows() {
 
 async function writeScreenshots(bar, updateWindows) {
   mkdirSync(outDir, { recursive: true });
+
+  // Issue #12: the two steps of a one-click update. The checks above leave the
+  // terminal in the rolled-back state on purpose, so the documentation image asks
+  // for the successful end state first (issue #21). This runs only with
+  // `--write-images`, never in `chrome:smoke`. It is captured before the composed
+  // windows below, because an occluded window may otherwise be captured from a
+  // stale frame.
+  updateWindows.progress.webContents.send('update:state', updateWindows.done);
+  updateWindows.progress.moveTop();
+  await settle(300);
+  // The confirmation window is taller than its default frame once the shared-install
+  // warning and the executable row are shown: size it to the content so the image has
+  // no scrollbar and no clipped bullets.
+  const overflow = await evaluate(
+    updateWindows.confirm,
+    '(() => { const m = document.querySelector("main"); return m.scrollHeight - m.clientHeight; })()',
+  );
+  if (overflow > 0) {
+    updateWindows.confirm.setContentSize(620, 520 + Math.ceil(overflow) + 1);
+    await settle(200);
+  }
+  writeFileSync(join(outDir, 'update-confirm.png'), (await updateWindows.confirm.webContents.capturePage()).toPNG());
+  writeFileSync(join(outDir, 'update-terminal.png'), (await updateWindows.progress.webContents.capturePage()).toPNG());
   // The checks left the gear in its expanded state; screenshots show it idle.
   await evaluate(bar, "document.querySelector('#gear').setAttribute('aria-expanded','false'), null");
   const webui = await windowFor(WIDTH, HEIGHT - FOOTER_HEIGHT, 'chrome.js', join(root, 'scripts', 'mock-webui.html'));
@@ -422,9 +445,6 @@ async function writeScreenshots(bar, updateWindows) {
   const shotPopover = await windowFor(WIDTH, HEIGHT, 'chrome.js', withPopover);
   writeFileSync(join(outDir, 'footer-settings.png'), (await shotPopover.webContents.capturePage()).toPNG());
 
-  // Issue #12: the two steps of a one-click update.
-  writeFileSync(join(outDir, 'update-confirm.png'), (await updateWindows.confirm.webContents.capturePage()).toPNG());
-  writeFileSync(join(outDir, 'update-terminal.png'), (await updateWindows.progress.webContents.capturePage()).toPNG());
   console.log(`screenshots written to ${outDir}`);
 }
 
