@@ -19,12 +19,37 @@ electronLanguages:
   - en-US
 
 win:
+  # Issue #14: one Windows x64 build produces both packages from the same sources.
+  #   portable -> WSL-Web-Shell-<version>-x64-Portable.exe (no installation)
+  #   nsis     -> WSL-Web-Shell-<version>-x64-Setup.exe    (assisted installer)
   target:
     - target: portable
       arch:
         - x64
+    - target: nsis
+      arch:
+        - x64
   icon: build/icon.png
-  artifactName: WSL-Web-Shell-${version}-x64.${ext}
 
 portable:
-  artifactName: WSL-Web-Shell-${version}-x64.${ext}
+  artifactName: WSL-Web-Shell-${version}-x64-Portable.${ext}
+
+nsis:
+  artifactName: WSL-Web-Shell-${version}-x64-Setup.${ext}
+  # Assisted (not one-click) wizard: install path and shortcuts are user choices.
+  oneClick: false
+  perMachine: false
+  allowElevation: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: WSL Web Shell
+  uninstallDisplayName: WSL Web Shell ${version}
+  # The uninstaller must never delete the WSL runtime, DSH data or the app profile:
+  # they live outside the installation directory and stay untouched.
+  deleteAppDataOnUninstall: false
+  runAfterFinish: true
+  differentialPackage: false
+  installerLanguages:
+    - en_US
+  language: '1033'

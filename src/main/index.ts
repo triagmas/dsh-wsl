@@ -58,13 +58,14 @@ const APP_ID = 'com.triagmas.wslwebshell';
  * The only way to prove that an update restarts the *portable* EXE — and not the
  * temporary extraction copy — is to run the packaged build itself:
  *
- *   WSL-Web-Shell-0.1.0-x64.exe --relaunch-probe=<dir>
+ *   WSL-Web-Shell-0.1.0-x64-Portable.exe --relaunch-probe=<dir>
+ *   WSL-Web-Shell-0.1.0-x64-Setup.exe (installed) --relaunch-probe=<dir>
  *
  * The parent records where it runs, decides the relaunch target with the same
  * `resolveRelaunchTarget()` the update uses, relaunches it through `app.relaunch`
  * with `--relaunch-child`, and exits. The child records the executable it was
- * started from. The Windows CI job compares both records; nothing here runs
- * during a normal start.
+ * started from. The Windows CI job compares both records for the portable and the
+ * installed package; nothing here runs during a normal start.
  */
 const RELAUNCH_PROBE_PREFIX = '--relaunch-probe=';
 const RELAUNCH_CHILD_FLAG = '--relaunch-child';
@@ -75,6 +76,8 @@ async function runRelaunchProbe(directory: string): Promise<void> {
     phase,
     execPath: process.execPath,
     portable: process.env.PORTABLE_EXECUTABLE_FILE ?? null,
+    packaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
     pid: process.pid,
   };
   const write = (name: string, payload: unknown): void => {
@@ -95,6 +98,8 @@ async function runRelaunchProbe(directory: string): Promise<void> {
       portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE ?? null,
       execPath: process.execPath,
       platform: process.platform,
+      packaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
     },
     (path) => {
       try {
@@ -300,16 +305,17 @@ async function bootstrap(): Promise<void> {
   }
 
   /**
-   * Restart the portable application after a successful update.
+   * Restart the application after a successful update.
    *
    * The graceful path is the same as Quit (owned backend stopped, windows
    * destroyed, clean-shutdown marker written); only the final step differs:
-   * relaunch the portable executable instead of exiting.
+   * relaunch the packaged executable instead of exiting.
    *
-   * A portable build runs from a temporary extraction directory, so
-   * `process.execPath` is not the file the user started. When the portable path
-   * is unknown or gone, the app must not pretend to restart itself: the terminal
-   * window says what to do instead and stays open.
+   * The portable build runs from a temporary extraction directory, so
+   * `process.execPath` is not the file the user started; the installed build runs
+   * from its installation directory and is restarted from `process.execPath`. When
+   * neither target can be proven, the app must not pretend to restart itself: the
+   * terminal window says what to do instead and stays open.
    */
   const relaunchApp = (): void => {
     const decision = resolveRelaunchTarget(
@@ -317,6 +323,8 @@ async function bootstrap(): Promise<void> {
         portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE ?? null,
         execPath: process.execPath,
         platform: process.platform,
+        packaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
       },
       (path) => {
         try {
@@ -336,7 +344,7 @@ async function bootstrap(): Promise<void> {
       return;
     }
 
-    log.info(`update: relaunching ${decision.target.execPath}`);
+    log.info(`update: relaunching ${decision.target.execPath} (${decision.target.mode})`);
     quitting = true;
     if (healthTimer !== null) clearTimeout(healthTimer);
     healthTimer = null;

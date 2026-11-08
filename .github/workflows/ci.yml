@@ -105,9 +105,9 @@ jobs:
           retention-days: 7
 
   windows-package:
-    name: Windows x64 portable package
+    name: Windows x64 packages (Portable + Setup)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     needs: verify
     steps:
       - uses: actions/checkout@v4
@@ -126,37 +126,139 @@ jobs:
           npm run lint
           npm test
 
-      - name: Package portable EXE
+      # Issue #14: one build produces both packages from the same sources.
+      - name: Package portable EXE and NSIS Setup EXE
         run: npm run dist
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
-      - name: Record artifact hash
+      - name: Record artifact names, sizes and hashes
         shell: pwsh
         run: |
-          $exe = Get-ChildItem release -Filter 'WSL-Web-Shell-*-x64.exe' | Select-Object -First 1
-          if (-not $exe) { throw 'portable EXE was not produced' }
-          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
-          "artifact=$($exe.Name)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "sha256=$hash" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "$hash  $($exe.Name)" | Out-File -FilePath release/SHA256SUMS.txt -Encoding ascii
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $portableName = "WSL-Web-Shell-$version-x64-Portable.exe"
+          $setupName = "WSL-Web-Shell-$version-x64-Setup.exe"
+          $portable = Join-Path 'release' $portableName
+          $setup = Join-Path 'release' $setupName
+          foreach ($file in @($portable, $setup)) {
+            if (-not (Test-Path $file)) { throw "expected artifact is missing: $file" }
+            $size = (Get-Item $file).Length
+            if ($size -lt 50MB) { throw "artifact is smaller than expected: $file ($size bytes)" }
+          }
+          # Exactly two top-level EXEs: no stale or ambiguous leftovers.
+          $exes = @(Get-ChildItem release -Filter '*.exe' -File)
+          if ($exes.Count -ne 2) { throw "expected exactly 2 top-level EXEs, found $($exes.Count): $($exes.Name -join ', ')" }
+          $unexpected = @($exes | Where-Object { $_.Name -ne $portableName -and $_.Name -ne $setupName })
+          if ($unexpected.Count -ne 0) { throw "unexpected artifact names: $($unexpected.Name -join ', ')" }
+          $portableHash = (Get-FileHash $portable -Algorithm SHA256).Hash.ToLower()
+          $setupHash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "version=$version" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "portable=$portableName size=$((Get-Item $portable).Length) sha256=$portableHash" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "setup=$setupName size=$((Get-Item $setup).Length) sha256=$setupHash" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "$portableHash  $portableName" | Out-File -FilePath release/SHA256SUMS.txt -Encoding ascii
+          "$setupHash  $setupName" | Out-File -FilePath release/SHA256SUMS.txt -Append -Encoding ascii
+          Get-Content release/SHA256SUMS.txt
 
-      - name: Packaged relaunch check (issue #12)
+      - name: Packaged relaunch check — portable (issue #12)
         shell: pwsh
         run: |
-          $exe = Get-ChildItem release -Filter 'WSL-Web-Shell-*-x64.exe' | Select-Object -First 1
-          if (-not $exe) { throw 'portable EXE was not produced' }
-          $dir = Join-Path $env:RUNNER_TEMP 'relaunch-probe'
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $exe = Join-Path 'release' "WSL-Web-Shell-$version-x64-Portable.exe"
+          if (-not (Test-Path $exe)) { throw 'portable EXE was not produced' }
+          $dir = Join-Path $env:RUNNER_TEMP 'relaunch-probe-portable'
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Write-Host "probing $($exe.FullName)"
-          Start-Process -FilePath $exe.FullName -ArgumentList "--relaunch-probe=$dir" -Wait
-          node scripts/check-relaunch.cjs $dir $exe.FullName 180
+          Write-Host "probing $exe"
+          Start-Process -FilePath $exe -ArgumentList "--relaunch-probe=$dir" -Wait
+          node scripts/check-relaunch.cjs $dir $exe 180 --mode=portable
 
-      - name: Upload portable EXE
+      # Issue #14: the assisted installer must install per-user without elevation,
+      # create shortcuts and an uninstall entry, and keep user data outside the
+      # installation directory.
+      - name: Setup EXE install smoke (silent, per-user)
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $setup = Join-Path 'release' "WSL-Web-Shell-$version-x64-Setup.exe"
+          $target = Join-Path $env:RUNNER_TEMP 'wss-installed'
+          if (Test-Path $target) { Remove-Item -Recurse -Force $target }
+          $app = Join-Path $target 'WSL Web Shell.exe'
+          # Do not block on -Wait: with runAfterFinish the installer may start the
+          # app itself, and the app would keep running. Wait for the files instead.
+          $install = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$target" -PassThru
+          $deadline = (Get-Date).AddSeconds(180)
+          while ((Get-Date) -lt $deadline) {
+            $uninstallerNow = @(Get-ChildItem $target -Filter 'Uninstall *.exe' -File -ErrorAction SilentlyContinue)
+            if ((Test-Path $app) -and ($uninstallerNow.Count -eq 1) -and $install.HasExited) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          $install.Refresh()
+          if (-not $install.HasExited) { $install.WaitForExit(60000) | Out-Null }
+          if (-not (Test-Path $app)) { throw "installer did not produce $app (exit $($install.ExitCode))" }
+          # A launched instance must not hold the probe or the uninstaller.
+          Get-Process -Name 'WSL Web Shell' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "stopping the instance the installer started (pid $($_.Id))"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+          }
+          Start-Sleep -Milliseconds 500
+          foreach ($file in @($app, (Join-Path $target 'resources\app.asar'))) {
+            if (-not (Test-Path $file)) { throw "installed file is missing: $file" }
+          }
+          $uninstaller = @(Get-ChildItem $target -Filter 'Uninstall *.exe' -File)
+          if ($uninstaller.Count -ne 1) { throw "expected one uninstaller, found $($uninstaller.Count)" }
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+          $shortcuts = @(Get-ChildItem $startMenu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*WSL Web Shell*' })
+          if ($shortcuts.Count -lt 1) { throw 'Start menu shortcut was not created' }
+          $entries = @(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' |
+            ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -like '*WSL Web Shell*' })
+          if ($entries.Count -lt 1) { throw 'Installed Apps entry was not registered' }
+          # User data outside the installation directory must survive an uninstall.
+          $userData = Join-Path $env:APPDATA 'wsl-web-shell'
+          New-Item -ItemType Directory -Force -Path $userData | Out-Null
+          'r14 install smoke marker' | Out-File (Join-Path $userData 'r14-install-smoke.txt') -Encoding ascii
+          "installed=$target" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "shortcut=$($shortcuts[0].FullName)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "uninstallEntry=$($entries[0].DisplayName)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Packaged relaunch check — installed (issue #14)
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'wss-installed'
+          $app = Join-Path $target 'WSL Web Shell.exe'
+          $dir = Join-Path $env:RUNNER_TEMP 'relaunch-probe-installed'
+          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Write-Host "probing $app"
+          Start-Process -FilePath $app -ArgumentList "--relaunch-probe=$dir" -Wait
+          node scripts/check-relaunch.cjs $dir $app 180 --mode=installed
+
+      - name: Setup EXE uninstall smoke
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'wss-installed'
+          $uninstaller = (Get-ChildItem $target -Filter 'Uninstall *.exe' -File)[0].FullName
+          $removal = Start-Process -FilePath $uninstaller -ArgumentList '/S', "_?=$target" -Wait -PassThru
+          if ($removal.ExitCode -ne 0) { throw "uninstaller exited with $($removal.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path $target) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path $target) { throw 'installation directory survived the uninstall' }
+          $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+          $shortcuts = @(Get-ChildItem $startMenu -Recurse -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*WSL Web Shell*' })
+          if ($shortcuts.Count -ne 0) { throw "Start menu shortcut survived the uninstall: $($shortcuts.FullName -join ', ')" }
+          $entries = @(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' |
+            ForEach-Object { Get-ItemProperty $_.PSPath } | Where-Object { $_.DisplayName -like '*WSL Web Shell*' })
+          if ($entries.Count -ne 0) { throw 'Installed Apps entry survived the uninstall' }
+          $marker = Join-Path (Join-Path $env:APPDATA 'wsl-web-shell') 'r14-install-smoke.txt'
+          if (-not (Test-Path $marker)) { throw 'user data outside the installation directory was deleted' }
+          Remove-Item $marker -Force
+          'uninstall removed the installation, its shortcuts and its uninstall entry; user data was preserved' |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Upload Windows packages
         uses: actions/upload-artifact@v4
         with:
           name: wsl-web-shell-windows-x64
           path: |
-            release/WSL-Web-Shell-*-x64.exe
+            release/WSL-Web-Shell-*-x64-Portable.exe
+            release/WSL-Web-Shell-*-x64-Setup.exe
             release/SHA256SUMS.txt
           retention-days: 7

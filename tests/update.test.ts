@@ -934,32 +934,120 @@ describe('update runner transaction', () => {
   });
 });
 
-describe('portable relaunch (review blocker D)', () => {
-  const portable = 'D:\\Apps\\WSL-Web-Shell-0.1.0-x64.exe';
+describe('relaunch target after an update (issues #12 and #14)', () => {
+  const portable = 'D:\\Apps\\WSL-Web-Shell-0.1.0-x64-Portable.exe';
+  const installed = 'C:\\Users\\me\\AppData\\Local\\Programs\\wsl-web-shell\\WSL Web Shell.exe';
+  const installedResources = 'C:\\Users\\me\\AppData\\Local\\Programs\\wsl-web-shell\\resources';
+  const installedEnv = {
+    portableExecutableFile: null as string | null,
+    execPath: installed,
+    platform: 'win32',
+    packaged: true,
+    resourcesPath: installedResources,
+  };
 
   it('relaunches the portable executable, not the extraction copy', () => {
     const decision = resolveRelaunchTarget(
-      { portableExecutableFile: portable, execPath: 'C:\\Temp\\2abc\\WSL Web Shell.exe', platform: 'win32' },
+      {
+        portableExecutableFile: portable,
+        execPath: 'C:\\Temp\\2abc\\WSL Web Shell.exe',
+        platform: 'win32',
+        packaged: true,
+        resourcesPath: 'C:\\Temp\\2abc\\resources',
+      },
       (path) => path === portable,
     );
-    expect(decision).toEqual({ ok: true, target: { execPath: portable, portable: true } });
+    expect(decision).toEqual({ ok: true, target: { execPath: portable, mode: 'portable', portable: true } });
+  });
+
+  it('relaunches the installed executable itself', () => {
+    const decision = resolveRelaunchTarget(installedEnv, (path) => path === installed || path.endsWith('app.asar'));
+    expect(decision).toEqual({ ok: true, target: { execPath: installed, mode: 'installed', portable: false } });
+  });
+
+  it('accepts the installed payload with forward slashes as electron-builder reports them', () => {
+    const decision = resolveRelaunchTarget(
+      { ...installedEnv, resourcesPath: 'C:/Users/me/AppData/Local/Programs/wsl-web-shell/resources' },
+      (path) => path === installed || path.endsWith('app.asar'),
+    );
+    expect(decision.ok).toBe(true);
+  });
+
+  it('refuses a development run and an installation it cannot prove', () => {
+    // electron . — there is no packaged payload, so nothing may be restarted.
+    expect(
+      resolveRelaunchTarget(
+        {
+          portableExecutableFile: null,
+          execPath: 'C:\\repo\\node_modules\\electron\\dist\\electron.exe',
+          platform: 'win32',
+          packaged: false,
+          resourcesPath: 'C:\\repo\\node_modules\\electron\\dist\\resources',
+        },
+        () => true,
+      ),
+    ).toEqual({ ok: false, reason: 'dev-unpackaged' });
+    // Packaged, but the executable is gone.
+    expect(resolveRelaunchTarget(installedEnv, (path) => path.endsWith('app.asar'))).toEqual({
+      ok: false,
+      reason: 'installed-not-a-file',
+    });
+    // Packaged, but the resources do not belong to this executable.
+    expect(
+      resolveRelaunchTarget(
+        { ...installedEnv, resourcesPath: 'C:\\Temp\\2abc\\resources' },
+        () => true,
+      ),
+    ).toEqual({ ok: false, reason: 'installed-ambiguous' });
+    // Packaged, resources match, but there is no packaged payload next to the EXE.
+    expect(resolveRelaunchTarget(installedEnv, (path) => path === installed)).toEqual({
+      ok: false,
+      reason: 'installed-ambiguous',
+    });
   });
 
   it('refuses to guess when the app was not started from the portable EXE', () => {
-    expect(resolveRelaunchTarget({ portableExecutableFile: null, execPath: 'C:\\dev\\electron.exe', platform: 'win32' })).toEqual({
-      ok: false,
-      reason: 'portable-missing',
-    });
     expect(
-      resolveRelaunchTarget({ portableExecutableFile: 'C:\\gone\\app.exe', execPath: 'C:\\dev\\electron.exe', platform: 'win32' }, () => false),
+      resolveRelaunchTarget(
+        {
+          portableExecutableFile: 'C:\\gone\\app.exe',
+          execPath: 'C:\\dev\\electron.exe',
+          platform: 'win32',
+          packaged: true,
+          resourcesPath: 'C:\\dev\\resources',
+        },
+        () => false,
+      ),
     ).toEqual({ ok: false, reason: 'portable-not-a-file' });
     expect(
-      resolveRelaunchTarget({ portableExecutableFile: 'C:\\temp\\x.txt', execPath: 'C:\\dev\\electron.exe', platform: 'win32' }, () => true),
+      resolveRelaunchTarget(
+        {
+          portableExecutableFile: 'C:\\temp\\x.txt',
+          execPath: 'C:\\dev\\electron.exe',
+          platform: 'win32',
+          packaged: true,
+          resourcesPath: 'C:\\dev\\resources',
+        },
+        () => true,
+      ),
     ).toEqual({ ok: false, reason: 'portable-not-a-file' });
   });
 
+  it('never relaunches outside Windows', () => {
+    expect(resolveRelaunchTarget({ ...installedEnv, platform: 'linux' }, () => true)).toEqual({
+      ok: false,
+      reason: 'not-windows',
+    });
+  });
+
   it('explains every refused relaunch to the user', () => {
-    for (const reason of ['portable-missing', 'portable-not-a-file', 'not-windows'] as const) {
+    for (const reason of [
+      'portable-not-a-file',
+      'dev-unpackaged',
+      'installed-not-a-file',
+      'installed-ambiguous',
+      'not-windows',
+    ] as const) {
       expect(describeRelaunchFailure(reason).length).toBeGreaterThan(40);
     }
   });
@@ -1000,6 +1088,10 @@ describe('update window and shutdown wiring (review blocker D)', () => {
     expect(indexSource).toContain('resolveRelaunchTarget(');
     expect(indexSource).toContain('describeRelaunchFailure(');
     expect(indexSource).toContain('PORTABLE_EXECUTABLE_FILE');
+    // Both packages are proven before a relaunch: the portable origin and the
+    // installed payload (issue #14).
+    expect(indexSource).toContain('packaged: app.isPackaged');
+    expect(indexSource).toContain('resourcesPath: process.resourcesPath');
     // The old unconditional relaunch is gone.
     expect(indexSource).not.toContain('app.relaunch(portable === null ? {}');
   });

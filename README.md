@@ -4,9 +4,13 @@
 
 Launch a small Electron application on Windows, automatically start a supported WebUI backend inside your **existing WSL2 distro**, and use the **original browser-based interface** in a standalone desktop window — without browser tabs or an address bar.
 
-**Project status: M1 release candidate.** `R00` (scaffold, CI, upstream contract), `R01`/`R01.1` (launcher, supervisor, tray, recovery, Windows EXE), `R02-A` (read-only environment inventory) and `R02-B` (isolated backend environment, real WebUI/tray acceptance) are implemented on `feat/m1-electron-shell`. A real acceptance run against a live Windows 11 + Ubuntu WSL2 machine **passed** on a packaged EXE; it is recorded in [docs/evidence/r02.md](docs/evidence/r02.md) with the exact artifact, SHA-256 and the gates that were checked.
+**Project status: M1 shipped as a prerelease.** `R00` (scaffold, CI, upstream contract), `R01`/`R01.1` (launcher, supervisor, tray, recovery, Windows EXE), `R02-A` (read-only environment inventory), `R02-B` (isolated backend environment, real WebUI/tray acceptance), the footer/tray work (PR #10) and the one-click isolated DSH update (PR #13) are merged into `main`. Real acceptance runs against a live Windows 11 + Ubuntu WSL2 machine **passed** on packaged EXEs; they are recorded in [docs/evidence/r02.md](docs/evidence/r02.md), [docs/evidence/r09.md](docs/evidence/r09.md) and [docs/evidence/r091.md](docs/evidence/r091.md).
 
-**No release exists yet.** No installer, no code signing, no auto-update, no merge to `main`.
+**Releases are prereleases and unsigned.** `v0.1.0-beta.1` contains only the portable
+EXE. The next prerelease ships **two** x64 artifacts from the same commit —
+`WSL-Web-Shell-<version>-x64-Portable.exe` and
+`WSL-Web-Shell-<version>-x64-Setup.exe` — plus a `SHA256SUMS.txt` with both hashes.
+There is still no code signing and no app self-update.
 
 ## First supported backend: DeepSeek Harness
 
@@ -67,7 +71,7 @@ Windows 11 + Ubuntu WSL2 environment (details and evidence in
 | Owner's other software untouched | pass (no global packages changed, official Windows Harness install/profile not modified) |
 
 Not covered by that run: a model provider and agent sessions (the UI stops at the
-onboarding screen), signing, installer, auto-update, other distros, non-default ports.
+onboarding screen), code signing, app self-update, other distros, non-default ports.
 The footer bar and the settings popover described below were added afterwards and have
 not been part of that acceptance run: they are covered by unit tests, a headless
 render smoke (`npm run chrome:smoke`) and the screenshots in
@@ -79,9 +83,10 @@ When GitHub reports a newer release, the bar also offers a one-click update of t
 isolated runtime: the exact published version is staged below the app's own runtime
 root, the app-owned backend is stopped only for the swap, the previous installation
 is kept for rollback and an interrupted swap is repaired on the next start. The new
-version is reported as successful only after it served the WebUI, and the portable
-EXE then restarts itself. The global `dsh`, the official Windows Harness and the
-projects are never touched. Details in [docs/update.md](docs/update.md).
+version is reported as successful only after it served the WebUI, and the app then
+restarts itself — the Portable EXE through `PORTABLE_EXECUTABLE_FILE`, the installed
+build through its installation directory. The global `dsh`, the official Windows
+Harness and the projects are never touched. Details in [docs/update.md](docs/update.md).
 
 | Before | During / after |
 |---|---|
@@ -95,6 +100,37 @@ without recording content: `window <surface> <event>` lines with
 start-up that reports whether the last run ended through the app's own quit path,
 fatal-error messages (name and message only, no stack), and Electron
 child-process failures. Launch tokens and local user directories are redacted.
+
+## Windows downloads: Portable or Setup
+
+Two packages are built from the same sources and behave identically at runtime; the
+difference is only how the app is installed and where its files live.
+
+| | `…-x64-Portable.exe` | `…-x64-Setup.exe` |
+|---|---|---|
+| Installation | none — double-click to run | ordinary Windows setup wizard |
+| Admin rights | none | none (per-user install by default) |
+| Install location | temporary folder, re-extracted on every start | `%LOCALAPPDATA%\Programs\wsl-web-shell` (changeable in the wizard) |
+| Start menu / desktop | not created | optional desktop shortcut, Start-menu entry |
+| Installed Apps entry | none | `WSL Web Shell <version>`, standard uninstall |
+| Uninstall | delete the EXE | Uninstall from Installed Apps or the Start-menu entry |
+| Best for | trying it out, USB stick, no traces on the machine | everyday use, shortcuts, a normal uninstall path |
+| Relaunch after an in-app DSH update | restarts the Portable EXE | restarts the installed EXE |
+
+Both packages use the same `appId`, the same application profile directory
+(`%APPDATA%\wsl-web-shell`) and the same isolated runtime
+(`~/.local/share/wsl-web-shell` inside WSL). Running both variants under the same
+Windows account therefore **shares** settings, logs, the owned-backend registry, the
+update journal and the installed DSH version — only one app instance can run at a
+time, and an update performed in one variant is visible in the other. The uninstaller
+never removes that profile, the WSL runtime, `dsh` data or your projects: it only
+removes the installation directory.
+
+Neither package installs or upgrades WSL, Node.js or the DeepSeek Harness: you still
+need WSL2 with your distribution and `dsh` inside it (see [Requirements](#requirements)).
+Binaries are **unsigned**, so Windows SmartScreen may warn about an unknown
+publisher; verify the SHA-256 from the release's `SHA256SUMS.txt` before you run
+them.
 
 ## Requirements
 
@@ -122,9 +158,10 @@ npm run screenshots     # same render, writes docs/media/*.png
 npm run composition:smoke  # real BrowserWindow + WebContentsView composition
                         # against a local test server: bar, bounds, resize, session,
                         # cold-start attach order
-node scripts/check-relaunch.cjs <dir> <exe>
+node scripts/check-relaunch.cjs <dir> <exe> [timeout] [--mode=portable|installed]
                         # Windows CI only: verifies that the packaged EXE
-                        # relaunches itself from the portable file, not from the
+                        # relaunches itself from the portable file (portable) or
+                        # from its installation directory (installed), not from a
                         # temporary extraction directory
 npm run paint:probe     # real screen pixels of a composed window: the remote
                         # WebUI must be visible above the bar (needs a display;
@@ -134,12 +171,21 @@ npm run paint:probe     # real screen pixels of a composed window: the remote
 Windows packaging (x64, portable EXE):
 
 ```sh
-npm run dist          # release/WSL-Web-Shell-<version>-x64.exe
+npm run dist          # both packages: release/WSL-Web-Shell-<version>-x64-{Portable,Setup}.exe
+npm run dist:portable # portable EXE only
+npm run dist:setup    # NSIS Setup EXE only
 npm run dist:dir      # unpacked app for inspection
 ```
 
-Packaging cross-builds from Linux/WSL as well; the executable is unsigned.
-Code-signing and an installer are future release work.
+Packaging cross-builds from Linux/WSL as well; both executables are unsigned.
+Code-signing is future release work.
+
+The Windows CI job builds both packages from one `npm run dist`, asserts that
+exactly the two expected artifact names exist, writes `SHA256SUMS.txt` with both
+hashes, and proves three things on the runner: the portable EXE relaunches from the
+portable file (7/7), the installed EXE relaunches from its installation, and the
+Setup EXE installs per-user with shortcuts and an uninstall entry and uninstalls
+itself without touching user data outside the installation directory.
 
 ## Report / verification format
 
@@ -179,12 +225,15 @@ are never presented as a real Windows/WSL acceptance PASS.
 
 ## Artifact provenance
 
-The portable EXE is built by the `windows-package` CI job (Windows runner,
-`npm run dist`), which records `sha256` in the job summary and uploads
-`SHA256SUMS.txt` next to the EXE. Locally built EXEs are byte-different (packager
-metadata), so a digest is only meaningful together with its source commit and run.
-Pinned release-candidate artifact, its commit and its digest are listed in
-[docs/evidence/r02.md](docs/evidence/r02.md).
+Both Windows packages are built by the `windows-package` CI job (Windows runner,
+`npm run dist`), which records both `sha256` values in the job summary and uploads
+`SHA256SUMS.txt` next to `WSL-Web-Shell-<version>-x64-Portable.exe` and
+`WSL-Web-Shell-<version>-x64-Setup.exe` in a single artifact. Locally built
+artifacts are byte-different (packager metadata), so a digest is only meaningful
+together with its source commit and run. Pinned acceptance artifacts, their commits
+and their digests are listed in [docs/evidence/r02.md](docs/evidence/r02.md),
+[docs/evidence/r09.md](docs/evidence/r09.md) and
+[docs/evidence/r091.md](docs/evidence/r091.md).
 
 A packaged EXE, CI and real acceptance evidence are acceptance requirements. CI
 covers typecheck, lint, unit tests and the Windows package build; the real GUI/WSL
