@@ -21,6 +21,19 @@ footer pill (only while an update exists)
    -> app relaunches the packaged EXE (or says it cannot)
 ```
 
+## What the user sees
+
+Both screenshots are rendered by the real confirmation and terminal pages
+(`src/update/`) through the repository harness `scripts/screenshot-ui.cjs`
+(`npm run screenshots`), which drives them with fixture data and never runs a real
+update. Paths, versions and the distribution name are test values. They are
+documentation-sized captures (sized to their content), not a strict copy of the
+production window geometry.
+
+| Confirmation | Terminal |
+|---|---|
+| ![Update confirmation: executable, npm scope, shared-installation warning](media/update-confirm.png) | ![Update terminal: snapshot, install, login-shell verification](media/update-terminal.png) |
+
 ## What "version" means here
 
 Two independent things, deliberately kept apart:
