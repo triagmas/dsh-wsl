@@ -29,16 +29,27 @@ class CrashWsl extends FakeWsl {
   crashStderr = "env: 'node': No such file or directory";
   /** Extra exits that are delivered for a process that already finished. */
   readonly deliveredExits = new Map<number, FakeServer>();
+  /** Throw synchronously from `startServer` (gateway/spawn failure). */
+  throwOnStart = false;
+  /**
+   * Answer the first ownership probe with a valid backend, then exit before the
+   * WebUI URL is published (the process was alive for the probe only).
+   */
+  crashAfterProbe = false;
+  private crashScheduled = false;
 
   constructor(options: ConstructorParameters<typeof FakeWsl>[0] = {}) {
     super(options);
   }
 
   override startServer(request: StartServerRequest): ServerHandle {
+    if (this.throwOnStart) throw new Error('wsl.exe could not be started');
     this.starts.push(request);
     const pid = (this.nextPid += 1);
     const crashing = this.crashCode !== null;
-    if (!crashing) this.alive.add(pid);
+    const crashAfterProbe = this.crashAfterProbe;
+    // A probe-then-crash backend is alive until its first ownership probe.
+    if (!crashing || crashAfterProbe) this.alive.add(pid);
     const server = new FakeServer({
       pid,
       announceUrl: !crashing,
@@ -48,6 +59,7 @@ class CrashWsl extends FakeWsl {
     this.servers.push(server);
     this.deliveredExits.set(pid, server);
     queueMicrotask(() => {
+      if (crashAfterProbe) return;
       if (crashing) {
         this.alive.delete(pid);
         server.exit({ code: this.crashCode, signal: null });
@@ -59,7 +71,20 @@ class CrashWsl extends FakeWsl {
   }
 
   override async probeProcess(_distro: string, pid: number) {
-    return this.alive.has(pid) ? backendProbe({ cmdline: `/usr/bin/node /usr/local/bin/dsh web --host 127.0.0.1 --port ${this.lastPort()} --no-open` }) : null;
+    if (!this.alive.has(pid)) return null;
+    const probe = backendProbe({
+      cmdline: `/usr/bin/node /usr/local/bin/dsh web --host 127.0.0.1 --port ${this.lastPort()} --no-open`,
+    });
+    if (this.crashAfterProbe && !this.crashScheduled) {
+      // Alive for this probe, gone right after it: the process may still be
+      // verified but dies before it publishes the WebUI URL.
+      this.crashScheduled = true;
+      queueMicrotask(() => {
+        this.alive.delete(pid);
+        this.deliveredExits.get(pid)?.exit({ code: this.crashCode ?? 1, signal: null });
+      });
+    }
+    return probe;
   }
 
   private lastPort(): number {
@@ -299,5 +324,60 @@ describe('issue #24: isolation toggle across restarts and failures', () => {
     expect(supervisor.state).toBe('READY');
     expect(harness.wsl.starts).toHaveLength(3);
     expect(harness.wsl.starts[2]).toMatchObject({ isolationRoot: '-', workspace: '~' });
+  });
+});
+
+/**
+ * Review R02 on PR #25: two narrow holes in the new recovery implementation.
+ */
+describe('issue #24 review: start bookkeeping and late startup failures', () => {
+  it('does not leave the start flagged as in flight when startServer throws synchronously', async () => {
+    const harness = createCrashHarness();
+    const supervisor = new Supervisor(harness.deps);
+
+    harness.wsl.throwOnStart = true;
+    await expect(supervisor.start()).rejects.toThrow(/wsl\.exe could not be started/);
+    await flush();
+
+    // The bookkeeping must be released even though the throw happened before the
+    // handle existed; otherwise every later exit event is ignored as "in flight".
+    const internal = supervisor as unknown as { startInFlight: boolean };
+    expect(internal.startInFlight).toBe(false);
+
+    // A correct attempt afterwards is not blocked, and recovery still works.
+    harness.wsl.throwOnStart = false;
+    await supervisor.retry();
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(1);
+
+    harness.wsl.servers[0]?.exit({ code: 1, signal: null });
+    await flush();
+    expect(harness.wsl.starts).toHaveLength(2);
+    expect(supervisor.state).toBe('READY');
+  });
+
+  it('fails fast when the backend dies after PID and probe but before the URL', async () => {
+    const harness = createCrashHarness();
+    // A long startup budget: only a real fail-fast can finish this quickly.
+    harness.deps.startupTimeoutMs = 30_000;
+    const supervisor = new Supervisor(harness.deps);
+
+    harness.wsl.crashAfterProbe = true;
+    harness.wsl.crashCode = 127;
+    harness.wsl.crashStderr = "env: 'node': No such file or directory";
+
+    const started = Date.now();
+    await expect(supervisor.start()).rejects.toThrow(/exited/i);
+    const elapsed = Date.now() - started;
+    await flush();
+
+    expect(elapsed).toBeLessThan(5_000);
+    expect(supervisor.state).toBe('ERROR');
+    const status = lastStatus(harness.statuses);
+    expect(status.detail).toContain('127');
+    expect(status.detail).toContain("env: 'node'");
+    // The failing start owns the outcome: no second attempt, no recovery.
+    expect(harness.wsl.starts).toHaveLength(1);
+    expect(harness.registry.read()).toBeNull();
   });
 });

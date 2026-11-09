@@ -797,23 +797,25 @@ export class Supervisor {
     this.serverGeneration = generation;
     this.startInFlight = true;
 
-    const handle = this.deps.wsl.startServer({
-      distro: config.distro,
-      dshPath: runtime.dshPath,
-      port: this.port(),
-      workspace,
-      host: LOOPBACK_HOST,
-      isolationRoot: isolationRootArg(plan),
-      nodePath: runtime.nodePath,
-    });
-    this.server = handle;
-    this.owned = true;
-
-    void handle.exited
-      .then((exit) => this.handleServerExit(exit, generation))
-      .catch((error: unknown) => this.deps.log.error(`exit handler failed: ${describe(error)}`));
-
     try {
+      // A gateway that throws synchronously must not leave the flag stuck: the
+      // bookkeeping is released by the finally below (review R02).
+      const handle = this.deps.wsl.startServer({
+        distro: config.distro,
+        dshPath: runtime.dshPath,
+        port: this.port(),
+        workspace,
+        host: LOOPBACK_HOST,
+        isolationRoot: isolationRootArg(plan),
+        nodePath: runtime.nodePath,
+      });
+      this.server = handle;
+      this.owned = true;
+
+      void handle.exited
+        .then((exit) => this.handleServerExit(exit, generation))
+        .catch((error: unknown) => this.deps.log.error(`exit handler failed: ${describe(error)}`));
+
       const pid = await this.raceExit(
         handle,
         this.withTimeout(handle.pid, 15_000, 'start-timeout', 'The backend did not report its process id.'),
@@ -850,7 +852,14 @@ export class Supervisor {
       } satisfies OwnedServerRecord);
 
       this.setState('CONNECTING', null);
-      const tokenUrl = await this.waitForStartupUrl(handle);
+      // The URL wait is raced against the exit too: a backend that dies after
+      // the ownership probe but before it announces its WebUI URL must fail
+      // immediately, not after the startup timeout (review R02).
+      const tokenUrl = await this.raceExit(
+        handle,
+        this.waitForStartupUrl(handle),
+        'before it announced its WebUI URL',
+      );
       const status = await this.deps.web.bootstrapToken(tokenUrl);
       if (status === 401 || status === 403) {
         throw new ShellError('auth-failed', 'The WebUI rejected the startup token.', 'Restart the backend from the tray menu.');
@@ -934,30 +943,34 @@ export class Supervisor {
     if (immediate !== null) return immediate;
 
     return await new Promise<string>((resolve, reject) => {
-      const seen: string[] = [...handle.lines()];
-      const timer = setTimeout(() => {
-        unsubscribe();
+      // Exactly one outcome may settle the wait, and every outcome releases the
+      // timer and the line listener: a process that dies before announcing its
+      // URL must neither leave a pending timer nor keep listening (review R02).
+      let settled = false;
+      const state: { timer?: NodeJS.Timeout; unsubscribe: () => void } = { unsubscribe: () => undefined };
+      const cleanup = (): void => {
+        if (settled) return;
+        settled = true;
+        if (state.timer !== undefined) clearTimeout(state.timer);
+        state.unsubscribe();
+      };
+
+      state.timer = setTimeout(() => {
+        cleanup();
         reject(new ShellError('start-timeout', 'The backend did not announce a WebUI URL in time.', 'Inspect the log: the backend may still be booting, or the frontend build is missing.'));
       }, Math.max(1_000, deadline - this.deps.now()));
-      const unsubscribe = handle.onLine((line) => {
-        seen.push(line);
+
+      state.unsubscribe = handle.onLine((line) => {
         const found = tryParse([line]);
-        if (found !== null) {
-          clearTimeout(timer);
-          unsubscribe();
-          resolve(found);
-        }
+        if (found === null) return;
+        cleanup();
+        resolve(found);
       });
+
       void handle.exited.then((exit) => {
-        clearTimeout(timer);
-        unsubscribe();
-        reject(
-          new ShellError(
-            'backend-lost',
-            `The backend exited before it became ready (code=${exit.code ?? 'null'}).`,
-            this.server?.stderrTail().slice(-600) ?? null,
-          ),
-        );
+        const error = this.backendExitedError(exit, 'before it announced its WebUI URL');
+        cleanup();
+        reject(error);
       });
     });
   }
