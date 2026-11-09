@@ -82,6 +82,15 @@ to `PATH` — never a private runtime prefix — and the wrapper re-validates th
 and re-checks the managed directories, so it can never launch against a root that
 changed after preparation.
 
+The `PATH` entry is added **whether or not data isolation is enabled** (issue
+#24): an npm-installed `dsh` is a `#!/usr/bin/env node` shim and
+`wsl.exe --exec /bin/bash` starts with a minimal PATH that does not contain
+`~/.local/bin`, so tying the entry to isolation made the backend die with exit 127
+as soon as the toggle was turned off. With isolation off the wrapper exports none
+of the `DSH_*`/cache/temp variables, `~` is the normal Linux home and the harness
+reads the user's own `~/.dsh`; turning it back on returns to the isolated root.
+Nothing is ever copied or merged between the two.
+
 **Which `dsh` runs (issue #17).** `RESOLVE_RUNTIME_SCRIPT` prefers exactly what an
 ordinary terminal would find: a pinned path from Settings, then
 `bash -lc 'command -v dsh'`, then the `--exec` PATH, then the conventional
@@ -181,6 +190,17 @@ probed again, so a hung-but-alive backend can never survive a failed recovery an
 an occupied port afterwards is necessarily somebody else's listener (collision).
 A process that already died is simply forgotten; a PID whose start time no longer
 matches is never signalled.
+
+Recovery is **serialized with manual starts and tied to a backend generation**
+(issue #24). Every spawned backend gets a monotonic generation; an exit event is
+only acted on while it still belongs to the current generation, so a late event
+from a replaced backend can neither trigger a recovery nor make the replacement
+look dead. While a start is in flight the start owns the outcome: the exit
+handler stays out of the way and duplicate recovery requests (an exit event plus
+a failing health tick for the same process) collapse into one loop. A backend
+that dies during startup therefore produces exactly one attempt with the exit
+code and the last stderr lines (`#!/usr/bin/env node` failures show up there),
+not a retry storm or a generic "could not be verified" message.
 
 `SIGKILL` is a last resort and is re-validated twice immediately before it is
 sent: PID, `/proc/<pid>/stat` start time and command line must still match the

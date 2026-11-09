@@ -28,6 +28,12 @@ export const WSL_EXE = 'wsl.exe';
  * an app-private runtime, so `dsh` inside the backend is the same installation
  * an ordinary terminal runs (issue #17).
  *
+ * The directory of the resolved Node.js is prepended to `PATH` **regardless of
+ * isolation** (issue #24): an npm-installed `dsh` is a `#!/usr/bin/env node`
+ * shim, and `wsl.exe --exec /bin/bash` starts with a minimal PATH that has no
+ * `~/.local/bin`, so without it the backend dies with exit 127 as soon as the
+ * user turns data isolation off.
+ *
  * Everything path-related happens here, inside the distribution: `~` expands
  * against the Linux home and the working directory is entered by the shell, so
  * the launch does not depend on `wsl.exe --cd` understanding a tilde-prefixed
@@ -60,8 +66,9 @@ export const START_WRAPPER_SCRIPT = [
   'export XDG_CACHE_HOME="$iroot/cache";',
   'export TMPDIR="$iroot/tmp";',
   'export WSL_WEB_SHELL_ISOLATION_ROOT="$iroot";',
-  'if [ "$node" != "-" ]; then export PATH="$(dirname "$node"):$PATH"; fi;',
   'fi;',
+  // Independent of isolation: the npm shim needs the runtime Node.js on PATH.
+  'if [ "$node" != "-" ]; then export PATH="$(dirname "$node"):$PATH"; fi;',
   'printf "%s %s\\n" "__dsh_web_shell_pid__" "$$";',
   'exec "$dsh" web --host "$host" --port "$port" --no-open',
 ].join(' ');

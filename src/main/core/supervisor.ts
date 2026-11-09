@@ -238,6 +238,15 @@ export class ShellError extends Error {
   }
 }
 
+/** States a lost backend can be recovered from without breaking the machine. */
+const RECOVERABLE_STATES: readonly LifecycleState[] = [
+  'STARTING_WEB',
+  'CONNECTING',
+  'READY',
+  'HIDDEN_IN_TRAY',
+  'RECOVERING',
+];
+
 const STATE_MESSAGES: Record<LifecycleState, string> = {
   CHECKING: 'Checking environment',
   STARTING_WSL: 'Starting Windows Subsystem for Linux',
@@ -264,6 +273,21 @@ export class Supervisor {
   private failures = 0;
   private attempt = 0;
   private recoveryRunning = false;
+  /** A recovery loop is queued or running; duplicates are dropped (issue #24). */
+  private recoveryScheduled = false;
+  /**
+   * Monotonic id of every backend this supervisor spawned. Exit events carry the
+   * generation of their own process, so an event from a replaced backend can
+   * never trigger recovery for (or signal) its successor (issue #24).
+   */
+  private generation = 0;
+  private serverGeneration = 0;
+  /**
+   * True between spawning a backend and deciding that its start failed. While a
+   * start is in flight it owns the outcome: the exit handler must not start a
+   * second, parallel recovery for the same process (issue #24).
+   */
+  private startInFlight = false;
   private quitting = false;
   private detail: string | null = null;
   /** Last known window visibility, so recovery can restore the tray state. */
@@ -541,10 +565,27 @@ export class Supervisor {
   }
 
   /** Unexpected process death, wired by the main process. */
-  async handleServerExit(exit: ExitInfo): Promise<void> {
+  async handleServerExit(exit: ExitInfo, generation: number = this.serverGeneration): Promise<void> {
+    if (generation !== this.serverGeneration) {
+      // The backend this event belongs to was already replaced: acting on it
+      // would make the replacement look dead and could stop the wrong process.
+      this.deps.log.debug(
+        `backend exit ignored: event generation ${generation} is not the current backend (${this.serverGeneration})`,
+      );
+      return;
+    }
     if (this.updateLocked) {
       // The update stops the backend on purpose; recovery must not race it.
       this.deps.log.debug(`backend exit ignored during the update (code=${exit.code ?? 'null'})`);
+      return;
+    }
+    if (this.startInFlight) {
+      // The start that owns this process reports the failure itself, once, with
+      // the backend's own output. A second reporter here would duplicate the
+      // recovery and race the lifecycle (issue #24).
+      this.deps.log.debug(
+        `backend exit observed while its start is in flight (code=${exit.code ?? 'null'}); the start reports it`,
+      );
       return;
     }
     if (this.quitting || this.lifecycle.state === 'QUITTING' || this.lifecycle.state === 'ERROR') return;
@@ -554,53 +595,80 @@ export class Supervisor {
     await this.handleLoss('process-exited');
   }
 
+  /**
+   * Bounded self-healing after an owned backend was lost.
+   *
+   * Recovery runs under the same lock as manual starts, so lifecycle
+   * transitions can never interleave, and duplicate requests (an exit event and
+   * a failing health tick for the same process) produce one loop (issue #24).
+   */
   private async handleLoss(reason: string): Promise<void> {
-    if (this.recoveryRunning || this.quitting || this.updateLocked) return;
-    this.recoveryRunning = true;
+    if (this.recoveryRunning || this.recoveryScheduled || this.quitting || this.updateLocked) return;
+    if (this.startInFlight) {
+      this.deps.log.debug(`recovery skipped (${reason}): a start is in flight and owns the outcome`);
+      return;
+    }
+    this.recoveryScheduled = true;
     try {
-      this.setState('RECOVERING', reason === 'process-exited' ? 'DeepSeek Harness stopped unexpectedly' : 'Connection to DeepSeek Harness lost');
-      this.deps.log.info(`recovery started (${reason})`);
-
-      // Keep the recorded PID/start time until the process is proven gone or
-      // stopped: a hung-but-alive backend still has to be reclaimed safely.
-      await this.releaseOwnedProcess();
-
-      const config = this.deps.config();
-      if (!config.autoRestart) {
-        this.owned = false;
-        this.fail(new ShellError('backend-lost', 'The DeepSeek Harness web server is not running.', 'Automatic restart is disabled in settings.'));
-        return;
-      }
-
-      for (let attempt = 1; attempt <= config.maxRestartAttempts; attempt += 1) {
-        this.attempt = attempt;
-        this.setState('RECOVERING', `Restarting backend (attempt ${attempt} of ${config.maxRestartAttempts})`);
-        await this.deps.sleep(backoffDelay(attempt - 1));
-        if (this.quitting) return;
-        try {
-          await this.bringUp();
-          this.deps.log.info(`recovery succeeded on attempt ${attempt}`);
-          this.attempt = 0;
-          this.recoveryRunning = false;
+      await this.serial(async () => {
+        this.recoveryScheduled = false;
+        if (this.quitting || this.updateLocked || this.startInFlight) return;
+        if (!RECOVERABLE_STATES.includes(this.lifecycle.state)) {
+          this.deps.log.debug(`recovery not needed (${reason}): state is ${this.lifecycle.state}`);
           return;
-        } catch (error) {
-          this.deps.log.error(`recovery attempt ${attempt} failed: ${describe(error)}`);
-          if (error instanceof ShellError && error.code === 'port-collision') {
-            this.fail(error);
-            return;
-          }
+        }
+        this.recoveryRunning = true;
+        try {
+          await this.runRecovery(reason);
+        } finally {
+          this.recoveryRunning = false;
+        }
+      });
+    } finally {
+      this.recoveryScheduled = false;
+    }
+  }
+
+  private async runRecovery(reason: string): Promise<void> {
+    this.setState('RECOVERING', reason === 'process-exited' ? 'DeepSeek Harness stopped unexpectedly' : 'Connection to DeepSeek Harness lost');
+    this.deps.log.info(`recovery started (${reason})`);
+
+    // Keep the recorded PID/start time until the process is proven gone or
+    // stopped: a hung-but-alive backend still has to be reclaimed safely.
+    await this.releaseOwnedProcess();
+
+    const config = this.deps.config();
+    if (!config.autoRestart) {
+      this.owned = false;
+      this.fail(new ShellError('backend-lost', 'The DeepSeek Harness web server is not running.', 'Automatic restart is disabled in settings.'));
+      return;
+    }
+
+    for (let attempt = 1; attempt <= config.maxRestartAttempts; attempt += 1) {
+      this.attempt = attempt;
+      this.setState('RECOVERING', `Restarting backend (attempt ${attempt} of ${config.maxRestartAttempts})`);
+      await this.deps.sleep(backoffDelay(attempt - 1));
+      if (this.quitting) return;
+      try {
+        await this.bringUp();
+        this.deps.log.info(`recovery succeeded on attempt ${attempt}`);
+        this.attempt = 0;
+        return;
+      } catch (error) {
+        this.deps.log.error(`recovery attempt ${attempt} failed: ${describe(error)}`);
+        if (error instanceof ShellError && error.code === 'port-collision') {
+          this.fail(error);
+          return;
         }
       }
-      this.fail(
-        new ShellError(
-          'retry-exhausted',
-          `The web server could not be restarted after ${config.maxRestartAttempts} attempts.`,
-          'Use Retry after checking the log and the WSL distribution.',
-        ),
-      );
-    } finally {
-      this.recoveryRunning = false;
     }
+    this.fail(
+      new ShellError(
+        'retry-exhausted',
+        `The web server could not be restarted after ${config.maxRestartAttempts} attempts.`,
+        'Use Retry after checking the log and the WSL distribution.',
+      ),
+    );
   }
 
   private async bringUp(): Promise<void> {
@@ -722,6 +790,13 @@ export class Supervisor {
     const workspace = resolveLaunchWorkspace(config.workspace, plan);
     this.setState('STARTING_WEB', null);
 
+    // Every spawned backend gets its own generation. Exit events carry the
+    // generation of the process they belong to, so the start below and the exit
+    // handler can never both "own" the same failure (issue #24).
+    const generation = (this.generation += 1);
+    this.serverGeneration = generation;
+    this.startInFlight = true;
+
     const handle = this.deps.wsl.startServer({
       distro: config.distro,
       dshPath: runtime.dshPath,
@@ -735,45 +810,100 @@ export class Supervisor {
     this.owned = true;
 
     void handle.exited
-      .then((exit) => this.handleServerExit(exit))
+      .then((exit) => this.handleServerExit(exit, generation))
       .catch((error: unknown) => this.deps.log.error(`exit handler failed: ${describe(error)}`));
 
-    const pid = await this.withTimeout(handle.pid, 15_000, 'start-timeout', 'The backend did not report its process id.');
-    if (pid === null) {
-      throw new ShellError('start-timeout', 'The backend did not report its process id.', 'See the log for the raw output.');
-    }
-    this.serverPid = pid;
-
-    const probe = await this.waitForProbe(config.distro, pid, 5_000);
-    const verdict = verifyOwnership(probe, { port: this.port() });
-    if (verdict !== 'owned' || probe === null) {
-      throw new ShellError(
-        'unexpected',
-        'The started process could not be verified as the DeepSeek Harness backend.',
-        'The app only manages processes it can prove it started.',
+    try {
+      const pid = await this.raceExit(
+        handle,
+        this.withTimeout(handle.pid, 15_000, 'start-timeout', 'The backend did not report its process id.'),
+        'before it reported its process id',
       );
-    }
-    this.serverStartTime = probe.startTime;
-    this.deps.registry.write({
-      presetId: config.presetId,
-      distro: config.distro,
-      port: this.port(),
-      pid,
-      startTime: probe.startTime,
-      workspace,
-      startedAt: new Date(this.deps.now()).toISOString(),
-      appVersion: this.deps.appVersion,
-    } satisfies OwnedServerRecord);
+      if (pid === null) {
+        throw new ShellError('start-timeout', 'The backend did not report its process id.', 'See the log for the raw output.');
+      }
+      this.serverPid = pid;
 
-    this.setState('CONNECTING', null);
-    const tokenUrl = await this.waitForStartupUrl(handle);
-    const status = await this.deps.web.bootstrapToken(tokenUrl);
-    if (status === 401 || status === 403) {
-      throw new ShellError('auth-failed', 'The WebUI rejected the startup token.', 'Restart the backend from the tray menu.');
+      const probe = await this.raceExit(
+        handle,
+        this.waitForProbe(config.distro, pid, 5_000),
+        'before its process could be verified',
+      );
+      const verdict = verifyOwnership(probe, { port: this.port() });
+      if (verdict !== 'owned' || probe === null) {
+        throw new ShellError(
+          'unexpected',
+          'The started process could not be verified as the DeepSeek Harness backend.',
+          this.unverifiedHint(probe, verdict),
+        );
+      }
+      this.serverStartTime = probe.startTime;
+      this.deps.registry.write({
+        presetId: config.presetId,
+        distro: config.distro,
+        port: this.port(),
+        pid,
+        startTime: probe.startTime,
+        workspace,
+        startedAt: new Date(this.deps.now()).toISOString(),
+        appVersion: this.deps.appVersion,
+      } satisfies OwnedServerRecord);
+
+      this.setState('CONNECTING', null);
+      const tokenUrl = await this.waitForStartupUrl(handle);
+      const status = await this.deps.web.bootstrapToken(tokenUrl);
+      if (status === 401 || status === 403) {
+        throw new ShellError('auth-failed', 'The WebUI rejected the startup token.', 'Restart the backend from the tray menu.');
+      }
+      if (status >= 400) {
+        throw new ShellError('auth-failed', `The WebUI login exchange failed (HTTP ${status}).`, 'Restart the backend from the tray menu.');
+      }
+    } finally {
+      this.startInFlight = false;
     }
-    if (status >= 400) {
-      throw new ShellError('auth-failed', `The WebUI login exchange failed (HTTP ${status}).`, 'Restart the backend from the tray menu.');
+  }
+
+  /**
+   * Reject as soon as the backend process exits while its start is in flight.
+   *
+   * Without this the ownership probe could wait its full timeout on an already
+   * dead process and then report a generic error that hides the real reason
+   * (issue #24: exit 127 with a missing runtime `node` on PATH).
+   */
+  private async raceExit<T>(handle: ServerHandle, work: Promise<T>, phase: string): Promise<T> {
+    let settled = false;
+    const exitRace = handle.exited.then((exit) => {
+      if (settled) return undefined as T;
+      throw this.backendExitedError(exit, phase);
+    });
+    try {
+      return await Promise.race([work, exitRace]);
+    } finally {
+      settled = true;
     }
+  }
+
+  private backendExitedError(exit: ExitInfo, phase: string): ShellError {
+    const code = exit.code === null ? 'no exit code' : `code ${exit.code}`;
+    const signal = exit.signal === null ? '' : `, signal ${exit.signal}`;
+    const tail = sanitizeOptional(this.server?.stderrTail() ?? null);
+    return new ShellError(
+      'backend-lost',
+      `The DeepSeek Harness backend exited with ${code}${signal} ${phase}.`,
+      tail ?? 'Inspect the log for the backend output.',
+    );
+  }
+
+  /** Say what was actually observed instead of only "not verified". */
+  private unverifiedHint(probe: ProcessProbe | null, verdict: string): string {
+    const tail = sanitizeOptional(this.server?.stderrTail() ?? null);
+    const observed =
+      probe === null
+        ? `No live process with pid=${this.serverPid} was found when the launch was checked.`
+        : `The process identity check returned "${verdict}".`;
+    return ['The app only manages processes it can prove it started.', observed, tail]
+      .filter((part): part is string => part !== null && part !== '')
+      .join(' ');
   }
 
   private async waitForProbe(distro: string, pid: number, timeoutMs: number): Promise<ProcessProbe | null> {
