@@ -98,7 +98,10 @@ function runWrapper(fixture: Fixture, isolationRootArg: string, workspace = '~')
 }
 
 describe('issue #24: isolation toggle must not break the backend launch', () => {
-  it('starts the npm shim with isolation disabled (regression: exit 127)', async () => {
+  // The wrapper runs inside WSL/Linux; these cases spawn `/bin/bash`.
+  const itPosix = it.skipIf(process.platform === 'win32');
+
+  itPosix('starts the npm shim with isolation disabled (regression: exit 127)', async () => {
     const fixture = await createFixture();
     try {
       const run = runWrapper(fixture, '-');
@@ -126,7 +129,7 @@ describe('issue #24: isolation toggle must not break the backend launch', () => 
     }
   });
 
-  it('keeps data isolation when it is enabled', async () => {
+  itPosix('keeps data isolation when it is enabled', async () => {
     const fixture = await createFixture();
     try {
       const run = runWrapper(fixture, '~/.local/share/wsl-web-shell');
@@ -145,7 +148,7 @@ describe('issue #24: isolation toggle must not break the backend launch', () => 
     }
   });
 
-  it('survives true -> false -> true restarts without moving any data', async () => {
+  itPosix('survives true -> false -> true restarts without moving any data', async () => {
     const fixture = await createFixture();
     try {
       // A credential-like marker inside the isolated home must stay untouched.
@@ -195,7 +198,7 @@ describe('issue #24: isolation toggle must not break the backend launch', () => 
     expect(isolationBlock).not.toContain('PATH');
   });
 
-  it('fails with an explicit code when the runtime Node.js is missing', async () => {
+  itPosix('fails with an explicit code when the runtime Node.js is missing', async () => {
     const fixture = await createFixture();
     try {
       // No resolved runtime: `$node` is "-", so nothing is prepended and the
