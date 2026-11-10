@@ -49,6 +49,7 @@ const NEW = '0.2.2-rc.1';
 const FOREIGN = '9.9.9';
 const NODE = process.execPath;
 const TX = '20261108T120000Z-a1b2';
+const FIXTURE_LEASE = 'e'.repeat(32);
 
 const npmAvailable = spawnSync('npm', ['--version'], { encoding: 'utf8' }).status === 0;
 const shellAvailable = spawnSync('/bin/sh', ['-c', 'exit 0']).status === 0;
@@ -217,7 +218,7 @@ function arrange(fixture: Fixture): { dsh: string; plan: SharedUpdatePlan; snaps
   const plan = planned.plan;
   const backup = runScript(
     PREPARE_BACKUP_SCRIPT,
-    [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, TX, fixture.appRoot],
+    [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, TX, fixture.appRoot, '-', FIXTURE_LEASE],
     fixture.env,
   );
   if (backup.status !== 0) throw new Error(`fixture backup failed: ${backup.stderr}`);
@@ -328,7 +329,7 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
     try {
       const backup = runScript(
         PREPARE_BACKUP_SCRIPT,
-        [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, '20261108T120001Z-a1b3', fixture.appRoot],
+        [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, '20261108T120001Z-a1b3', fixture.appRoot, '-', FIXTURE_LEASE],
         fixture.env,
       );
       expect(backup.status).toBe(79);
@@ -351,7 +352,7 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
     symlinkSync(outside, join(fixture.appRoot, 'update'));
     const backup = runScript(
       PREPARE_BACKUP_SCRIPT,
-      [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, '20261108T120002Z-a1b4', fixture.appRoot],
+      [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, '20261108T120002Z-a1b4', fixture.appRoot, '-', FIXTURE_LEASE],
       fixture.env,
     );
     expect(backup.status).toBe(79);
@@ -646,7 +647,7 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
 
     const backup = runScript(
       PREPARE_BACKUP_SCRIPT,
-      [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, staleTx, fixture.appRoot],
+      [plan.dshPath, plan.prefix, plan.packageDir, plan.realPath, plan.installedVersion, staleTx, fixture.appRoot, '-', FIXTURE_LEASE],
       fixture.env,
     );
     expect(backup.status).toBe(79);

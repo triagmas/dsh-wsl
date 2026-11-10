@@ -13,7 +13,8 @@
  * exactly like the other `sh`-based suites.
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +28,7 @@ import {
 
 const VERSION = '0.2.1-rc.5';
 const TX = '20261111T090000Z-a1b2';
+const LEASE = 'c'.repeat(32);
 const OTHER_TX = '20261110T123455Z-1f8f';
 const posix = process.platform !== 'win32' && existsSync('/bin/sh');
 
@@ -75,7 +77,7 @@ function sandbox(files: number) {
 
 function runPrepare(
   box: ReturnType<typeof sandbox>,
-  overrides: { tx?: string; path?: string; pkg?: string } = {},
+  overrides: { tx?: string; path?: string; pkg?: string; lease?: string } = {},
 ) {
   return spawnSync(
     '/bin/sh',
@@ -90,6 +92,7 @@ function runPrepare(
       overrides.tx ?? TX,
       box.appRoot,
       box.node,
+      overrides.lease ?? LEASE,
     ],
     { encoding: 'utf8', cwd: box.root, env: { PATH: overrides.path ?? '/usr/bin:/bin', HOME: box.root } },
   );
@@ -97,6 +100,27 @@ function runPrepare(
 
 function snapshotPath(box: ReturnType<typeof sandbox>, tx = TX): string {
   return join(box.updateDir, `shared-backup-${tx}`);
+}
+
+/** Everything a directory contains, so "untouched" can be asserted exactly. */
+function treeState(root: string): string[] {
+  const out: string[] = [];
+  const walk = (dir: string, prefix: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = join(dir, entry.name);
+      const rel = `${prefix}${entry.name}`;
+      if (entry.isDirectory()) {
+        out.push(`d ${rel}`);
+        walk(full, `${rel}/`);
+      } else if (entry.isSymbolicLink()) {
+        out.push(`l ${rel}`);
+      } else {
+        out.push(`f ${rel} ${createHash('sha256').update(readFileSync(full)).digest('hex')}`);
+      }
+    }
+  };
+  if (existsSync(root)) walk(root, '');
+  return out;
 }
 
 /** The algorithm the batching replaced, kept here to prove format compatibility. */
@@ -268,23 +292,66 @@ describe.skipIf(!posix)('phase markers name the stage a killed attempt reached',
   });
 });
 
-describe.skipIf(!posix)('CLEAN_SNAPSHOT_SCRIPT removes only its own transaction', () => {
-  function interruptedAttempt(box: ReturnType<typeof sandbox>) {
+describe.skipIf(!posix)('a pre-existing temporary snapshot is never adopted or removed', () => {
+  it('refuses with 79 and leaves the pre-existing tree byte-identical', () => {
+    const box = sandbox(3);
+    mkdirSync(box.updateDir, { recursive: true });
+    const tmp = join(box.updateDir, `shared-backup-${TX}.tmp`);
+    mkdirSync(join(tmp, 'payload'), { recursive: true });
+    writeFileSync(join(tmp, 'payload', 'sentinel.txt'), 'pre-existing\n');
+    writeFileSync(join(tmp, 'manifest'), 'sentinel manifest\n');
+    const before = treeState(tmp);
+
+    const result = runPrepare(box);
+    expect(result.status).toBe(79);
+    expect(result.stderr).toContain('already exists');
+    // No lease, no payload copy, no deletion: the tree is exactly as it was.
+    expect(treeState(tmp)).toEqual(before);
+    expect(existsSync(join(tmp, 'owner'))).toBe(false);
+  });
+
+  it('does not leave the pre-existing tree removable by a later cleanup', () => {
+    const box = sandbox(3);
+    mkdirSync(box.updateDir, { recursive: true });
+    const tmp = join(box.updateDir, `shared-backup-${TX}.tmp`);
+    mkdirSync(join(tmp, 'payload'), { recursive: true });
+    writeFileSync(join(tmp, 'payload', 'sentinel.txt'), 'pre-existing\n');
+    const before = treeState(tmp);
+    expect(runPrepare(box).status).toBe(79);
+    // Even a cleanup that names the right transaction cannot prove creation.
+    const result = spawnSync('/bin/sh', ['-c', CLEAN_SNAPSHOT_SCRIPT, box.appRoot, TX, LEASE, '-'], {
+      encoding: 'utf8',
+      cwd: box.root,
+      env: { PATH: '/usr/bin:/bin', HOME: box.root },
+    });
+    expect(result.status).toBe(79);
+    expect(treeState(tmp)).toEqual(before);
+  });
+});
+
+describe.skipIf(!posix)('CLEAN_SNAPSHOT_SCRIPT removes only a tree this attempt created', () => {
+  /** A `.tmp` tree shaped exactly like an interrupted attempt's leftovers. */
+  function interruptedAttempt(box: ReturnType<typeof sandbox>, lease = LEASE) {
     const tmp = join(box.updateDir, `shared-backup-${TX}.tmp`);
     mkdirSync(join(tmp, 'payload', 'lib'), { recursive: true });
     writeFileSync(join(tmp, 'payload', 'lib', 'bin.js'), 'half copied\n');
     writeFileSync(join(tmp, 'manifest'), '4294967295 12 ./lib/bin.js\n');
+    writeFileSync(join(tmp, 'owner'), `transaction=${TX}\ntoken=${lease}\npid=4242\ncreated=1700000000000\n`);
     writeFileSync(join(box.updateDir, `${TX}.progress`), `1700000000000 start\n1700000000000 copy\n`);
     writeFileSync(join(box.updateDir, `.${TX}.manifest-list`), 'partial\n');
     return tmp;
   }
 
-  function runClean(box: ReturnType<typeof sandbox>, tx = TX) {
-    return spawnSync('/bin/sh', ['-c', CLEAN_SNAPSHOT_SCRIPT, box.appRoot, tx], {
-      encoding: 'utf8',
-      cwd: box.root,
-      env: { PATH: '/usr/bin:/bin', HOME: box.root },
-    });
+  function runClean(
+    box: ReturnType<typeof sandbox>,
+    options: { tx?: string; lease?: string; mountInfo?: string } = {},
+  ) {
+    const mountInfo = options.mountInfo ?? '-';
+    return spawnSync(
+      '/bin/sh',
+      ['-c', CLEAN_SNAPSHOT_SCRIPT, box.appRoot, options.tx ?? TX, options.lease ?? LEASE, mountInfo],
+      { encoding: 'utf8', cwd: box.root, env: { PATH: '/usr/bin:/bin', HOME: box.root } },
+    );
   }
 
   it('removes the temporary tree, the markers and the work files', () => {
@@ -331,17 +398,91 @@ describe.skipIf(!posix)('CLEAN_SNAPSHOT_SCRIPT removes only its own transaction'
     const tmp = join(box.updateDir, `shared-backup-${TX}.tmp`);
     mkdirSync(tmp, { recursive: true });
     writeFileSync(join(tmp, 'unexpected.txt'), 'not ours\n');
+    writeFileSync(join(tmp, 'owner'), `transaction=${TX}\ntoken=${LEASE}\n`);
     const result = runClean(box);
     expect(result.status).toBe(79);
     expect(existsSync(join(tmp, 'unexpected.txt'))).toBe(true);
   });
 
-  it('rejects a malformed transaction id and a relative app root', () => {
+  it('refuses a tree without a creation lease and leaves it byte-identical', () => {
     const box = sandbox(2);
-    expect(runClean(box, '../etc').status).toBe(64);
-    expect(runClean(box, 'a/b').status).toBe(64);
-    expect(runClean(box, '').status).toBe(64);
-    const args = spawnSync('/bin/sh', ['-c', CLEAN_SNAPSHOT_SCRIPT, 'relative/root', TX], {
+    const tmp = interruptedAttempt(box);
+    rmSync(join(tmp, 'owner'));
+    writeFileSync(join(tmp, 'payload', 'sentinel.txt'), 'pre-existing\n');
+    const before = treeState(tmp);
+    const result = runClean(box);
+    expect(result.status).toBe(79);
+    expect(result.stderr).toContain('carries no creation lease');
+    expect(treeState(tmp)).toEqual(before);
+  });
+
+  it('refuses a lease that belongs to another attempt', () => {
+    const box = sandbox(2);
+    const tmp = interruptedAttempt(box);
+    const before = treeState(tmp);
+    const result = runClean(box, { lease: 'f'.repeat(32) });
+    expect(result.status).toBe(79);
+    expect(result.stderr).toContain('belongs to another attempt');
+    expect(treeState(tmp)).toEqual(before);
+  });
+
+  it('refuses a lease that names another transaction', () => {
+    const box = sandbox(2);
+    const tmp = interruptedAttempt(box);
+    writeFileSync(join(tmp, 'owner'), `transaction=${OTHER_TX}\ntoken=${LEASE}\n`);
+    const before = treeState(tmp);
+    expect(runClean(box).status).toBe(79);
+    expect(treeState(tmp)).toEqual(before);
+  });
+
+  it('refuses a tree that is a mount point or contains one', () => {
+    const box = sandbox(2);
+    const tmp = interruptedAttempt(box);
+    const inside = join(tmp, 'payload', 'lib');
+    const table = join(box.root, 'mountinfo.txt');
+    writeFileSync(
+      table,
+      `999 999 8:1 / / rw - ext4 /dev/sda1 rw\n1000 999 8:2 / ${inside} rw - ext4 /dev/sdb1 rw\n`,
+    );
+    const before = treeState(tmp);
+    const result = runClean(box, { mountInfo: table });
+    expect(result.status).toBe(79);
+    expect(result.stderr).toContain('is a mount point at or below');
+    expect(treeState(tmp)).toEqual(before);
+  });
+
+  it('refuses to delete while a process still holds a file inside the tree', () => {
+    const box = sandbox(2);
+    const tmp = interruptedAttempt(box);
+    const held = join(tmp, 'payload', 'lib', 'bin.js');
+    // A background reader keeps the file open, so the guard must refuse.
+    const reader = spawn('/bin/sh', ['-c', `exec 3<"${held}"; sleep 5`], { stdio: 'ignore' });
+    try {
+      const deadline = Date.now() + 3_000;
+      let refused = false;
+      while (Date.now() < deadline) {
+        const result = runClean(box);
+        if (result.status === 79 && (result.stderr ?? '').includes('still open by a running process')) {
+          refused = true;
+          break;
+        }
+      }
+      expect(refused).toBe(true);
+      expect(existsSync(held)).toBe(true);
+    } finally {
+      reader.kill();
+    }
+  });
+
+  it('rejects a malformed transaction id, lease or mount table path', () => {
+    const box = sandbox(2);
+    expect(runClean(box, { tx: '../etc' }).status).toBe(64);
+    expect(runClean(box, { tx: 'a/b' }).status).toBe(64);
+    expect(runClean(box, { tx: '' }).status).toBe(64);
+    expect(runClean(box, { lease: 'short' }).status).toBe(64);
+    expect(runClean(box, { lease: 'A'.repeat(32) }).status).toBe(64);
+    expect(runClean(box, { mountInfo: 'relative/table' }).status).toBe(64);
+    const args = spawnSync('/bin/sh', ['-c', CLEAN_SNAPSHOT_SCRIPT, 'relative/root', TX, LEASE, '-'], {
       encoding: 'utf8',
       env: { PATH: '/usr/bin:/bin', HOME: box.root },
     });
@@ -350,8 +491,10 @@ describe.skipIf(!posix)('CLEAN_SNAPSHOT_SCRIPT removes only its own transaction'
 });
 
 describe('the cleanup command is built from validated arguments', () => {
-  it('passes the app root and the transaction id as the only positional arguments', () => {
-    expect(buildCleanSnapshotArgs({ distro: 'Ubuntu', appRoot: '~/root', transaction: TX })).toEqual([
+  const base = { distro: 'Ubuntu', appRoot: '~/root', transaction: TX, lease: LEASE };
+
+  it('passes the app root, the transaction id, the lease and the mount table', () => {
+    expect(buildCleanSnapshotArgs(base)).toEqual([
       '-d',
       'Ubuntu',
       '--exec',
@@ -360,21 +503,37 @@ describe('the cleanup command is built from validated arguments', () => {
       CLEAN_SNAPSHOT_SCRIPT,
       '~/root',
       TX,
+      LEASE,
+      '-',
     ]);
   });
 
   it('passes `-` for an installation that does not isolate the environment', () => {
-    const argv = buildCleanSnapshotArgs({ distro: 'Ubuntu', appRoot: '-', transaction: TX });
-    expect(argv.at(-2)).toBe('-');
+    const argv = buildCleanSnapshotArgs({ ...base, appRoot: '-' });
+    expect(argv.at(-4)).toBe('-');
+    expect(argv.at(-2)).toBe(LEASE);
+    expect(argv.at(-1)).toBe('-');
+  });
+
+  it('accepts an absolute fixture path for the mount table', () => {
+    const argv = buildCleanSnapshotArgs({ ...base, mountInfo: '/tmp/mountinfo-fixture' });
+    expect(argv.at(-1)).toBe('/tmp/mountinfo-fixture');
   });
 
   it('refuses a transaction id that is not a plain token', () => {
-    expect(() => buildCleanSnapshotArgs({ distro: 'Ubuntu', appRoot: '~/r', transaction: '../x' })).toThrow();
-    expect(() => buildCleanSnapshotArgs({ distro: 'Ubuntu', appRoot: '~/r', transaction: 'a b' })).toThrow();
+    expect(() => buildCleanSnapshotArgs({ ...base, transaction: '../x' })).toThrow();
+    expect(() => buildCleanSnapshotArgs({ ...base, transaction: 'a b' })).toThrow();
   });
 
-  it('refuses a relative app root', () => {
-    expect(() => buildCleanSnapshotArgs({ distro: 'Ubuntu', appRoot: 'root', transaction: TX })).toThrow();
+  it('refuses a lease that is not a plain token', () => {
+    for (const lease of ['', 'short', 'A'.repeat(32), 'z'.repeat(32), 'a'.repeat(31)]) {
+      expect(() => buildCleanSnapshotArgs({ ...base, lease })).toThrow();
+    }
+  });
+
+  it('refuses a relative app root or a relative mount table path', () => {
+    expect(() => buildCleanSnapshotArgs({ ...base, appRoot: 'root' })).toThrow();
+    expect(() => buildCleanSnapshotArgs({ ...base, mountInfo: 'relative/table' })).toThrow();
   });
 
   it('parses a report without a result line as unusable rather than successful', () => {

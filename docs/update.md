@@ -202,23 +202,51 @@ worst observed end-to-end is ~95 s and a typical run 11.6 s. 300 s is three time
 the worst measurement and no longer hides a hang, since a stuck run now names its
 phase.
 
-### Cleaning up after an interrupted attempt (issue #31)
+### Cleaning up after an interrupted attempt (issue #31, review R02)
 
-When the budget expires, `wsl.exe` is killed and — measured — its whole Linux
-process subtree dies with it within 0.5 s: no surviving child or grandchild still
-writes into the tree. The script therefore cannot clean up after itself, so the
-app finishes the job with `CLEAN_SNAPSHOT_SCRIPT`: it prints the recorded phase
-lines, removes `<update>/shared-backup-<tx>.tmp` and this transaction's progress
-and manifest work files, and nothing else.
+When the budget expires, `wsl.exe` is killed **and awaited**: the gateway only
+treats the attempt as finished once the owned process reports its own exit
+(`TERMINATION_GRACE_MS`, 15 s). If that confirmation never arrives — the kill
+throws, or no exit is reported — the temporary tree is **kept**, the failure says
+so ("the partial snapshot was kept for a manual check") and the update fails
+closed. A timeout is never treated as proof that nothing is still writing.
 
-The scope is provable rather than assumed: the transaction id must match the
-transaction pattern, the update directory must canonicalise to itself, the target
-must be a real directory whose direct entries are exactly `payload/` (a real
-directory) and `manifest` (a regular file), and any symlink is a refusal (`79`).
-A *verified* snapshot (`shared-backup-<tx>` without `.tmp`) is never touched, an
-unrecognized tree is left in place for the owner to inspect, and a failed cleanup
-never masks the original failure. Measured: removing an 844 MB / 61 833-file tree
-takes 0.97 s, so the cleanup budget is 60 s.
+Only then does the app call `CLEAN_SNAPSHOT_SCRIPT`, and only for a status that
+could have created the tree: a refusal of an already existing path (`79`) or of
+the arguments (`64`) never wrote anything, so no cleanup runs at all.
+
+Ownership is proven, not guessed. Right after the script creates
+`<update>/shared-backup-<tx>.tmp` — with a plain `mkdir`, so an existing directory
+is never reused — it writes `owner` into it:
+
+```
+transaction=<tx>
+token=<32 hex characters, generated per attempt>
+pid=<creating shell>   created=<epoch ms>
+```
+
+The token is a fresh random value held only in the app's memory for that attempt,
+so a pre-existing directory cannot contain it; the transaction name alone is never
+accepted as ownership. The lease is deleted again just before the rename, so a
+verified snapshot keeps its documented shape and never carries a token. Cleanup
+requires a matching lease, which means a tree that merely looks familiar is
+refused (`79`) and left exactly as it was.
+
+Before `rm -rf` the script also refuses:
+
+- a symlink anywhere in the chain (`update/`, the target, `payload`, `manifest`, `owner`);
+- entries other than `payload/` (a real directory), `manifest` (a regular file) and `owner`;
+- a **mount point at or below the target**, read from `/proc/self/mountinfo`, including a
+  bind mount on the same device — an unreadable or unparsable table is a refusal,
+  never a green light;
+- a tree a **running process still has open**: every `/proc/<pid>/fd` link is
+  compared against the target path, so a writer that outlived the killed `wsl.exe`
+  keeps the tree in place instead of losing its files mid-write.
+
+A *verified* snapshot (`shared-backup-<tx>` without `.tmp`) is never touched, no
+other directory is ever considered, and a failed cleanup never masks the original
+failure. Measured: removing an 844 MB / 61 833-file tree takes 0.97 s, so the
+cleanup budget is 60 s.
 
 ### Identity at the last safe moment (B2)
 

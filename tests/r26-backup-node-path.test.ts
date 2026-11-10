@@ -22,6 +22,7 @@ import { PREPARE_BACKUP_SCRIPT, buildPrepareBackupArgs } from '../src/main/wsl/u
 
 const VERSION = '0.2.1-rc.5';
 const TX = '20261110T100114Z-d380';
+const LEASE = 'a'.repeat(32);
 const HERE = process.cwd();
 const posix = process.platform !== 'win32' && existsSync('/bin/sh');
 
@@ -93,6 +94,7 @@ function runBackup(
       TX,
       box.appRoot,
       overrides.node ?? box.node,
+      LEASE,
     ],
     {
       encoding: 'utf8',
@@ -131,7 +133,7 @@ describe.skipIf(!posix)('PREPARE_BACKUP_SCRIPT keeps working on a minimal PATH (
     const box = sandbox();
     const result = spawnSync(
       '/bin/sh',
-      ['-c', PREPARE_BACKUP_SCRIPT, box.dsh, box.prefix, box.pkg, box.real, VERSION, TX, '-', box.node],
+      ['-c', PREPARE_BACKUP_SCRIPT, box.dsh, box.prefix, box.pkg, box.real, VERSION, TX, '-', box.node, LEASE],
       { encoding: 'utf8', cwd: box.root, env: { PATH: '/usr/bin:/bin', HOME: box.root } },
     );
     expect(result.status).toBe(0);
@@ -192,9 +194,11 @@ describe('buildPrepareBackupArgs passes the resolved Node runtime', () => {
     realPath: '/home/dev/.local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
     installedVersion: VERSION,
     transaction: TX,
+    nodePath: '/home/dev/.local/bin/node',
+    lease: LEASE,
   };
 
-  it('sends the Node executable as the last positional argument', () => {
+  it('sends the Node executable and the attempt lease as the last positional arguments', () => {
     const argv = buildPrepareBackupArgs({ ...base, nodePath: '/home/dev/.local/bin/node' });
     expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PREPARE_BACKUP_SCRIPT]);
     expect(argv.slice(6)).toEqual([
@@ -206,12 +210,20 @@ describe('buildPrepareBackupArgs passes the resolved Node runtime', () => {
       TX,
       base.appRoot,
       '/home/dev/.local/bin/node',
+      LEASE,
     ]);
   });
 
   it('passes `-` when the runtime is unknown', () => {
     const argv = buildPrepareBackupArgs({ ...base, nodePath: null });
-    expect(argv[argv.length - 1]).toBe('-');
+    expect(argv[argv.length - 2]).toBe('-');
+    expect(argv[argv.length - 1]).toBe(LEASE);
+  });
+
+  it('rejects a lease that is not a plain token', () => {
+    for (const lease of ['', 'short', 'A'.repeat(32), 'z'.repeat(32), 'a'.repeat(31), 'a b'.repeat(11)]) {
+      expect(() => buildPrepareBackupArgs({ ...base, lease })).toThrow(ArgumentError);
+    }
   });
 
   it('rejects an invalid Node path before anything runs', () => {
