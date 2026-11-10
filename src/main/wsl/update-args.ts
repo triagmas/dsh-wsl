@@ -396,11 +396,22 @@ export const INSPECT_SHARED_SCRIPT = [
  *
  * `$0` = executable, `$1` = prefix, `$2` = package directory, `$3` = approved
  * real path, `$4` = installed version, `$5` = transaction id, `$6` = app data
- * root (`-` when isolation is off).
+ * root (`-` when isolation is off), `$7` = resolved Node runtime (`-` when
+ * unknown).
+ *
+ * The npm launcher is normally a symlink to a script that starts with
+ * `#!/usr/bin/env node`, so every version probe needs Node on PATH. A
+ * `wsl.exe --exec /bin/sh` command starts with a minimal PATH that does not
+ * contain the user's Node directory, so the resolved runtime is prepended here
+ * exactly like the other update stages do — regardless of the isolation
+ * setting. Without it the probe reported an empty version and the snapshot
+ * failed with code 81 even though the installation was healthy (issue #27).
  */
 export const PREPARE_BACKUP_SCRIPT = [
   'set -u',
-  'dsh="$0"; prefix="$1"; pkg="$2"; real_path="$3"; installed="$4"; tx="$5"; app_root="$6"',
+  'dsh="$0"; prefix="$1"; pkg="$2"; real_path="$3"; installed="$4"; tx="$5"; app_root="$6"; node="${7:--}"',
+  'case "$node" in "-") ;; /*) ;; *) echo "backup: rejected node runtime" >&2; exit 64 ;; esac',
+  'if [ "$node" != "-" ]; then PATH="$(dirname "$node"):$PATH"; export PATH; fi',
   'case "$installed" in ""|*[!0-9A-Za-z.-]*) echo "backup: rejected installed version" >&2; exit 64 ;; esac',
   'case "$tx" in ""|*[!0-9A-Za-z-]*) echo "backup: rejected transaction id" >&2; exit 64 ;; esac',
   'case "$prefix" in /*) ;; *) echo "backup: rejected npm prefix" >&2; exit 64 ;; esac',
@@ -752,6 +763,8 @@ export interface BackupRequest {
   realPath: string;
   installedVersion: string;
   transaction: string;
+  /** Resolved Node runtime, or `null` when it is not known (probe may then fail). */
+  nodePath: string | null;
 }
 
 export interface InspectRequest {
@@ -817,6 +830,9 @@ export function buildPrepareBackupArgs(request: BackupRequest): string[] {
   const dsh = assertAbsolutePath(request.dshPath);
   const realPath = assertAbsolutePath(request.realPath);
   const pkg = assertAbsolutePath(request.packageDir);
+  if (request.nodePath !== null && !isValidRuntimeBinary(request.nodePath)) {
+    throw new ArgumentError('invalid-runtime-binary');
+  }
   return [
     '-d',
     distro,
@@ -831,6 +847,7 @@ export function buildPrepareBackupArgs(request: BackupRequest): string[] {
     request.installedVersion,
     assertTransaction(request.transaction),
     appRootArg(request.appRoot),
+    request.nodePath ?? '-',
   ];
 }
 

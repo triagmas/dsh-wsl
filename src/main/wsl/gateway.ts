@@ -421,18 +421,20 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         realPath: request.realPath,
         installedVersion: request.installedVersion,
         transaction: request.transaction,
+        nodePath: request.nodePath,
       });
       const result = await run(argv, 120_000);
       const report = parseBackupReport(`${result.stdout}\n${result.stderr}`);
       if (result.code !== 0 || report === null) {
+        const detail = (result.stderr || result.stdout).trim().split('\n').filter(Boolean).slice(-1)[0] ?? '';
         options.log.error(
           `the recovery snapshot for ${request.installedVersion} could not be created (code=${result.code ?? 'null'}): ` +
-            `${(result.stderr || result.stdout).trim().split('\n').filter(Boolean).slice(-1)[0] ?? 'no output'}`,
+            `${detail === '' ? 'no output' : detail}`,
         );
-        return null;
+        return { ok: false, code: result.code, detail };
       }
       options.log.info(`recovery snapshot ready at ${report.path} (${report.files} files, version=${report.version})`);
-      return { path: report.path, files: report.files };
+      return { ok: true, snapshot: { path: report.path, files: report.files } };
     },
 
     async updateSharedDsh(request: SharedUpdateRunRequest, onLine) {

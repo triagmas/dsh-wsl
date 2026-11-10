@@ -4,6 +4,7 @@ import type {
   NpmVersionCheck,
   ResolvedRuntime,
   ServerHandle,
+  BackupAttempt,
   PrepareBackupRequest,
   SharedRollbackRequest,
   SharedUpdateRunRequest,
@@ -159,6 +160,9 @@ export class FakeWsl implements WslGateway {
   readonly backupRequests: PrepareBackupRequest[] = [];
   backupFails = false;
   backupFiles = 128;
+  /** Exit code and stderr line reported when `backupFails` is set (issue #27). */
+  backupFailureCode: number | null = 81;
+  backupFailureDetail = 'backup: /home/dev/.local/bin/dsh reports [] instead of [0.2.1-rc.5]';
   readonly npmChecks: { distro: string; appRoot: string; version: string; nodePath: string | null }[] = [];
   readonly inspections: InspectSharedRequest[] = [];
 
@@ -187,11 +191,16 @@ export class FakeWsl implements WslGateway {
     return { found: true, installation: { ...this.installation }, legacyRuntimePresent: this.legacyRuntimePresent };
   }
 
-  async prepareSharedBackup(request: PrepareBackupRequest): Promise<{ path: string; files: number } | null> {
+  async prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupAttempt> {
     this.backupRequests.push(request);
-    if (this.backupFails) return null;
+    if (this.backupFails) {
+      return { ok: false, code: this.backupFailureCode, detail: this.backupFailureDetail };
+    }
     const root = request.appRoot === '-' ? '/home/dev/.cache/wsl-web-shell' : request.appRoot.replace(/^~/, '/home/dev');
-    return { path: `${root}/update/shared-backup-${request.transaction}`, files: this.backupFiles };
+    return {
+      ok: true,
+      snapshot: { path: `${root}/update/shared-backup-${request.transaction}`, files: this.backupFiles },
+    };
   }
 
   async updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {

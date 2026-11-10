@@ -15,6 +15,7 @@ import {
   createUpdateState,
   createUpdateTerminal,
   decideRecovery,
+  describeBackupFailure,
   describeUpdatePhase,
   describeUpdateReason,
   isExactVersion,
@@ -937,6 +938,60 @@ describe('recovery snapshot and identity checks (review B1-B3)', () => {
     expect(h.wsl.updateRuns).toHaveLength(0);
     expect(h.journal.current()).toBeNull();
     expect(outcome.state.detail).toContain('verified recovery snapshot');
+  });
+
+  it('hands the resolved Node runtime to the snapshot step (issue #27)', async () => {
+    const h = runnerHarness();
+    await h.runner.run(acceptedPlan(), { ...context, nodePath: '/home/dev/.local/bin/node' });
+    // The npm launcher is a `#!/usr/bin/env node` shim: the backup script needs
+    // the runtime directory on PATH, and asking for it here keeps that
+    // independent of the isolation switch.
+    expect(h.wsl.backupRequests[0]?.nodePath).toBe('/home/dev/.local/bin/node');
+  });
+
+  it('reports an unknown runtime as `null` rather than guessing a path', async () => {
+    const h = runnerHarness();
+    await h.runner.run(acceptedPlan(), { ...context, nodePath: null });
+    expect(h.wsl.backupRequests[0]?.nodePath).toBeNull();
+  });
+
+  it('surfaces the real backup failure instead of generic free-space advice', async () => {
+    const h = runnerHarness();
+    h.wsl.backupFails = true;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    const detail = outcome.state.detail ?? '';
+    expect(detail).toContain('exit code 81');
+    expect(detail).toContain('reports [] instead of [0.2.1-rc.5]');
+    expect(detail).toContain('nothing was changed');
+    expect(detail).not.toContain('free space');
+    // Fail closed: no backend pause, no install, no journal record.
+    expect(h.order).toEqual([]);
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(h.journal.current()).toBeNull();
+  });
+
+  it('writes the exit status and the script line into the terminal buffer', async () => {
+    const h = runnerHarness();
+    h.wsl.backupFails = true;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    const lines = (outcome.state.lines ?? []).join('\n');
+    expect(lines).toContain('update: the recovery snapshot failed (code=81)');
+    expect(lines).toContain('reports [] instead of [0.2.1-rc.5]');
+    // The step is announced before it runs, so the window never shows an
+    // unexplained stop.
+    expect(lines).toContain('update: preparing a recovery snapshot of');
+  });
+
+  it('describes a snapshot failure with whatever the script reported', () => {
+    expect(describeBackupFailure(81, 'backup: /home/dev/.local/bin/dsh reports [] instead of [0.2.1-rc.5]'))
+      .toBe(
+        'The verified recovery snapshot could not be created (exit code 81: backup: /home/dev/.local/bin/dsh reports [] instead of [0.2.1-rc.5]), so nothing was changed. Your DeepSeek Harness CLI was not modified.',
+      );
+    expect(describeBackupFailure(null, '')).toContain('no exit status');
+    expect(describeBackupFailure(null, '')).toContain('printed no explanation');
+    expect(describeBackupFailure(80, 'the snapshot failed its integrity check')).toContain('exit code 80');
   });
 
   it('records the snapshot in the journal so recovery can use it offline', async () => {

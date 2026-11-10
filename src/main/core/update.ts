@@ -261,6 +261,10 @@ export const UPDATE_REASONS = {
   foreignProcess: 'foreign-process',
   noNpm: 'no-npm',
   loginShellMismatch: 'login-shell-mismatch',
+  // Part of the published reason catalogue. The runner now describes a failed
+  // snapshot with the code and output of the script itself
+  // (`describeBackupFailure`); this entry stays as generic wording for callers
+  // that have no script output yet.
   backupUnavailable: 'backup-unavailable',
 } as const;
 
@@ -295,6 +299,25 @@ export function describeUpdateReason(reason: string): string {
     default:
       return 'This update cannot be started safely.';
   }
+}
+
+/**
+ * Explain a failed snapshot attempt with the real reason.
+ *
+ * The backup script already reports the actionable cause on stderr (an empty
+ * version probe, a redirected package directory, an incomplete copy, a
+ * non-writable snapshot directory). Passing that through is what turns a generic
+ * "Update failed" into something the user can act on; the free-space advice is
+ * only one of several possible causes, so it is no longer assumed (issue #27).
+ */
+export function describeBackupFailure(code: number | null, detail: string): string {
+  const exit = code === null ? 'no exit status' : `exit code ${code}`;
+  const reason = detail.trim();
+  return (
+    `The verified recovery snapshot could not be created (${exit}: ${
+      reason === '' ? 'the backup step printed no explanation' : reason
+    }), so nothing was changed. Your DeepSeek Harness CLI was not modified.`
+  );
 }
 
 /** The npm command the user can run manually when the app refuses. */

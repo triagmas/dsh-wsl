@@ -241,12 +241,33 @@ describe('backup script (B1)', () => {
     realPath: REAL,
     installedVersion: '0.2.1-rc.5',
     transaction: '20261107T101500Z-1a2b',
+    nodePath: '/home/dev/.local/bin/node',
   };
 
   it('receives every value as a positional parameter', () => {
     const argv = buildPrepareBackupArgs(backupRequest);
     expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PREPARE_BACKUP_SCRIPT]);
-    expect(argv.slice(6)).toEqual([DSH, PREFIX, PKG, REAL, '0.2.1-rc.5', '20261107T101500Z-1a2b', APP_ROOT]);
+    // The resolved Node runtime is the last positional argument so the version
+    // probe works on a minimal PATH (issue #27).
+    expect(argv.slice(6)).toEqual([
+      DSH,
+      PREFIX,
+      PKG,
+      REAL,
+      '0.2.1-rc.5',
+      '20261107T101500Z-1a2b',
+      APP_ROOT,
+      '/home/dev/.local/bin/node',
+    ]);
+  });
+
+  it('accepts a missing runtime as `-`', () => {
+    const argv = buildPrepareBackupArgs({ ...backupRequest, nodePath: null });
+    expect(argv[argv.length - 1]).toBe('-');
+  });
+
+  it('rejects a runtime path that is not absolute', () => {
+    expect(() => buildPrepareBackupArgs({ ...backupRequest, nodePath: 'node' })).toThrow(ArgumentError);
   });
 
   it('refuses symlinked or pre-existing snapshot locations (C3)', () => {
