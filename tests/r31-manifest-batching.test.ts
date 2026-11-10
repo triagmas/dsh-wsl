@@ -48,8 +48,8 @@ function tempRoot(prefix = 'wss-r31-'): string {
 }
 
 /** npm-like installation used by the snapshot script. */
-function sandbox(files: number) {
-  const root = tempRoot();
+function sandbox(files: number, prefix = 'wss-r31-') {
+  const root = tempRoot(prefix);
   const prefix = join(root, 'prefix');
   const pkg = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh');
   const entry = join(pkg, 'lib', 'bin.js');
@@ -449,6 +449,42 @@ describe.skipIf(!posix)('CLEAN_SNAPSHOT_SCRIPT removes only a tree this attempt 
     expect(result.status).toBe(79);
     expect(result.stderr).toContain('is a mount point at or below');
     expect(treeState(tmp)).toEqual(before);
+  });
+
+  it('refuses a nested mount encoded as \040 in a target containing spaces', () => {
+    const box = sandbox(2, 'wss r31-');
+    const tmp = interruptedAttempt(box);
+    const nested = join(tmp, 'payload', 'lib');
+    const mountinfo = join(box.root, 'mountinfo-spaces.txt');
+    const encoded = nested.replaceAll(' ', '\\040');
+    writeFileSync(mountinfo, `999 999 8:1 / / rw - ext4 /dev/sda1 rw\n1000 999 8:2 / ${encoded} rw - ext4 /dev/sdb1 rw\n`);
+    const before = treeState(tmp);
+    const result = runClean(box, { mountInfo: mountinfo });
+    expect(result.status).toBe(79);
+    expect(result.stderr).toContain('is a mount point at or below');
+    expect(treeState(tmp)).toEqual(before);
+  });
+
+  it('refuses a malformed mountinfo rather than treating it as no mounts', () => {
+    const box = sandbox(2);
+    const tmp = interruptedAttempt(box);
+    const mountinfo = join(box.root, 'mountinfo-bad.txt');
+    writeFileSync(mountinfo, 'garbled mountinfo row\n');
+    const before = treeState(tmp);
+    const result = runClean(box, { mountInfo: mountinfo });
+    expect(result.status).toBe(79);
+    expect(result.stderr).toContain('could not be parsed');
+    expect(treeState(tmp)).toEqual(before);
+  });
+
+  it('cleans its own leased tree when the well-formed mountinfo has no nested mount', () => {
+    const box = sandbox(2, 'wss r31-');
+    const tmp = interruptedAttempt(box);
+    const mountinfo = join(box.root, 'mountinfo-clean.txt');
+    writeFileSync(mountinfo, '999 999 8:1 / / rw - ext4 /dev/sda1 rw\n');
+    const result = runClean(box, { mountInfo: mountinfo });
+    expect(result.status).toBe(0);
+    expect(existsSync(tmp)).toBe(false);
   });
 
   it('refuses to delete while a process still holds a file inside the tree', () => {
