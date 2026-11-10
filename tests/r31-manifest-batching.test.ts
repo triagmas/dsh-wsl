@@ -48,8 +48,8 @@ function tempRoot(prefix = 'wss-r31-'): string {
 }
 
 /** npm-like installation used by the snapshot script. */
-function sandbox(files: number, prefix = 'wss-r31-') {
-  const root = tempRoot(prefix);
+function sandbox(files: number, tempPrefix = 'wss-r31-') {
+  const root = tempRoot(tempPrefix);
   const prefix = join(root, 'prefix');
   const pkg = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh');
   const entry = join(pkg, 'lib', 'bin.js');
