@@ -1185,10 +1185,10 @@ const CLEAN_GUARD_HELPER = [
       for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
       if (separator == 0 || separator + 3 > NF) { invalid = 1; exit 2 }
       mount = $5
-      gsub(/\\\\040/, " ", mount)
-      gsub(/\\\\011/, "\t", mount)
-      gsub(/\\\\012/, "\n", mount)
-      gsub(/\\\\134/, "\\\\", mount)
+      gsub(/\\040/, " ", mount)
+      gsub(/\\011/, "\t", mount)
+      gsub(/\\012/, "\n", mount)
+      gsub(/\\134/, "\\", mount)
       if (mount == target || index(mount, target "/") == 1) { print mount; exit }
     }
     END { if (invalid) exit 2 }
