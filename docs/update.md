@@ -159,6 +159,67 @@ stripped, credentials (`?token=…`, `token: …`) are redacted, whitespace is
 collapsed and the text is capped at 200 characters with an ellipsis. An empty
 result keeps a bounded fallback, so the exit code is never lost.
 
+### The snapshot fits in its budget (issue #31)
+
+The first real in-app CLI update failed closed for the right reason but at the
+wrong cost: the manifest was produced by one `cksum` fork per file, which measured
+**134 s per pass** on the 838 MB / 61 833-file DSH package, and the stage needs two
+passes, so the 120 s gateway budget expired mid-manifest and the update stopped
+with "no verified recovery snapshot, nothing was changed".
+
+The recorded format is unchanged — one `CRC SIZE PATH` line per file, `LC_ALL=C`
+sorted, relative to `payload/` — and stays byte-identical: the batched manifest of
+the real package compared `cmp`-equal against the old per-file loop. What changed
+is how it is computed: the payload is walked once with `-print0`, sorted with
+`sort -z` and checksummed in batches of 500 paths by `xargs -0`. Measured on the
+same package: **134 s → 1.25 s** per pass (**1200 → 3** `cksum` forks for 1200
+files), and a full snapshot from start to verified rename in **11.6 s** (copy
+2.9 s, manifest 4.5 s including the shim record, verification 4.0 s).
+
+Each stage writes to a file instead of being piped into the next, because `dash`
+has no `pipefail` and a pipeline would report the status of its last command only.
+A failing `find`, `sort` or `cksum` therefore aborts the snapshot instead of
+recording a short manifest, the record count is checked against the number of
+files, and a payload whose file names contain a newline is refused — such a name
+would make the line-based format ambiguous.
+
+### Phase markers and the timeout budget (issue #31)
+
+```
+<app root>/update/<tx>.progress      epoch-milliseconds + phase name, per line
+```
+
+`PREPARE_BACKUP_SCRIPT` appends `start`, `copy`, `manifest`, `rename`, `verify`
+and `done` as it goes and removes the file when the snapshot verifies. Because the
+gateway kills the whole `wsl.exe` command when the budget expires, the file is the
+only record of where the time went: the cleanup step reprints it and the failure
+message names the phase (`… (stopped during: manifest)`), while `app.log` carries
+the full trail (`start@0ms -> copy@84ms -> manifest@2984ms -> …`).
+
+The budget was raised to **300 s** only after measuring: `cp -a` takes 3.7–4.0 s
+warm and 90 s with a cold page cache under load, each manifest pass 1.25 s, so the
+worst observed end-to-end is ~95 s and a typical run 11.6 s. 300 s is three times
+the worst measurement and no longer hides a hang, since a stuck run now names its
+phase.
+
+### Cleaning up after an interrupted attempt (issue #31)
+
+When the budget expires, `wsl.exe` is killed and — measured — its whole Linux
+process subtree dies with it within 0.5 s: no surviving child or grandchild still
+writes into the tree. The script therefore cannot clean up after itself, so the
+app finishes the job with `CLEAN_SNAPSHOT_SCRIPT`: it prints the recorded phase
+lines, removes `<update>/shared-backup-<tx>.tmp` and this transaction's progress
+and manifest work files, and nothing else.
+
+The scope is provable rather than assumed: the transaction id must match the
+transaction pattern, the update directory must canonicalise to itself, the target
+must be a real directory whose direct entries are exactly `payload/` (a real
+directory) and `manifest` (a regular file), and any symlink is a refusal (`79`).
+A *verified* snapshot (`shared-backup-<tx>` without `.tmp`) is never touched, an
+unrecognized tree is left in place for the owner to inspect, and a failed cleanup
+never masks the original failure. Measured: removing an 844 MB / 61 833-file tree
+takes 0.97 s, so the cleanup budget is 60 s.
+
 ### Identity at the last safe moment (B2)
 
 `realPath` from the plan is passed into the mutating script and compared again

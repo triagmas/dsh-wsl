@@ -39,6 +39,7 @@ import {
   buildStartServerArgs,
 } from './args.js';
 import {
+  buildCleanSnapshotArgs,
   buildInspectSharedArgs,
   buildNpmViewArgs,
   buildPrepareBackupArgs,
@@ -46,7 +47,9 @@ import {
   buildUpdateSharedArgs,
   NPM_MARKER,
   parseBackupReport,
+  parseCleanSnapshotReport,
   parseNpmMarker,
+  type CleanSnapshotReport,
 } from './update-args.js';
 
 export interface CommandResult {
@@ -59,11 +62,43 @@ export interface WslGatewayOptions {
   log: Logger;
   wslExe?: string;
   spawnImpl?: typeof spawn;
+  /**
+   * Overrides for the two snapshot-stage budgets, used by tests only.
+   *
+   * The defaults are the measured budgets below; a test that must observe the
+   * timeout path cannot wait minutes for it.
+   */
+  timeouts?: { backupMs?: number; cleanMs?: number };
 }
+
+/**
+ * Budget for one verified recovery snapshot (issue #31).
+ *
+ * Measured on the owner's host against the 838 MB / 61 833-file DSH package:
+ * `cp -a` 3.7–4.0 s warm and 90 s with a cold page cache under load; the content
+ * manifest 1.25 s per pass after the batching fix (134 s before it); the closing
+ * verification one more manifest pass. Worst observed end-to-end is therefore
+ * ~95 s with a cold cache, and a typical run is under 10 s. 300 s is three times
+ * the worst measurement, so a slow disk does not fail a healthy snapshot, while
+ * the phase markers written by the script still identify whatever was running if
+ * the budget is ever exhausted.
+ */
+const BACKUP_TIMEOUT_MS = 300_000;
+
+/**
+ * Budget for removing an interrupted snapshot.
+ *
+ * Measured: removing an 844 MB / 61 833-file snapshot tree took 0.97 s. 60 s is
+ * a sixty-fold margin and stays well below the backup budget, so a stuck removal
+ * can never dominate the update.
+ */
+const CLEAN_TIMEOUT_MS = 60_000;
 
 export function createWslGateway(options: WslGatewayOptions): WslGateway {
   const wslExe = options.wslExe ?? WSL_EXE;
   const spawnImpl = options.spawnImpl ?? spawn;
+  const backupTimeoutMs = options.timeouts?.backupMs ?? BACKUP_TIMEOUT_MS;
+  const cleanTimeoutMs = options.timeouts?.cleanMs ?? CLEAN_TIMEOUT_MS;
 
   const run = (args: string[], timeoutMs: number): Promise<CommandResult> =>
     new Promise((resolve, reject) => {
@@ -175,6 +210,80 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       throw new ShellError('unexpected', message, detail === '' ? null : detail);
     }
     return result;
+  };
+
+  /**
+   * Finish the work of a killed snapshot attempt (issue #31).
+   *
+   * `wsl.exe` killed at the timeout takes its whole Linux subtree with it, so no
+   * writer survives; the script can therefore no longer clean up after itself.
+   * The cleanup is transaction-scoped and refuses anything it does not recognize,
+   * and it reprints the recorded phase lines so the failure can name the phase.
+   */
+  const cleanInterruptedSnapshot = async (
+    request: PrepareBackupRequest,
+  ): Promise<CleanSnapshotReport | null> => {
+    try {
+      const result = await run(
+        buildCleanSnapshotArgs({
+          distro: request.distro,
+          appRoot: request.appRoot,
+          transaction: request.transaction,
+        }),
+        cleanTimeoutMs,
+      );
+      const report = parseCleanSnapshotReport(`${result.stdout}\n${result.stderr}`);
+      if (report === null) {
+        options.log.warn(
+          `the leftovers of the interrupted snapshot ${request.transaction} could not be cleaned up (code=${result.code ?? 'null'})`,
+        );
+        return null;
+      }
+      if (report.phases.length > 0) {
+        const first = report.phases[0]?.at ?? 0;
+        const trail = report.phases
+          .map((entry) => `${entry.phase}@${Math.max(0, entry.at - first)}ms`)
+          .join(' -> ');
+        options.log.info(`interrupted snapshot phases (${request.transaction}): ${trail}`);
+      } else {
+        options.log.info(`the interrupted snapshot ${request.transaction} recorded no phase markers`);
+      }
+      if (report.removed) {
+        options.log.info(`removed the interrupted snapshot directory for ${request.transaction}`);
+      }
+      return report;
+    } catch (error) {
+      // A failing cleanup never masks the original failure; it is reported only.
+      options.log.warn(
+        `the leftovers of the interrupted snapshot ${request.transaction} could not be removed: ${(error as Error).message}`,
+      );
+      return null;
+    }
+  };
+
+  const phaseNote = (report: CleanSnapshotReport | null): string | null => {
+    const phase = report?.phases.at(-1)?.phase;
+    return phase === undefined ? null : `stopped during: ${phase}`;
+  };
+
+  const withPhaseNote = (detail: string, report: CleanSnapshotReport | null): string => {
+    const note = phaseNote(report);
+    if (note === null) return detail;
+    return detail === '' ? `the backup step ${note}` : `${detail} (${note})`;
+  };
+
+  /**
+   * Re-throw a killed command with the phase appended, so the update window and
+   * `app.log` say where the budget was spent instead of only "it timed out".
+   */
+  const withPhaseNoteOnError = (error: unknown, report: CleanSnapshotReport | null): unknown => {
+    const note = phaseNote(report);
+    if (note === null || !(error instanceof Error)) return error;
+    const message = `${error.message} (${note})`;
+    if (error instanceof ShellError) return new ShellError(error.code, message, error.hint);
+    const wrapped = new Error(message);
+    wrapped.name = error.name;
+    return wrapped;
   };
 
   return {
@@ -424,7 +533,20 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         transaction: request.transaction,
         nodePath: request.nodePath,
       });
-      const result = await run(argv, 120_000);
+      let result: CommandResult;
+      try {
+        result = await run(argv, backupTimeoutMs);
+      } catch (error) {
+        // A killed command is the case that matters most (issue #31): the script
+        // could not clean up after itself, so the app does it and names the phase.
+        const cleaned = await cleanInterruptedSnapshot(request);
+        options.log.error(
+          `the recovery snapshot for ${request.installedVersion} could not be created: ${
+            error instanceof Error ? error.message : 'unknown error'
+          }`,
+        );
+        throw withPhaseNoteOnError(error, cleaned);
+      }
       const report = parseBackupReport(`${result.stdout}\n${result.stderr}`);
       if (result.code !== 0 || report === null) {
         // Subprocess output never leaves the gateway unsanitized: the helper
@@ -435,7 +557,10 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
           `the recovery snapshot for ${request.installedVersion} could not be created (code=${result.code ?? 'null'}): ` +
             `${detail === '' ? 'no output' : detail}`,
         );
-        return { ok: false, code: result.code, detail };
+        // The script may have been killed mid-way, so finish its work for it and
+        // report which phase was still running when the budget expired.
+        const cleaned = await cleanInterruptedSnapshot(request);
+        return { ok: false, code: result.code, detail: withPhaseNote(detail, cleaned) };
       }
       options.log.info(`recovery snapshot ready at ${report.path} (${report.files} files, version=${report.version})`);
       return { ok: true, snapshot: { path: report.path, files: report.files } };

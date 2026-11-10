@@ -290,8 +290,12 @@ describe('backup script (B1)', () => {
     // Every consumer re-verifies the manifest before it deletes anything.
     for (const script of [UPDATE_SHARED_SCRIPT, ROLLBACK_SHARED_SCRIPT]) {
       expect(script).toContain('manifest_ok "$sn"');
+      // The manifest is still produced by `cksum` over every payload file and
+      // still re-verified by comparison, but in batches and through files, so a
+      // failing stage cannot be hidden by a pipeline (#31).
       expect(script).toContain('cksum');
-      expect(script).toContain('cmp -s -');
+      expect(script).toContain('manifest_of() {');
+      expect(script).toContain('cmp -s "$check"');
       const check = script.indexOf('manifest_ok "$sn"');
       expect(check).toBeGreaterThan(-1);
     }
