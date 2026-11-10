@@ -242,13 +242,15 @@ describe('backup script (B1)', () => {
     installedVersion: '0.2.1-rc.5',
     transaction: '20261107T101500Z-1a2b',
     nodePath: '/home/dev/.local/bin/node',
+    lease: 'd'.repeat(32),
   };
 
   it('receives every value as a positional parameter', () => {
     const argv = buildPrepareBackupArgs(backupRequest);
     expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PREPARE_BACKUP_SCRIPT]);
-    // The resolved Node runtime is the last positional argument so the version
-    // probe works on a minimal PATH (issue #27).
+    // The resolved Node runtime is the second-to-last positional argument so the
+    // version probe works on a minimal PATH (issue #27); the attempt lease follows
+    // it and proves ownership of the temporary snapshot (review R02).
     expect(argv.slice(6)).toEqual([
       DSH,
       PREFIX,
@@ -258,12 +260,29 @@ describe('backup script (B1)', () => {
       '20261107T101500Z-1a2b',
       APP_ROOT,
       '/home/dev/.local/bin/node',
+      'd'.repeat(32),
     ]);
   });
 
   it('accepts a missing runtime as `-`', () => {
     const argv = buildPrepareBackupArgs({ ...backupRequest, nodePath: null });
-    expect(argv[argv.length - 1]).toBe('-');
+    expect(argv[argv.length - 2]).toBe('-');
+  });
+
+  it('refuses a lease that is not 32-64 lowercase hex characters', () => {
+    for (const lease of ['', 'abc', 'A'.repeat(32), 'g'.repeat(32), 'a'.repeat(31), 'a'.repeat(65)]) {
+      expect(() => buildPrepareBackupArgs({ ...backupRequest, lease })).toThrow(ArgumentError);
+    }
+  });
+
+  it('writes the lease into the temporary snapshot and removes it before the rename', () => {
+    const leaseAt = PREPARE_BACKUP_SCRIPT.indexOf('token=%s');
+    const renameAt = PREPARE_BACKUP_SCRIPT.indexOf('mv "$sn.tmp" "$sn"');
+    expect(leaseAt).toBeGreaterThan(-1);
+    expect(renameAt).toBeGreaterThan(leaseAt);
+    // The tree is created with a plain mkdir, so an existing tree cannot be reused.
+    expect(PREPARE_BACKUP_SCRIPT).toContain('mkdir "$sn.tmp"');
+    expect(PREPARE_BACKUP_SCRIPT).not.toContain('mkdir -p "$sn.tmp/payload"');
   });
 
   it('rejects a runtime path that is not absolute', () => {
@@ -290,8 +309,12 @@ describe('backup script (B1)', () => {
     // Every consumer re-verifies the manifest before it deletes anything.
     for (const script of [UPDATE_SHARED_SCRIPT, ROLLBACK_SHARED_SCRIPT]) {
       expect(script).toContain('manifest_ok "$sn"');
+      // The manifest is still produced by `cksum` over every payload file and
+      // still re-verified by comparison, but in batches and through files, so a
+      // failing stage cannot be hidden by a pipeline (#31).
       expect(script).toContain('cksum');
-      expect(script).toContain('cmp -s -');
+      expect(script).toContain('manifest_of() {');
+      expect(script).toContain('cmp -s "$check"');
       const check = script.indexOf('manifest_ok "$sn"');
       expect(check).toBeGreaterThan(-1);
     }

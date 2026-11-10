@@ -52,6 +52,12 @@ export const NPM_MARKER = '__wsl_web_shell_npm__';
 /** Marker printed by the backup script before every `key=value` line. */
 export const BACKUP_MARKER = '__dsh_wsl_backup__';
 
+/** Marks the phase lines reprinted by {@link CLEAN_SNAPSHOT_SCRIPT}. */
+export const CLEAN_PROGRESS_MARKER = '__dsh_wsl_progress__';
+
+/** Marks the cleanup result line. */
+export const CLEAN_MARKER = '__dsh_wsl_clean__';
+
 /**
  * Self-identifying text embedded in every script that scans `/proc`.
  *
@@ -204,17 +210,77 @@ const DEST_TRUSTED_HELPER = [
  * `cksum` (POSIX) over a sorted relative file list detects truncated, altered or
  * removed files, so a snapshot that merely *looks* present can never be used to
  * delete a working installation (review C3).
+ *
+ * The recorded format is unchanged: one `CRC SIZE PATH` line per file, paths
+ * sorted with `LC_ALL=C` and relative to the payload. What changed is how it is
+ * produced (issue #31): the old loop forked one `cksum` per file, which on a
+ * 61 833-file package measured 134 s per pass — twice the whole stage budget. The
+ * file list is now walked once, sorted with `-z` and checksummed in batches of
+ * 500 paths, which measured 1.25 s per pass on the same payload and produced a
+ * byte-identical manifest.
+ *
+ * Every stage is checked separately, so a failure anywhere is a refusal: `dash`
+ * has no `pipefail`, therefore the stages write to files instead of being piped
+ * into each other. A file name containing a newline would make the line-based
+ * format ambiguous, so such a payload is refused instead of producing a record
+ * that could agree with a tampered tree.
  */
 const MANIFEST_HELPER = [
   'manifest_of() {',
-  '( cd "$1" && find . -type f -print | LC_ALL=C sort | while IFS= read -r f; do cksum "$f"; done )',
+  'payload="$1"; work="$2"; out="$3"',
+  'tag="${tx:-$$}"',
+  'list="$work/.$tag.manifest-list"; sorted="$work/.$tag.manifest-sorted"',
+  '[ -d "$payload" ] || { echo "update: $payload is not a directory" >&2; return 1; }',
+  '[ -d "$work" ] || { echo "update: $work is not a directory" >&2; return 1; }',
+  'rm -f "$list" "$sorted" 2>/dev/null',
+  '( cd "$payload" && find . -type f -print0 ) > "$list" || { echo "update: the package contents could not be listed" >&2; rm -f "$list" "$sorted"; return 1; }',
+  'nul="$(tr -cd "\\0" < "$list" | wc -c | tr -d " ")"',
+  'lines="$(cd "$payload" && find . -type f -print | wc -l | tr -d " ")"',
+  'if [ "$nul" != "$lines" ]; then',
+  'echo "update: a file name in the package contains a newline, so the manifest would be ambiguous" >&2',
+  'rm -f "$list" "$sorted"; return 1',
+  'fi',
+  'LC_ALL=C sort -z "$list" > "$sorted" || { echo "update: the file list could not be sorted" >&2; rm -f "$list" "$sorted"; return 1; }',
+  // The list holds paths relative to the payload, so the batches must run there;
+  // the redirect stays outside the subshell so a failure is not hidden.
+  '( cd "$payload" && xargs -0 -r -n 500 cksum < "$sorted" ) > "$out" || { echo "update: the checksum command failed" >&2; rm -f "$list" "$sorted" "$out"; return 1; }',
+  'written="$(wc -l < "$out" | tr -d " ")"',
+  'if [ "$written" != "$nul" ]; then',
+  'echo "update: the manifest has $written records for $nul files" >&2',
+  'rm -f "$list" "$sorted" "$out"; return 1',
+  'fi',
+  'rm -f "$list" "$sorted"',
+  'return 0',
   '}',
   'manifest_ok() {',
   '[ -d "$1/payload" ] && [ -f "$1/manifest" ] || return 1',
-  'manifest_of "$1/payload" 2>/dev/null | cmp -s - "$1/manifest" || return 1',
+  'work="${2:-$upd}"',
+  'check="$work/.${tx:-$$}.manifest-check"',
+  'manifest_of "$1/payload" "$work" "$check" || { rm -f "$check"; return 1; }',
+  'if ! cmp -s "$check" "$1/manifest"; then rm -f "$check"; return 1; fi',
+  'rm -f "$check"',
   'want="$(meta_value files "$1/meta")"',
   'have="$(wc -l < "$1/manifest" 2>/dev/null | tr -d " ")"',
   '[ -z "$want" ] || [ "$want" = "$have" ] || return 1',
+  'return 0',
+  '}',
+].join('\n');
+
+/**
+ * Phase markers for the snapshot stage (issue #31).
+ *
+ * The gateway kills the whole `wsl.exe` command when it exceeds its budget, so a
+ * timeout alone never says *where* the time went. Each phase appends one line to
+ * `<app root>/update/<tx>.progress` with an epoch-millisecond stamp; the file
+ * survives the kill, so a failed run can name the phase that was still running
+ * instead of guessing. The file is transaction-scoped and removed with the rest
+ * of this transaction's leftovers.
+ */
+const PROGRESS_HELPER = [
+  'progress() {',
+  '[ -n "${upd:-}" ] || return 0',
+  'case "${tx:-}" in ""|*[!0-9A-Za-z-]*) return 0 ;; esac',
+  'printf "%s %s\\n" "$(date -u +%s%3N)" "$1" >> "$upd/$tx.progress" 2>/dev/null || true',
   'return 0',
   '}',
 ].join('\n');
@@ -250,7 +316,7 @@ const SNAPSHOT_HELPER = [
   'se="$(meta_value entry "$sn/meta")" || return 1',
   '[ -n "$se" ] || return 1',
   '[ -f "$sn/payload/$se" ] || return 1',
-  'manifest_ok "$sn" || { echo "update: the snapshot at $sn failed its integrity check" >&2; return 1; }',
+  'manifest_ok "$sn" "$upd" || { echo "update: the snapshot at $sn failed its integrity check" >&2; return 1; }',
   'return 0',
   '}',
 ].join('\n');
@@ -397,7 +463,13 @@ export const INSPECT_SHARED_SCRIPT = [
  * `$0` = executable, `$1` = prefix, `$2` = package directory, `$3` = approved
  * real path, `$4` = installed version, `$5` = transaction id, `$6` = app data
  * root (`-` when isolation is off), `$7` = resolved Node runtime (`-` when
- * unknown).
+ * unknown), `$8` = creation lease of this attempt (32 lowercase hex characters).
+ *
+ * The lease is written into `<snapshot>.tmp/owner` immediately after that
+ * directory is created and removed again before the rename, so only a tree this
+ * very attempt made can carry it. Cleanup requires it (review R02): a
+ * pre-existing directory with the same transaction name is refused with 79 and
+ * never deleted, even when the shape looks familiar.
  *
  * The npm launcher is normally a symlink to a script that starts with
  * `#!/usr/bin/env node`, so every version probe needs Node on PATH. A
@@ -409,8 +481,10 @@ export const INSPECT_SHARED_SCRIPT = [
  */
 export const PREPARE_BACKUP_SCRIPT = [
   'set -u',
-  'dsh="$0"; prefix="$1"; pkg="$2"; real_path="$3"; installed="$4"; tx="$5"; app_root="$6"; node="${7:--}"',
+  'dsh="$0"; prefix="$1"; pkg="$2"; real_path="$3"; installed="$4"; tx="$5"; app_root="$6"; node="${7:--}"; lease="${8:-}"',
   'case "$node" in "-") ;; /*) ;; *) echo "backup: rejected node runtime" >&2; exit 64 ;; esac',
+  'case "$lease" in ""|*[!0-9a-f]*) echo "backup: rejected creation lease" >&2; exit 64 ;; esac',
+  '[ "${#lease}" -ge 32 ] && [ "${#lease}" -le 64 ] || { echo "backup: rejected creation lease" >&2; exit 64; }',
   'if [ "$node" != "-" ]; then PATH="$(dirname "$node"):$PATH"; export PATH; fi',
   'case "$installed" in ""|*[!0-9A-Za-z.-]*) echo "backup: rejected installed version" >&2; exit 64 ;; esac',
   'case "$tx" in ""|*[!0-9A-Za-z-]*) echo "backup: rejected transaction id" >&2; exit 64 ;; esac',
@@ -419,6 +493,7 @@ export const PREPARE_BACKUP_SCRIPT = [
   'case "$pkg" in /*) ;; *) echo "backup: rejected package path" >&2; exit 64 ;; esac',
   'case "$real_path" in /*) ;; *) echo "backup: rejected real path" >&2; exit 64 ;; esac',
   VERSION_HELPER,
+  PROGRESS_HELPER,
   META_HELPER,
   MANIFEST_HELPER,
   REAL_DIR_HELPER,
@@ -426,6 +501,7 @@ export const PREPARE_BACKUP_SCRIPT = [
   SNAPSHOT_HELPER,
   BACKUP_BASE_HELPER,
   'backup_base "$app_root" || exit 79',
+  'progress start',
   'sn="$upd/shared-backup-$tx"',
   // C3: a pre-existing directory with this transaction's name is not ours.
   '[ -e "$sn" ] && { echo "backup: $sn already exists" >&2; exit 79; }',
@@ -448,14 +524,20 @@ export const PREPARE_BACKUP_SCRIPT = [
   // Copy and verify. Only a directory this invocation created is ever removed.
   'created=no',
   'cleanup() { [ "$created" = "yes" ] && rm -rf "$sn.tmp" 2>/dev/null; }',
-  'mkdir -p "$sn.tmp/payload" 2>/dev/null || { echo "backup: $sn.tmp cannot be created" >&2; exit 80; }',
+  'progress copy',
+  // A plain `mkdir` (not `-p`) makes creation atomic: if anything already exists
+  // under this name, the run refuses instead of writing into a foreign tree.
+  'mkdir "$sn.tmp" 2>/dev/null || { echo "backup: $sn.tmp cannot be created" >&2; exit 80; }',
   'created=yes',
+  'printf "transaction=%s\ntoken=%s\npid=%s\ncreated=%s\n" "$tx" "$lease" "$$" "$(date -u +%s%3N)" > "$sn.tmp/owner" 2>/dev/null || { echo "backup: the creation lease could not be written" >&2; cleanup; exit 80; }',
+  'mkdir "$sn.tmp/payload" 2>/dev/null || { echo "backup: the payload directory cannot be created" >&2; cleanup; exit 80; }',
   'if ! cp -a "$pkg/." "$sn.tmp/payload/" 2>/dev/null; then echo "backup: the package could not be copied (free space?)" >&2; cleanup; exit 80; fi',
   '[ -f "$sn.tmp/payload/package.json" ] || { echo "backup: the copied package is incomplete" >&2; cleanup; exit 80; }',
   '[ -f "$sn.tmp/payload/$entry" ] || { echo "backup: the copied entry point $entry is missing" >&2; cleanup; exit 80; }',
   'copied="$(version_of "$sn.tmp/payload/$entry")"',
   '[ "$copied" = "$installed" ] || { echo "backup: the copied executable reports [$copied] instead of [$installed]" >&2; cleanup; exit 80; }',
-  'manifest_of "$sn.tmp/payload" > "$sn.tmp/manifest" 2>/dev/null || { echo "backup: the content manifest could not be written" >&2; cleanup; exit 80; }',
+  'progress manifest',
+  'manifest_of "$sn.tmp/payload" "$upd" "$sn.tmp/manifest" || { echo "backup: the content manifest could not be written" >&2; cleanup; exit 80; }',
   'files="$(wc -l < "$sn.tmp/manifest" 2>/dev/null | tr -d " ")"',
   '[ -n "$files" ] && [ "$files" -gt 0 ] || { echo "backup: the copied package contains no files" >&2; cleanup; exit 80; }',
   // Executable state: a symlink target or a copy of the shim file.
@@ -474,9 +556,15 @@ export const PREPARE_BACKUP_SCRIPT = [
   'printf "files=%s\\n" "$files"',
   'printf "transaction=%s\\n" "$tx"',
   '} > "$sn.tmp/meta" || { echo "backup: the snapshot record could not be written" >&2; cleanup; exit 80; }',
+  // The lease has done its job: a verified snapshot keeps its documented shape.
+  'rm -f "$sn.tmp/owner" 2>/dev/null || { echo "backup: the creation lease could not be removed" >&2; cleanup; exit 80; }',
+  'progress rename',
   'mv "$sn.tmp" "$sn" 2>/dev/null || { echo "backup: the snapshot could not be moved into place" >&2; cleanup; exit 80; }',
   'created=no',
+  'progress verify',
   'snapshot_ok "$sn" "$installed" || { echo "backup: the finished snapshot did not verify" >&2; exit 80; }',
+  'progress done',
+  'rm -f "$upd/$tx.progress" 2>/dev/null || true',
   `printf "%s path=%s\\n" "${BACKUP_MARKER}" "$sn"`,
   `printf "%s version=%s\\n" "${BACKUP_MARKER}" "$installed"`,
   `printf "%s real=%s\\n" "${BACKUP_MARKER}" "$real_path"`,
@@ -765,6 +853,8 @@ export interface BackupRequest {
   transaction: string;
   /** Resolved Node runtime, or `null` when it is not known (probe may then fail). */
   nodePath: string | null;
+  /** Per-attempt creation lease, written into the temporary snapshot (R02). */
+  lease: string;
 }
 
 export interface InspectRequest {
@@ -848,7 +938,73 @@ export function buildPrepareBackupArgs(request: BackupRequest): string[] {
     assertTransaction(request.transaction),
     appRootArg(request.appRoot),
     request.nodePath ?? '-',
+    assertLease(request.lease),
   ];
+}
+
+/**
+ * Build the guarded cleanup command for one interrupted snapshot attempt.
+ *
+ * `$0` = app data root, `$1` = transaction id, both validated.
+ */
+export function buildCleanSnapshotArgs(request: {
+  distro: string;
+  appRoot: string;
+  transaction: string;
+  /** Creation lease of the attempt whose leftovers may be removed. */
+  lease: string;
+  /** Mount table to consult; `-` means `/proc/self/mountinfo` (tests pass a fixture). */
+  mountInfo?: string;
+}): string[] {
+  const mountInfo = request.mountInfo ?? '-';
+  if (mountInfo !== '-' && !mountInfo.startsWith('/')) throw new ArgumentError('invalid-mount-table');
+  return [
+    '-d',
+    assertDistroName(request.distro),
+    '--exec',
+    '/bin/sh',
+    '-c',
+    CLEAN_SNAPSHOT_SCRIPT,
+    appRootArg(request.appRoot),
+    assertTransaction(request.transaction),
+    assertLease(request.lease),
+    mountInfo,
+  ];
+}
+
+/**
+ * A creation lease proves that a snapshot `.tmp` tree belongs to the attempt that
+ * wants to remove it (review R02). It is 32-64 lowercase hex characters, generated
+ * per attempt, so a pre-existing directory can never carry it.
+ */
+function assertLease(lease: string): string {
+  if (typeof lease !== 'string' || !/^[0-9a-f]{32,64}$/.test(lease)) throw new ArgumentError('invalid-lease');
+  return lease;
+}
+
+const CLEAN_PROGRESS_LINE = new RegExp(`^${CLEAN_PROGRESS_MARKER} (\\d{1,16}) (start|copy|manifest|meta|rename|verify|done)$`);
+const CLEAN_RESULT_LINE = new RegExp(`^${CLEAN_MARKER} removed=(yes|no)$`);
+
+/**
+ * Parse the cleanup report; `null` when the run did not produce a result line,
+ * which callers treat as "leftovers may remain" rather than as success.
+ */
+export function parseCleanSnapshotReport(text: string): CleanSnapshotReport | null {
+  const phases: { at: number; phase: string }[] = [];
+  let removed: boolean | null = null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const phase = CLEAN_PROGRESS_LINE.exec(line);
+    if (phase !== null) {
+      const at = Number.parseInt(phase[1] ?? '', 10);
+      if (Number.isFinite(at)) phases.push({ at, phase: phase[2] ?? '' });
+      continue;
+    }
+    const result = CLEAN_RESULT_LINE.exec(line);
+    if (result !== null) removed = result[1] === 'yes';
+  }
+  if (removed === null) return null;
+  return { phases, removed };
 }
 
 /** Update the shared installation in place. */
@@ -972,4 +1128,162 @@ export function parseBackupReport(text: string): BackupReport | null {
   }
   if (!Number.isFinite(files) || files <= 0) return null;
   return { path, version, realPath, packageDir, files };
+}
+
+/**
+ * Remove the leftovers of one interrupted snapshot attempt.
+ *
+ * `PREPARE_BACKUP_SCRIPT` runs with `cp`, `find`, `sort` and `cksum`; when the
+ * gateway kills `wsl.exe` because the budget expired, that whole Linux process
+ * subtree dies with it (measured: no surviving child or grandchild after 0.5 s),
+ * so the app can safely finish the job the killed script could not: delete the
+ * half-written `<update>/shared-backup-<tx>.tmp` tree and this transaction's
+ * progress and manifest work files.
+ *
+ * The scope is deliberately tiny and provable. Only the transaction's own `.tmp`
+ * path is considered, its id must match the transaction pattern, the update
+ * directory must canonicalise to itself, the target must be a real directory
+ * whose direct entries are exactly the ones the script creates (`payload/` as a
+ * real directory, `manifest` as a regular file), and any symlink anywhere is a
+ * refusal. A *verified* snapshot (`shared-backup-<tx>`, without `.tmp`) is never
+ * touched, and neither is any other directory.
+ *
+ * The recorded phase lines are printed before removal, so the caller can report
+ * which phase was still running when the budget expired.
+ *
+ * Exit codes: 64 malformed argument, 79 unsafe location or unexpected contents,
+ * 80 removal failed.
+ *
+ * `$0` = app data root (`-` when isolation is off), `$1` = transaction id.
+ */
+/**
+ * Guards for a recursive delete inside the app's update directory.
+ *
+ * `rm -rf` walks subdirectories, so two things must be ruled out before it runs:
+ * a mount at or below the target (the delete would reach a foreign filesystem,
+ * including a bind mount that sits on the same device), and a process that still
+ * holds an open file there (a writer that outlived the killed `wsl.exe`). Both
+ * checks fail closed: unreadable `/proc` or an unparsable mount table is a
+ * refusal, not a green light.
+ *
+ * The mount table path is a positional argument so a test can point it at a
+ * fixture; production always passes `-`, which means the real `/proc` table.
+ */
+const CLEAN_GUARD_HELPER = [
+  'check_mounts() {',
+  't="$1"; mi="$2"',
+  '[ -r "$mi" ] || { echo "clean: the mount table $mi cannot be read, so the delete is refused" >&2; return 1; }',
+  // mountinfo uses literal octal escapes (e.g. \\040). Decode after reading
+  // field 5, not through `awk -v`: that option silently unescapes backslashes.
+  // Invalid mountinfo rows MUST fail closed before recursive deletion.
+  String.raw`hit="$(DSH_MOUNT_TARGET="$t" awk '
+    BEGIN { target = ENVIRON["DSH_MOUNT_TARGET"]; invalid = 0 }
+    {
+      if (NF < 10 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ ||
+          $3 !~ /^[0-9]+:[0-9]+$/ || substr($5, 1, 1) != "/") { invalid = 1; exit 2 }
+      separator = 0
+      for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
+      if (separator == 0 || separator + 3 > NF) { invalid = 1; exit 2 }
+      mount = $5
+      gsub(/\\040/, " ", mount)
+      gsub(/\\011/, "\t", mount)
+      gsub(/\\012/, "\n", mount)
+      gsub(/\\134/, "\\", mount)
+      if (mount == target || index(mount, target "/") == 1) { print mount; exit }
+    }
+    END { if (invalid) exit 2 }
+  ' "$mi" 2>/dev/null)" || { echo "clean: the mount table $mi could not be parsed, so the delete is refused" >&2; return 1; }`,
+  '[ -z "$hit" ] || { echo "clean: [$hit] is a mount point at or below $t, so the delete is refused" >&2; return 1; }',
+  'return 0',
+  '}',
+  'in_use() {',
+  't="$1"',
+  'for fd in /proc/[0-9]*/fd/*; do',
+  '[ -L "$fd" ] || continue',
+  'link="$(readlink "$fd" 2>/dev/null)" || continue',
+  'case "$link" in "$t"|"$t"/*) return 0 ;; esac',
+  'done',
+  'return 1',
+  '}',
+].join('\n');
+
+/**
+ * Remove the leftovers of one interrupted snapshot attempt.
+ *
+ * `PREPARE_BACKUP_SCRIPT` runs with `cp`, `find`, `sort` and `cksum`; when the
+ * gateway kills `wsl.exe` because the budget expired, that whole Linux process
+ * subtree normally dies with it, but the app never assumes it: the gateway first
+ * waits for the owned process to report its exit, and this script additionally
+ * refuses to delete a tree that still has an open file inside it.
+ *
+ * Ownership is proven, not guessed (review R02). The creating run writes a lease
+ * file (`owner`) into `<update>/shared-backup-<tx>.tmp` immediately after that
+ * directory is created, carrying the transaction id and a per-attempt random
+ * token; a pre-existing directory cannot contain the token of an attempt that has
+ * not run yet, and the token is never the guessable transaction name. Cleanup
+ * requires a matching lease, and therefore also refuses a pre-existing tree that
+ * merely looks familiar.
+ *
+ * Everything else is still refused: a symlink anywhere in the chain, entries
+ * other than `payload/` (a real directory), `manifest` (a regular file) and
+ * `owner`, a mount point at or below the target, and an update directory that
+ * does not canonicalise to itself. A *verified* snapshot (`shared-backup-<tx>`,
+ * without `.tmp`) is never touched, and neither is any other directory.
+ *
+ * The recorded phase lines are printed before removal, so the caller can report
+ * which phase was still running when the budget expired.
+ *
+ * Exit codes: 64 malformed argument, 79 unsafe location, missing or foreign
+ * lease, nested mount or open file, 80 removal failed.
+ *
+ * `$0` = app data root (`-` when isolation is off), `$1` = transaction id,
+ * `$2` = creation lease, `$3` = mount table path (`-` for `/proc/self/mountinfo`).
+ */
+export const CLEAN_SNAPSHOT_SCRIPT = [
+  'set -u',
+  'app_root="$0"; tx="$1"; lease="$2"; mi="${3:--}"',
+  'case "$tx" in ""|*[!0-9A-Za-z-]*) echo "clean: rejected transaction id" >&2; exit 64 ;; esac',
+  'case "$lease" in ""|*[!0-9a-f]*) echo "clean: rejected creation lease" >&2; exit 64 ;; esac',
+  '[ "${#lease}" -ge 32 ] && [ "${#lease}" -le 64 ] || { echo "clean: rejected creation lease" >&2; exit 64; }',
+  'case "$mi" in "-") mi="/proc/self/mountinfo" ;; /*) ;; *) echo "clean: rejected mount table path" >&2; exit 64 ;; esac',
+  REAL_DIR_HELPER,
+  META_HELPER,
+  CLEAN_GUARD_HELPER,
+  BACKUP_BASE_HELPER,
+  'backup_base "$app_root" || exit 79',
+  'tmp="$upd/shared-backup-$tx.tmp"',
+  'prog="$upd/$tx.progress"',
+  '[ -L "$upd" ] && { echo "clean: $upd is a symlink" >&2; exit 79; }',
+  'if [ -f "$prog" ] && [ ! -L "$prog" ]; then',
+  'tail -n 20 "$prog" 2>/dev/null | while IFS= read -r line; do printf "%s %s\\n" "' + CLEAN_PROGRESS_MARKER + '" "$line"; done',
+  'fi',
+  'removed=no',
+  'if [ -e "$tmp" ] || [ -L "$tmp" ]; then',
+  '[ -L "$tmp" ] && { echo "clean: $tmp is a symlink" >&2; exit 79; }',
+  '[ -d "$tmp" ] || { echo "clean: $tmp is not a directory" >&2; exit 79; }',
+  'owner="$tmp/owner"',
+  '[ -f "$owner" ] && [ ! -L "$owner" ] || { echo "clean: $tmp carries no creation lease, so it is not ours to delete" >&2; exit 79; }',
+  'case "$(meta_value token "$owner")" in "$lease") ;; *) echo "clean: the creation lease of $tmp belongs to another attempt" >&2; exit 79 ;; esac',
+  '[ "$(meta_value transaction "$owner")" = "$tx" ] || { echo "clean: the creation lease of $tmp names another transaction" >&2; exit 79; }',
+  'extra="$(find "$tmp" -mindepth 1 -maxdepth 1 ! -name payload ! -name manifest ! -name owner -print 2>/dev/null | head -n 1)"',
+  '[ -z "$extra" ] || { echo "clean: unexpected entry [$extra] in $tmp" >&2; exit 79; }',
+  'if [ -e "$tmp/payload" ]; then [ -d "$tmp/payload" ] && [ ! -L "$tmp/payload" ] || { echo "clean: $tmp/payload is not a real directory" >&2; exit 79; }; fi',
+  'if [ -e "$tmp/manifest" ]; then [ -f "$tmp/manifest" ] && [ ! -L "$tmp/manifest" ] || { echo "clean: $tmp/manifest is not a regular file" >&2; exit 79; }; fi',
+  'check_mounts "$tmp" "$mi" || exit 79',
+  'in_use "$tmp" && { echo "clean: $tmp is still open by a running process, so it is kept" >&2; exit 79; }',
+  'rm -rf -- "$tmp" || { echo "clean: the temporary snapshot $tmp could not be removed" >&2; exit 80; }',
+  '[ -e "$tmp" ] && { echo "clean: the temporary snapshot $tmp still exists" >&2; exit 80; }',
+  'removed=yes',
+  'fi',
+  'rm -f -- "$prog" 2>/dev/null || true',
+  'rm -f -- "$upd/.$tx.manifest-list" "$upd/.$tx.manifest-sorted" "$upd/.$tx.manifest-check" 2>/dev/null || true',
+  'printf "%s removed=%s\\n" "' + CLEAN_MARKER + '" "$removed"',
+  'exit 0',
+].join('\n');
+
+export interface CleanSnapshotReport {
+  /** Phase lines recorded by the interrupted script, oldest first. */
+  phases: { at: number; phase: string }[];
+  /** Whether a temporary snapshot tree was actually removed. */
+  removed: boolean;
 }
