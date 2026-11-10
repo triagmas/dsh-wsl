@@ -451,7 +451,7 @@ describe.skipIf(!posix)('CLEAN_SNAPSHOT_SCRIPT removes only a tree this attempt 
     expect(treeState(tmp)).toEqual(before);
   });
 
-  it('refuses a nested mount encoded as \040 in a target containing spaces', () => {
+  it('refuses a nested mount encoded as \\040 in a target containing spaces', () => {
     const box = sandbox(2, 'wss r31-');
     const tmp = interruptedAttempt(box);
     const nested = join(tmp, 'payload', 'lib');
