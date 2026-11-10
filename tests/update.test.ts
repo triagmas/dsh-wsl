@@ -15,6 +15,10 @@ import {
   createUpdateState,
   createUpdateTerminal,
   decideRecovery,
+  BACKUP_REASON_MAX_LENGTH,
+  UPDATE_TERMINAL_MAX_LINE_LENGTH,
+  backupFailureDetail,
+  describeBackupFailure,
   describeUpdatePhase,
   describeUpdateReason,
   isExactVersion,
@@ -28,6 +32,7 @@ import {
   phaseFromUpdateLine,
   planSharedUpdate,
   planTerminalUpdate,
+  sanitizeBackupReason,
   sanitizeUpdateLine,
   shouldRestartAfterUpdate,
   type SharedInstallObservation,
@@ -937,6 +942,132 @@ describe('recovery snapshot and identity checks (review B1-B3)', () => {
     expect(h.wsl.updateRuns).toHaveLength(0);
     expect(h.journal.current()).toBeNull();
     expect(outcome.state.detail).toContain('verified recovery snapshot');
+  });
+
+  it('hands the resolved Node runtime to the snapshot step (issue #27)', async () => {
+    const h = runnerHarness();
+    await h.runner.run(acceptedPlan(), { ...context, nodePath: '/home/dev/.local/bin/node' });
+    // The npm launcher is a `#!/usr/bin/env node` shim: the backup script needs
+    // the runtime directory on PATH, and asking for it here keeps that
+    // independent of the isolation switch.
+    expect(h.wsl.backupRequests[0]?.nodePath).toBe('/home/dev/.local/bin/node');
+  });
+
+  it('reports an unknown runtime as `null` rather than guessing a path', async () => {
+    const h = runnerHarness();
+    await h.runner.run(acceptedPlan(), { ...context, nodePath: null });
+    expect(h.wsl.backupRequests[0]?.nodePath).toBeNull();
+  });
+
+  it('surfaces the real backup failure instead of generic free-space advice', async () => {
+    const h = runnerHarness();
+    h.wsl.backupFails = true;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    const detail = outcome.state.detail ?? '';
+    expect(detail).toContain('exit code 81');
+    expect(detail).toContain('reports [] instead of [0.2.1-rc.5]');
+    expect(detail).toContain('nothing was changed');
+    expect(detail).not.toContain('free space');
+    // Fail closed: no backend pause, no install, no journal record.
+    expect(h.order).toEqual([]);
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(h.journal.current()).toBeNull();
+  });
+
+  it('writes the exit status and the script line into the terminal buffer', async () => {
+    const h = runnerHarness();
+    h.wsl.backupFails = true;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+    const lines = (outcome.state.lines ?? []).join('\n');
+    expect(lines).toContain('update: the recovery snapshot failed (code=81)');
+    expect(lines).toContain('reports [] instead of [0.2.1-rc.5]');
+    // The step is announced before it runs, so the window never shows an
+    // unexplained stop.
+    expect(lines).toContain('update: preparing a recovery snapshot of');
+  });
+
+  it('describes a snapshot failure with whatever the script reported', () => {
+    expect(describeBackupFailure(81, 'backup: /home/dev/.local/bin/dsh reports [] instead of [0.2.1-rc.5]'))
+      .toBe(
+        'The verified recovery snapshot could not be created (exit code 81: backup: /home/dev/.local/bin/dsh reports [] instead of [0.2.1-rc.5]), so nothing was changed. Your DeepSeek Harness CLI was not modified.',
+      );
+    expect(describeBackupFailure(null, '')).toContain('no exit status');
+    expect(describeBackupFailure(null, '')).toContain('printed no explanation');
+    expect(describeBackupFailure(null, null)).toContain('printed no explanation');
+    expect(describeBackupFailure(80, 'the snapshot failed its integrity check')).toContain('exit code 80');
+  });
+
+  it('takes the last stderr line through the sanitizer at the gateway boundary', () => {
+    const token = 'c'.repeat(48);
+    const detail = backupFailureDetail(
+      'progress noise\n',
+      `update: copying\nbackup: \u001b[31mdsh reports [] instead of [0.2.1-rc.5]\u001b[0m ?token=${token}\n\n`,
+    );
+    expect(detail).not.toContain(token);
+    expect(detail).toContain('token=[redacted]');
+    expect(detail).toMatch(/^[\x20-\x7e\u2026]+$/);
+    // The actionable part survives; only the credential is replaced.
+    expect(detail).toContain('reports [] instead of [0.2.1-rc.5]');
+    // stderr is preferred, stdout is the fallback, silence stays silent.
+    expect(backupFailureDetail('backup: from stdout', '')).toBe('backup: from stdout');
+    expect(backupFailureDetail('', '')).toBe('');
+    expect(backupFailureDetail('\u001b[2J', '\u0007')).toBe('');
+  });
+
+  it('bounds a very long gateway detail', () => {
+    const detail = backupFailureDetail('', `${'z'.repeat(9000)}\n`);
+    expect(detail.length).toBeLessThanOrEqual(UPDATE_TERMINAL_MAX_LINE_LENGTH);
+    expect(detail.endsWith('\u2026')).toBe(true);
+  });
+
+  it('redacts credentials, strips escapes and bounds the reason it receives', () => {
+    const token = 'a'.repeat(32);
+    const reason = sanitizeBackupReason(`backup: \u001b[31mfailed\u001b[0m\u0007 https://127.0.0.1:3080/?token=${token} rest`);
+    expect(reason).not.toBeNull();
+    expect(reason).not.toContain(token);
+    expect(reason).toContain('token=[redacted]');
+    // Printable only: no escape, no bell, no carriage return.
+    expect(reason).toMatch(/^[\x20-\x7e\u2026]+$/);
+    expect(reason).toContain('failed');
+  });
+
+  it('caps a long backup reason instead of forwarding it whole', () => {
+    const long = `backup: ${'x'.repeat(5000)}`;
+    const reason = sanitizeBackupReason(long);
+    expect(reason).not.toBeNull();
+    expect(reason?.length ?? 0).toBeLessThanOrEqual(BACKUP_REASON_MAX_LENGTH);
+    expect(reason?.endsWith('\u2026')).toBe(true);
+  });
+
+  it('collapses a multi-line reason and rejects output with nothing visible', () => {
+    expect(sanitizeBackupReason('  backup: a\n\tb  ')).toBe('backup: a b');
+    expect(sanitizeBackupReason('\u001b[2J\u0007  ')).toBeNull();
+    expect(sanitizeBackupReason('')).toBeNull();
+  });
+
+  it('keeps token-bearing, escape-laden and very long stderr out of every surface', async () => {
+    const h = runnerHarness();
+    h.wsl.backupFails = true;
+    const token = 'b'.repeat(40);
+    h.wsl.backupFailureDetail = `backup: \u001b[1;31midentity check failed\u001b[0m token=${token} ${'y'.repeat(2000)}`;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+    expect(outcome.ok).toBe(false);
+
+    const detail = outcome.state.detail ?? '';
+    const lines = (outcome.state.lines ?? []).join('\n');
+    for (const surface of [detail, lines]) {
+      expect(surface).not.toContain(token);
+      expect(surface).not.toContain('\u001b');
+      expect(surface).not.toContain('\u0007');
+      expect(surface).toContain('identity check failed');
+    }
+    // The exit code and the actionable reason survive, the message stays bounded.
+    expect(detail).toContain('exit code 81');
+    expect(detail).toContain('nothing was changed');
+    expect(detail.length).toBeLessThanOrEqual(400);
+    expect(lines.length).toBeLessThan(1000);
   });
 
   it('records the snapshot in the journal so recovery can use it offline', async () => {

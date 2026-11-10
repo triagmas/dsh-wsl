@@ -121,6 +121,14 @@ export interface PrepareBackupRequest {
   realPath: string;
   installedVersion: string;
   transaction: string;
+  /**
+   * Resolved Node runtime the backend uses (`null` when unknown).
+   *
+   * The npm launcher is a `#!/usr/bin/env node` shim, so the backup script needs
+   * this directory on PATH; without it the version probe returns nothing and the
+   * snapshot is refused with code 81 (issue #27).
+   */
+  nodePath: string | null;
 }
 
 /** Result of the snapshot step: where the verified copy lives. */
@@ -130,6 +138,15 @@ export interface BackupSnapshot {
   /** Number of files the snapshot contains. */
   files: number;
 }
+
+/**
+ * Outcome of the snapshot attempt. A failure keeps the exit code and the last
+ * line of subprocess output so the UI can show the real reason instead of the
+ * generic "check free space" advice.
+ */
+export type BackupAttempt =
+  | { ok: true; snapshot: BackupSnapshot }
+  | { ok: false; code: number | null; detail: string };
 
 export interface InspectSharedRequest {
   distro: string;
@@ -172,7 +189,7 @@ export interface WslGateway {
    * Create and verify the offline recovery snapshot. Throws or returns `null`
    * when the snapshot cannot be proven; the update must not start then.
    */
-  prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupSnapshot | null>;
+  prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupAttempt>;
   /** Update the shared installation, streaming npm output. */
   updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
   /** Reinstall the previous exact version (failure path and journal recovery). */

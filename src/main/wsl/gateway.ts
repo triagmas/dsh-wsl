@@ -16,6 +16,7 @@ import { ShellError } from '../core/supervisor.js';
 import type { Logger } from '../core/logger.js';
 import type { ProcessProbe } from './output.js';
 import { parseDshVersion } from '../core/versions.js';
+import { backupFailureDetail } from '../core/update.js';
 import {
   decodeWslOutput,
   LineBuffer,
@@ -421,18 +422,23 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         realPath: request.realPath,
         installedVersion: request.installedVersion,
         transaction: request.transaction,
+        nodePath: request.nodePath,
       });
       const result = await run(argv, 120_000);
       const report = parseBackupReport(`${result.stdout}\n${result.stderr}`);
       if (result.code !== 0 || report === null) {
+        // Subprocess output never leaves the gateway unsanitized: the helper
+        // strips escapes and control characters, redacts credentials and bounds
+        // the line, exactly like a terminal line.
+        const detail = backupFailureDetail(result.stdout, result.stderr);
         options.log.error(
           `the recovery snapshot for ${request.installedVersion} could not be created (code=${result.code ?? 'null'}): ` +
-            `${(result.stderr || result.stdout).trim().split('\n').filter(Boolean).slice(-1)[0] ?? 'no output'}`,
+            `${detail === '' ? 'no output' : detail}`,
         );
-        return null;
+        return { ok: false, code: result.code, detail };
       }
       options.log.info(`recovery snapshot ready at ${report.path} (${report.files} files, version=${report.version})`);
-      return { path: report.path, files: report.files };
+      return { ok: true, snapshot: { path: report.path, files: report.files } };
     },
 
     async updateSharedDsh(request: SharedUpdateRunRequest, onLine) {

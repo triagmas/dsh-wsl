@@ -30,6 +30,7 @@
 import type { Logger } from './logger.js';
 import type { UpdateTransition, WslGateway } from './supervisor.js';
 import {
+  describeBackupFailure,
   describeUpdateReason,
   describeUpdatePhase,
   isSameVersion,
@@ -38,6 +39,7 @@ import {
   createUpdateState,
   createUpdateTerminal,
   UPDATE_REASONS,
+  sanitizeBackupReason,
   type SharedUpdatePlan,
   type UpdateJournalPhase,
   type UpdateJournalStore,
@@ -313,7 +315,7 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         //    shared installation is touched. Without it nothing is changed at
         //    all, and the backend is never stopped.
         terminal.append(`update: preparing a recovery snapshot of ${verified.installedVersion}`);
-        const snapshot = await deps.wsl
+        const backup = await deps.wsl
           .prepareSharedBackup({
             distro: verified.distro,
             appRoot: verified.appRoot,
@@ -323,23 +325,36 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
             realPath: verified.realPath,
             installedVersion: verified.installedVersion,
             transaction: context.transaction,
+            nodePath: context.nodePath,
           })
-          .catch((error: unknown) => {
-            terminal.append(
-              `update: the recovery snapshot failed (${error instanceof Error ? error.message : 'unknown error'})`,
-            );
-            return null;
-          });
-        if (snapshot === null) {
+          .catch((error: unknown) => ({
+            ok: false as const,
+            code: null,
+            detail: error instanceof Error ? error.message : 'unknown error',
+          }));
+        if (!backup.ok) {
           // Nothing was paused and nothing was written, so there is no lock to
           // release and no journal to clear.
           deps.journal.clear();
-          deps.log.error('update: no verified recovery snapshot, nothing was changed');
-          return { ok: false, state: fail(describeUpdateReason(UPDATE_REASONS.backupUnavailable)) };
+          // One sanitized reason for every surface: the terminal, the log and the
+          // state message. The gateway already sanitizes its own output, but a
+          // rejected gateway promise reaches this branch as raw text, so the
+          // sanitizer is applied here as well (escapes/control characters out,
+          // credentials redacted, hard length bound).
+          const reason = sanitizeBackupReason(backup.detail);
+          terminal.append(
+            `update: the recovery snapshot failed (code=${backup.code ?? 'null'})${reason === null ? '' : `: ${reason}`}`,
+          );
+          deps.log.error(
+            `update: no verified recovery snapshot, nothing was changed (code=${backup.code ?? 'null'}: ${
+              reason ?? 'no output'
+            })`,
+          );
+          return { ok: false, state: fail(describeBackupFailure(backup.code, reason)) };
         }
-        const snapshotDir = snapshot.path;
+        const snapshotDir = backup.snapshot.path;
         backupDir = snapshotDir;
-        terminal.append(`update: verified recovery snapshot at ${snapshotDir} (${snapshot.files} files)`);
+        terminal.append(`update: verified recovery snapshot at ${snapshotDir} (${backup.snapshot.files} files)`);
 
         // 3. The journal must exist before anything can be installed.
         if (!writeJournal(verified, context, 'updating', startedAt, snapshotDir)) {

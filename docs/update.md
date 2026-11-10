@@ -136,6 +136,29 @@ instead of being copied over a working installation, and a `.tmp` directory that
 already exists is rejected before any removal — cleanup only ever removes a tree
 the current invocation created.
 
+### The snapshot step runs Node the way the shim does (issue #27)
+
+An npm installation of the CLI is usually a symlink to `lib/bin.js`, whose first
+line is `#!/usr/bin/env node`. Every snapshot verification step executes that
+file, so it needs a `node` on `PATH`. A `wsl.exe --exec /bin/sh` command starts
+with a minimal `PATH` that does not contain the user's Node directory, therefore
+the resolved runtime is prepended at the top of `PREPARE_BACKUP_SCRIPT` — exactly
+as the inspect, npm-lookup, update and rollback scripts already do, and
+independently of the isolation setting (`$7` is the resolved runtime, `-` when it
+is unknown). Without it the version probe printed nothing and the snapshot was
+refused with `81` and `reports [] instead of [<version>]` even though the
+installation was healthy.
+
+A refused snapshot reports its own exit status and the last line of script
+output in the update window and in `app.log`, so the message names the real
+cause (`exit code 81: backup: … reports [] instead of [0.2.1-rc.5]`) instead of
+the generic "check free space" advice that only fits some failures. That line is
+subprocess output, so it goes through the same sanitizer as a terminal line
+before it can reach the UI state: ANSI escapes and control characters are
+stripped, credentials (`?token=…`, `token: …`) are redacted, whitespace is
+collapsed and the text is capped at 200 characters with an ellipsis. An empty
+result keeps a bounded fallback, so the exit code is never lost.
+
 ### Identity at the last safe moment (B2)
 
 `realPath` from the plan is passed into the mutating script and compared again

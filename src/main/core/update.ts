@@ -41,6 +41,9 @@ export const UPDATE_TERMINAL_MAX_LINES = 400;
 /** Longest single line kept from the updater output. */
 export const UPDATE_TERMINAL_MAX_LINE_LENGTH = 320;
 
+/** How much of the backup script's own wording a failure message keeps. */
+export const BACKUP_REASON_MAX_LENGTH = 200;
+
 /**
  * An exact release version: `0.2.2`, `0.2.2-rc.1`, never a range or a tag.
  * Deliberately strict — the value ends up as an npm install target.
@@ -83,6 +86,44 @@ export function sanitizeUpdateLine(raw: string): string | null {
   return redacted.length > UPDATE_TERMINAL_MAX_LINE_LENGTH
     ? `${redacted.slice(0, UPDATE_TERMINAL_MAX_LINE_LENGTH - 1)}…`
     : redacted;
+}
+
+/**
+ * One line of backup-script output as a failure message may show it.
+ *
+ * The snapshot step is allowed to explain itself (a missing Node runtime, a
+ * redirected package directory, an incomplete copy), but its output is
+ * untrusted text from a subprocess. It goes through the same sanitizer the
+ * terminal uses — ANSI escapes and control characters removed, credentials
+ * redacted, hard length bound — before it can reach `UpdateState.detail`.
+ * `null` means "nothing usable was printed", so the caller substitutes a
+ * bounded fallback instead of an empty parenthesis.
+ */
+export function sanitizeBackupReason(raw: string): string | null {
+  const line = sanitizeUpdateLine(raw);
+  if (line === null) return null;
+  const collapsed = line.replace(/\s+/g, ' ').trim();
+  if (collapsed === '') return null;
+  return collapsed.length > BACKUP_REASON_MAX_LENGTH
+    ? `${collapsed.slice(0, BACKUP_REASON_MAX_LENGTH - 1)}…`
+    : collapsed;
+}
+
+/**
+ * The one line of a failed backup step that the UI and the log may show.
+ *
+ * Subprocess output is untrusted text: the last non-empty line is picked (the
+ * earlier ones are usually progress noise), then sanitized like terminal output.
+ * Empty string means nothing usable was printed.
+ */
+export function backupFailureDetail(stdout: string, stderr: string): string {
+  const source = stderr.trim() === '' ? stdout : stderr;
+  const line = source
+    .split('\n')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(-1)[0] ?? '';
+  return sanitizeUpdateLine(line) ?? '';
 }
 
 export interface UpdateTerminal {
@@ -261,6 +302,10 @@ export const UPDATE_REASONS = {
   foreignProcess: 'foreign-process',
   noNpm: 'no-npm',
   loginShellMismatch: 'login-shell-mismatch',
+  // Part of the published reason catalogue. The runner now describes a failed
+  // snapshot with the code and output of the script itself
+  // (`describeBackupFailure`); this entry stays as generic wording for callers
+  // that have no script output yet.
   backupUnavailable: 'backup-unavailable',
 } as const;
 
@@ -295,6 +340,27 @@ export function describeUpdateReason(reason: string): string {
     default:
       return 'This update cannot be started safely.';
   }
+}
+
+/**
+ * Explain a failed snapshot attempt with the real reason.
+ *
+ * The backup script already reports the actionable cause on stderr (an empty
+ * version probe, a redirected package directory, an incomplete copy, a
+ * non-writable snapshot directory). Passing that through is what turns a generic
+ * "Update failed" into something the user can act on; the free-space advice is
+ * only one of several possible causes, so it is no longer assumed (issue #27).
+ */
+export function describeBackupFailure(code: number | null, detail: string | null): string {
+  const exit = code === null ? 'no exit status' : `exit code ${code}`;
+  // Sanitized here as well as where the text enters the app: the bound and the
+  // redaction must hold even for a caller that passes raw subprocess output.
+  const reason = detail === null ? null : sanitizeBackupReason(detail);
+  return (
+    `The verified recovery snapshot could not be created (${exit}: ${
+      reason === null ? 'the backup step printed no explanation' : reason
+    }), so nothing was changed. Your DeepSeek Harness CLI was not modified.`
+  );
 }
 
 /** The npm command the user can run manually when the app refuses. */
