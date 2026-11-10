@@ -16,6 +16,7 @@ import { ShellError } from '../core/supervisor.js';
 import type { Logger } from '../core/logger.js';
 import type { ProcessProbe } from './output.js';
 import { parseDshVersion } from '../core/versions.js';
+import { backupFailureDetail } from '../core/update.js';
 import {
   decodeWslOutput,
   LineBuffer,
@@ -426,7 +427,10 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       const result = await run(argv, 120_000);
       const report = parseBackupReport(`${result.stdout}\n${result.stderr}`);
       if (result.code !== 0 || report === null) {
-        const detail = (result.stderr || result.stdout).trim().split('\n').filter(Boolean).slice(-1)[0] ?? '';
+        // Subprocess output never leaves the gateway unsanitized: the helper
+        // strips escapes and control characters, redacts credentials and bounds
+        // the line, exactly like a terminal line.
+        const detail = backupFailureDetail(result.stdout, result.stderr);
         options.log.error(
           `the recovery snapshot for ${request.installedVersion} could not be created (code=${result.code ?? 'null'}): ` +
             `${detail === '' ? 'no output' : detail}`,

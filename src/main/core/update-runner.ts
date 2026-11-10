@@ -39,6 +39,7 @@ import {
   createUpdateState,
   createUpdateTerminal,
   UPDATE_REASONS,
+  sanitizeBackupReason,
   type SharedUpdatePlan,
   type UpdateJournalPhase,
   type UpdateJournalStore,
@@ -335,17 +336,21 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
           // Nothing was paused and nothing was written, so there is no lock to
           // release and no journal to clear.
           deps.journal.clear();
+          // One sanitized reason for every surface: the terminal, the log and the
+          // state message. The gateway already sanitizes its own output, but a
+          // rejected gateway promise reaches this branch as raw text, so the
+          // sanitizer is applied here as well (escapes/control characters out,
+          // credentials redacted, hard length bound).
+          const reason = sanitizeBackupReason(backup.detail);
           terminal.append(
-            `update: the recovery snapshot failed (code=${backup.code ?? 'null'})${
-              backup.detail === '' ? '' : `: ${backup.detail}`
-            }`,
+            `update: the recovery snapshot failed (code=${backup.code ?? 'null'})${reason === null ? '' : `: ${reason}`}`,
           );
           deps.log.error(
             `update: no verified recovery snapshot, nothing was changed (code=${backup.code ?? 'null'}: ${
-              backup.detail === '' ? 'no output' : backup.detail
+              reason ?? 'no output'
             })`,
           );
-          return { ok: false, state: fail(describeBackupFailure(backup.code, backup.detail)) };
+          return { ok: false, state: fail(describeBackupFailure(backup.code, reason)) };
         }
         const snapshotDir = backup.snapshot.path;
         backupDir = snapshotDir;

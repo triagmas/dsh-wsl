@@ -152,7 +152,12 @@ installation was healthy.
 A refused snapshot reports its own exit status and the last line of script
 output in the update window and in `app.log`, so the message names the real
 cause (`exit code 81: backup: … reports [] instead of [0.2.1-rc.5]`) instead of
-the generic "check free space" advice that only fits some failures.
+the generic "check free space" advice that only fits some failures. That line is
+subprocess output, so it goes through the same sanitizer as a terminal line
+before it can reach the UI state: ANSI escapes and control characters are
+stripped, credentials (`?token=…`, `token: …`) are redacted, whitespace is
+collapsed and the text is capped at 200 characters with an ellipsis. An empty
+result keeps a bounded fallback, so the exit code is never lost.
 
 ### Identity at the last safe moment (B2)
 
