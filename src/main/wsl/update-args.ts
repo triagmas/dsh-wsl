@@ -1173,9 +1173,26 @@ const CLEAN_GUARD_HELPER = [
   'check_mounts() {',
   't="$1"; mi="$2"',
   '[ -r "$mi" ] || { echo "clean: the mount table $mi cannot be read, so the delete is refused" >&2; return 1; }',
-  // The mount table escapes spaces as \\040; compare both spellings of our target.
-  'esc="$(printf "%s" "$t" | sed -e "s/ /\\\\040/g" -e "s/\t/\\\\011/g")"',
-  'hit="$(awk -v t="$t" -v e="$esc" \'{ mp=$5; if (mp==t || mp==e || index(mp,t"/")==1 || index(mp,e"/")==1) { print mp; exit } }\' "$mi" 2>/dev/null)" || { echo "clean: the mount table $mi could not be parsed, so the delete is refused" >&2; return 1; }',
+  // mountinfo uses literal octal escapes (e.g. \\040). Decode after reading
+  // field 5, not through `awk -v`: that option silently unescapes backslashes.
+  // Invalid mountinfo rows MUST fail closed before recursive deletion.
+  String.raw`hit="$(DSH_MOUNT_TARGET="$t" awk '
+    BEGIN { target = ENVIRON["DSH_MOUNT_TARGET"]; invalid = 0 }
+    {
+      if (NF < 10 || $1 !~ /^[0-9]+$/ || $2 !~ /^[0-9]+$/ ||
+          $3 !~ /^[0-9]+:[0-9]+$/ || substr($5, 1, 1) != "/") { invalid = 1; exit 2 }
+      separator = 0
+      for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
+      if (separator == 0 || separator + 3 > NF) { invalid = 1; exit 2 }
+      mount = $5
+      gsub(/\\\\040/, " ", mount)
+      gsub(/\\\\011/, "\t", mount)
+      gsub(/\\\\012/, "\n", mount)
+      gsub(/\\\\134/, "\\\\", mount)
+      if (mount == target || index(mount, target "/") == 1) { print mount; exit }
+    }
+    END { if (invalid) exit 2 }
+  ' "$mi" 2>/dev/null)" || { echo "clean: the mount table $mi could not be parsed, so the delete is refused" >&2; return 1; }`,
   '[ -z "$hit" ] || { echo "clean: [$hit] is a mount point at or below $t, so the delete is refused" >&2; return 1; }',
   'return 0',
   '}',
