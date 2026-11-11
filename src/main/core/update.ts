@@ -749,10 +749,19 @@ export function decideRecovery(
   if (observation.present && isSameVersion(observation.version, journal.installed)) {
     return { action: 'abandon', reason: `the installation still reports ${journal.installed}` };
   }
+  if (observation.present && observation.version === null) {
+    // An unobservable version (for example missing Node on PATH) does not
+    // establish corruption. Preserving the journal is safer than deleting an
+    // intact package to attempt rollback.
+    return {
+      action: 'blocked',
+      reason: 'the installation is present but did not report a verifiable version',
+    };
+  }
   if (observation.present) {
     return {
       action: 'rollback',
-      reason: `the installation reports ${observation.version ?? 'an unknown version'}, expected ${journal.target} or ${journal.installed}`,
+      reason: `the installation reports ${observation.version}, expected ${journal.target} or ${journal.installed}`,
     };
   }
   return { action: 'rollback', reason: 'the installation is missing, so the previous version is reinstalled' };
