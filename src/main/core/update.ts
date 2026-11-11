@@ -561,11 +561,11 @@ function requiredString(value: Record<string, unknown>, key: string): string | n
  * All other paths in a v2 journal are required to be absolute.
  */
 function isJournalAppRoot(value: string): boolean {
-  if (value === '-' || isNormalisedAbsolutePath(value)) return true;
+  if (value === '-') return true;
+  if (!value.startsWith('~/')) return isNormalisedAbsolutePath(value);
   // Reuse the absolute-path normalization rules for the part after the tilde,
   // and reject control characters and backslashes in the home-relative form.
-  return value.startsWith('~/') &&
-    isNormalisedAbsolutePath(value.slice(1)) &&
+  return isNormalisedAbsolutePath(value.slice(1)) &&
     !/[\x00-\x1f\x7f\\]/.test(value);
 }
 
