@@ -244,6 +244,12 @@ export class FakeWsl implements WslGateway {
     }
   }
 
+  readonly recoveryNodeQueries: string[] = [];
+  async resolveRecoveryNode(distro: string): Promise<string | null> {
+    this.recoveryNodeQueries.push(distro);
+    return this.options.nodePath === undefined ? '/usr/bin/node' : this.options.nodePath;
+  }
+
   async resolveRuntime(
     _distro: string,
     override: string | null,

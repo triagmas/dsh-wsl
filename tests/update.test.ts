@@ -408,7 +408,13 @@ describe('interrupted update recovery decisions', () => {
 
   it('rolls back when the installation reports anything else', () => {
     expect(decideRecovery(journal(), observation({ version: '0.2.3' })).action).toBe('rollback');
-    expect(decideRecovery(journal(), observation({ version: null })).action).toBe('rollback');
+    expect(decideRecovery(journal(), observation({ version: null })).action).toBe('blocked');
+  });
+
+  it('blocks an unreadable version instead of interpreting a failed Node probe as corruption', () => {
+    const decision = decideRecovery(journal(), observation({ present: true, version: null }));
+    expect(decision.action).toBe('blocked');
+    expect(decision.reason).toContain('did not report a verifiable version');
   });
 
   it('rolls back when the executable is missing', () => {

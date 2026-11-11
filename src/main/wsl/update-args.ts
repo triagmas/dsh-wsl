@@ -771,7 +771,10 @@ export const ROLLBACK_SHARED_SCRIPT = [
   'case "$pkg" in /*) ;; *) echo "update: rejected package path" >&2; exit 64 ;; esac',
   'case "$real_path" in /*) ;; *) echo "update: rejected real path" >&2; exit 64 ;; esac',
   'case "$snapshot" in /*) ;; *) echo "update: rejected snapshot path" >&2; exit 64 ;; esac',
-  'if [ "$node" != "-" ] && [ -n "$node" ]; then PATH="$(dirname "$node"):$PATH"; export PATH; fi',
+  // A missing Node executable makes npm and dsh version probes return empty.
+  // Refuse BEFORE touching the package, even when the snapshot is valid.
+  'if [ "$node" = "-" ] || [ -z "$node" ] || [ ! -x "$node" ]; then echo "update: Node.js is unavailable; refusing restore before package mutation" >&2; exit 81; fi',
+  'PATH="$(dirname "$node"):$PATH"; export PATH',
   VERSION_HELPER,
   META_HELPER,
   MANIFEST_HELPER,
