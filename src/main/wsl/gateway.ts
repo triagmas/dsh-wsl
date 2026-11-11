@@ -408,6 +408,21 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       options.log.info(`isolated environment ready: ${result.stdout.trim().split('\n').pop() ?? root}`);
     },
 
+    async resolveRecoveryNode(distro) {
+      // Recovery runs before Supervisor.bringUp(), so resolvedRuntime() is null.
+      // Reuse the read-only runtime probe but do not require a working DSH:
+      // npm may have removed its shim before the interrupted update crashed.
+      const result = await run(buildResolveRuntimeArgs(distro, null, null), 30_000);
+      if (result.code !== 0) {
+        throw new ShellError('unexpected', 'The Node.js runtime could not be resolved for update recovery.');
+      }
+      const nodePath = parseRuntimeProbe(result.stdout).nodePath;
+      if (nodePath === null) {
+        options.log.warn('update recovery: Node.js runtime not found; keeping the journal');
+      }
+      return nodePath;
+    },
+
     async resolveRuntime(distro, override, isolationRoot) {
       const result = await run(buildResolveRuntimeArgs(distro, isolationRoot, override), 30_000);
       const probe = parseRuntimeProbe(result.stdout);
