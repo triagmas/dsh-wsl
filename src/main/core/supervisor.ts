@@ -169,6 +169,12 @@ export interface WslGateway {
   ensureDistro(distro: string): Promise<void>;
   /** Resolve the distribution's own `dsh` and `node` (read-only). */
   resolveRuntime(distro: string, override: string | null, isolationRoot: string | null): Promise<ResolvedRuntime>;
+  /**
+   * Read-only Node.js discovery for crash recovery, before a backend exists.
+   * Unlike resolveRuntime(), this must also work if npm removed the DSH shim
+   * during an interrupted install; it cannot depend on dsh being runnable.
+   */
+  resolveRecoveryNode(distro: string): Promise<string | null>;
   /** Create the isolated data directories below the validated root. */
   prepareIsolation(distro: string, root: string): Promise<void>;
   startServer(request: StartServerRequest): ServerHandle;
