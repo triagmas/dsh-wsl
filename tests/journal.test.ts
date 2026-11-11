@@ -235,7 +235,7 @@ describe('start-up handling of the journal states (issues #12 and #17)', () => {
     };
     return {
       wsl: {
-        async resolveRecoveryNode(distro: string) {
+        async resolveRecoveryNode(distro: string): Promise<string | null> {
           calls.push('node');
           expect(distro).toBe('Ubuntu');
           return '/home/dev/.local/bin/node';
