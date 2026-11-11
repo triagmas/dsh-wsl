@@ -345,6 +345,27 @@ describe('transaction journal', () => {
     expect(parseUpdateJournal(journal({ phase: 'verifying' }))?.phase).toBe('verifying');
   });
 
+  it('accepts the home-relative appRoot persisted by real WSL inspections', () => {
+    const actual = journal({
+      transaction: '20261110T223319Z-0b78',
+      appRoot: '~/.local/share/wsl-web-shell',
+      backupDir: '/home/triag/.local/share/wsl-web-shell/update/shared-backup-20261110T223319Z-0b78',
+    });
+    expect(parseUpdateJournal(JSON.parse(JSON.stringify(actual)) as unknown)).toEqual(actual);
+    expect(decideRecovery(actual, observation()).action).toBe('abandon');
+  });
+
+  it('rejects noncanonical and escaping home-relative app roots', () => {
+    for (const appRoot of [
+      '~', '~/',
+      '~/dir//sub', '~/dir/./sub', '~/dir/../sub', '~/dir/..',
+      '~/dir/', '~//dir', '~/dir\\sub', '~/dir\nsub',
+      '~/dir\u0000sub', 'relative/home', '~other/.local/share',
+    ]) {
+      expect(parseUpdateJournal(journal({ appRoot }))).toBeNull();
+    }
+  });
+
   it('refuses a journal it cannot trust', () => {
     expect(parseUpdateJournal(null)).toBeNull();
     expect(parseUpdateJournal({})).toBeNull();

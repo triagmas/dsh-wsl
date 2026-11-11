@@ -73,6 +73,21 @@ describe('journal store', () => {
     expect(store.read()).toBeNull();
   });
 
+  it('durably round-trips the production home-relative appRoot from WSL', async () => {
+    const directory = await scratch();
+    const path = join(directory, 'profile', 'update-journal.json');
+    const store = createJournalStore(path, createNullLogger());
+    const record = journal({
+      transaction: '20261110T223319Z-0b78',
+      appRoot: '~/.local/share/wsl-web-shell',
+      backupDir: '/home/triag/.local/share/wsl-web-shell/update/shared-backup-20261110T223319Z-0b78',
+    });
+
+    expect(() => store.write(record)).not.toThrow();
+    expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(record);
+    expect(store.read()).toEqual(record);
+  });
+
   it('replaces a previous record atomically', async () => {
     const directory = await scratch();
     const path = join(directory, 'update-journal.json');
