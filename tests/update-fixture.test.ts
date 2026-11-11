@@ -316,6 +316,23 @@ describe.skipIf(!npmAvailable || !shellAvailable || !bashAvailable)('shared inst
     expect(existsSync(`${snapshot}/payload/package.json`)).toBe(true);
   }, 120_000);
 
+  it('refuses a rollback without resolved Node before touching a real fixture package', () => {
+    const fixture = createFixture();
+    const { plan, snapshot } = arrange(fixture);
+    const packageJson = join(plan.packageDir, 'package.json');
+    const before = readFileSync(packageJson, 'utf8');
+    const restore = runScript(
+      ROLLBACK_SHARED_SCRIPT,
+      [plan.prefix, OLD, fixture.npmShim, '-', plan.dshPath, plan.packageDir, TX, fixture.appRoot, plan.realPath, snapshot],
+      fixture.env,
+    );
+    expect(restore.status).toBe(81);
+    expect(restore.stderr).toContain('Node.js is unavailable');
+    expect(readFileSync(packageJson, 'utf8')).toBe(before);
+    expect(versionAt(plan.dshPath, fixture.env)).toBe(`dsh ${OLD}`);
+    expect(existsSync(snapshot)).toBe(true);
+  }, 120_000);
+
   // --- B1: no mutation without a verified, offline-restorable snapshot --------
 
   it('refuses to update when the snapshot location cannot be written', () => {
