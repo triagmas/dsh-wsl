@@ -221,43 +221,38 @@ describe('journal store', () => {
 });
 
 describe('start-up handling of the journal states (issues #12 and #17)', () => {
-  function deps(store: ReturnType<typeof createJournalStore>, calls: string[], version: string | null = '0.2.1-rc.5') {
+  function deps(
+    store: ReturnType<typeof createJournalStore>,
+    calls: string[],
+    version: string | null = '0.2.1-rc.5',
+    present = version !== null,
+  ) {
     const wsl = new FakeWsl();
     wsl.recoveryObservation = {
-      present: version !== null,
+      present,
       version,
       realPath: DEFAULT_INSTALLATION.realPath,
     };
     return {
       wsl: {
-        async inspectSharedDsh() {
-          calls.push('inspect');
-          return wsl.inspectSharedDsh({
-            distro: 'Ubuntu',
-            appRoot: '/home/dev/.local/share/wsl-web-shell',
-            dshPath: DEFAULT_INSTALLATION.path,
-            nodePath: null,
-            ownPid: null,
-          });
+        async resolveRecoveryNode(distro: string) {
+          calls.push('node');
+          expect(distro).toBe('Ubuntu');
+          return '/home/dev/.local/bin/node';
         },
-        async rollbackSharedDsh(request: { dshPath: string }, restore: string, transaction: string) {
+        async inspectSharedDsh(request: Parameters<FakeWsl['inspectSharedDsh']>[0]) {
+          calls.push('inspect');
+          expect(request.nodePath).toBe('/home/dev/.local/bin/node');
+          return wsl.inspectSharedDsh(request);
+        },
+        async rollbackSharedDsh(
+          request: Parameters<FakeWsl['rollbackSharedDsh']>[0],
+          restore: string,
+          transaction: string,
+        ) {
           calls.push('restore');
-          return wsl.rollbackSharedDsh(
-            {
-              distro: 'Ubuntu',
-              appRoot: '/home/dev/.local/share/wsl-web-shell',
-              prefix: '/home/dev/.npm-global',
-              packageDir: DEFAULT_INSTALLATION.packageDir as string,
-              dshPath: request.dshPath,
-              realPath: DEFAULT_INSTALLATION.realPath,
-              npmPath: '/usr/bin/npm',
-              nodePath: null,
-              snapshotDir: '/home/dev/.local/share/wsl-web-shell/update/shared-backup-20261107T101500Z-1a2b',
-            },
-            restore,
-            transaction,
-            () => undefined,
-          );
+          expect(request.nodePath).toBe('/home/dev/.local/bin/node');
+          return wsl.rollbackSharedDsh(request, restore, transaction, () => undefined);
         },
       },
       journal: store,
@@ -286,7 +281,7 @@ describe('start-up handling of the journal states (issues #12 and #17)', () => {
     const calls: string[] = [];
     const result = await recoverInterruptedUpdate(deps(store, calls));
     expect(result.action).toBe('abandon');
-    expect(calls).toEqual(['inspect', 'resume']);
+    expect(calls).toEqual(['node', 'inspect', 'resume']);
     expect(store.read()).toBeNull();
   });
 
@@ -309,8 +304,35 @@ describe('start-up handling of the journal states (issues #12 and #17)', () => {
     const calls: string[] = [];
     const result = await recoverInterruptedUpdate(deps(store, calls, '0.2.3'));
     expect(result.action).toBe('rollback');
-    expect(calls).toEqual(['inspect', 'restore', 'resume']);
+    expect(calls).toEqual(['node', 'inspect', 'restore', 'resume']);
     expect(store.read()).toBeNull();
+  });
+
+  it('keeps a journal and never calls restore when the present DSH reports no version', async () => {
+    const directory = await scratch();
+    const store = createJournalStore(join(directory, 'update-journal.json'), createNullLogger());
+    store.write(journal({ appRoot: '~/.local/share/wsl-web-shell' }));
+    const calls: string[] = [];
+    const result = await recoverInterruptedUpdate(deps(store, calls, null, true));
+    expect(result.action).toBe('blocked');
+    expect(calls).toEqual(['node', 'inspect']);
+    expect(store.read()?.version).toBe(2);
+  });
+
+  it('blocks without inspecting, restoring or clearing the journal when Node is missing', async () => {
+    const directory = await scratch();
+    const store = createJournalStore(join(directory, 'update-journal.json'), createNullLogger());
+    store.write(journal());
+    const calls: string[] = [];
+    const d = deps(store, calls);
+    d.wsl.resolveRecoveryNode = async () => {
+      calls.push('node');
+      return null;
+    };
+    const result = await recoverInterruptedUpdate(d);
+    expect(result.action).toBe('blocked');
+    expect(calls).toEqual(['node']);
+    expect(store.read()?.version).toBe(2);
   });
 
   it('blocks a corrupt journal instead of starting anything', async () => {
