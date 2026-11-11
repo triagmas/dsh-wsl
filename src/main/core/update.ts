@@ -554,6 +554,21 @@ function requiredString(value: Record<string, unknown>, key: string): string | n
   return typeof field === 'string' && field.length > 0 && field.length <= 4096 ? field : null;
 }
 
+/**
+ * The WSL gateway also accepts a home-relative app root (for example
+ * ~/.local/share/wsl-web-shell). Preserve that exact representation in a
+ * recovery journal: expanding it on Windows would use the wrong home directory.
+ * All other paths in a v2 journal are required to be absolute.
+ */
+function isJournalAppRoot(value: string): boolean {
+  if (value === '-' || isNormalisedAbsolutePath(value)) return true;
+  // Reuse the absolute-path normalization rules for the part after the tilde,
+  // and reject control characters and backslashes in the home-relative form.
+  return value.startsWith('~/') &&
+    isNormalisedAbsolutePath(value.slice(1)) &&
+    !/[\x00-\x1f\x7f\\]/.test(value);
+}
+
 /** Validate a journal read back from disk; anything odd means "no journal". */
 export function parseUpdateJournal(raw: unknown): UpdateJournal | null {
   if (raw === null || typeof raw !== 'object') return null;
@@ -598,7 +613,7 @@ export function parseUpdateJournal(raw: unknown): UpdateJournal | null {
       backupDir === null ||
       !isNormalisedAbsolutePath(npmPath) ||
       !isNormalisedAbsolutePath(backupDir) ||
-      (appRoot !== '-' && !isNormalisedAbsolutePath(appRoot)) ||
+      !isJournalAppRoot(appRoot) ||
       !isNormalisedAbsolutePath(dshPath) ||
       !isNormalisedAbsolutePath(realPath) ||
       !isNormalisedAbsolutePath(prefix) ||
