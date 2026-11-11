@@ -171,7 +171,7 @@ export function createJournalStore(path: string, log: Logger): UpdateJournalStor
 }
 
 export interface UpdateRecoveryDeps {
-  wsl: Pick<WslGateway, 'inspectSharedDsh' | 'rollbackSharedDsh'>;
+  wsl: Pick<WslGateway, 'resolveRecoveryNode' | 'inspectSharedDsh' | 'rollbackSharedDsh'>;
   journal: UpdateJournalStore;
   /** Start the backend from whatever installation is active after the repair. */
   resume: () => Promise<UpdateTransition>;
@@ -218,12 +218,36 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
     return { handled: true, action: 'legacy', message: resumed.ok ? message : (resumed.message ?? message) };
   }
 
+  // A recovery journal is handled BEFORE Supervisor.bringUp() resolves the
+  // runtime. Do not use supervisor.resolvedRuntime(): it is still null here.
+  // The independent WSL probe locates Node without requiring DSH to work.
+  let nodePath: string | null;
+  try {
+    nodePath = await deps.wsl.resolveRecoveryNode(journal.distro);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'unknown error';
+    deps.log.error(`update recovery: Node.js discovery failed (${detail}); journal kept`);
+    return {
+      handled: true,
+      action: 'blocked',
+      message: 'The Node.js runtime could not be inspected; the update journal was kept. No restore was attempted.',
+    };
+  }
+  if (nodePath === null) {
+    deps.log.error('update recovery: no verified Node.js runtime; journal kept');
+    return {
+      handled: true,
+      action: 'blocked',
+      message: 'Node.js is unavailable for update recovery; the journal was kept. No restore was attempted.',
+    };
+  }
+
   const inspect = async (): Promise<SharedInstallObservation> => {
     const report = await deps.wsl.inspectSharedDsh({
       distro: journal.distro,
       appRoot: journal.appRoot,
       dshPath: journal.dshPath,
-      nodePath: null,
+      nodePath,
       ownPid: null,
     });
     const installation = report.installation;
@@ -251,6 +275,17 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
   const decision = decideRecovery(journal, observation);
   deps.log.info(`update recovery: ${decision.action} (${decision.reason})`);
 
+  if (decision.action === 'blocked') {
+    // A missing version is not evidence that the npm installation is missing.
+    // Never turn a failed version probe into a destructive snapshot restore.
+    deps.log.error('update recovery: installation state unverified; journal kept, no restore attempted');
+    return {
+      handled: true,
+      action: 'blocked',
+      message: `The existing DSH version could not be verified (${decision.reason}). The journal was kept and no restore was attempted.`,
+    };
+  }
+
   if (decision.action === 'abandon') {
     // Nothing was changed: forget the record and continue with the normal start.
     deps.journal.clear();
@@ -272,15 +307,14 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
     // The new version is installed but does not serve: restore the previous one
     // and keep the journal until that is proven as well.
     deps.log.warn(`update recovery: the updated version did not start (${resumed.message ?? 'unknown'})`);
-    return await restore(deps, journal, `The updated version did not start (${resumed.message ?? 'unknown error'}).`);
+    return await restore(deps, journal, nodePath, `The updated version did not start (${resumed.message ?? 'unknown error'}).`);
   }
 
   return await restore(
     deps,
     journal,
-    decision.action === 'blocked'
-      ? `An interrupted update left the installation in an unknown state: ${decision.reason}.`
-      : `An interrupted update left ${observation.version ?? 'no version'} installed instead of ${journal.target}.`,
+    nodePath,
+    `An interrupted update left ${observation.version ?? 'no version'} installed instead of ${journal.target}.`,
   );
 }
 
@@ -288,6 +322,7 @@ export async function recoverInterruptedUpdate(deps: UpdateRecoveryDeps): Promis
 async function restore(
   deps: UpdateRecoveryDeps,
   journal: UpdateJournalV2,
+  nodePath: string,
   reason: string,
 ): Promise<UpdateRecoveryResult> {
   const restored = await deps.wsl
@@ -300,7 +335,7 @@ async function restore(
         dshPath: journal.dshPath,
         realPath: journal.realPath,
         npmPath: journal.npmPath,
-        nodePath: null,
+        nodePath,
         snapshotDir: journal.backupDir,
       },
       journal.installed,
