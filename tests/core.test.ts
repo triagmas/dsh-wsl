@@ -116,9 +116,17 @@ describe('navigation policy', () => {
   it('grants only the tiny permission allowlist', () => {
     expect(decidePermission('fullscreen')).toBe(true);
     expect(decidePermission('clipboard-sanitized-write')).toBe(true);
-    for (const denied of ['media', 'geolocation', 'notifications', 'midi', 'openExternal']) {
+    for (const denied of ['geolocation', 'notifications', 'midi', 'openExternal']) {
       expect(decidePermission(denied)).toBe(false);
     }
+  });
+
+  it('grants the microphone for voice input and refuses the camera', () => {
+    expect(decidePermission('media', { mediaTypes: ['audio'] })).toBe(true);
+    expect(decidePermission('media', { mediaType: 'audio' })).toBe(true);
+    expect(decidePermission('media', { mediaTypes: ['video'] })).toBe(false);
+    expect(decidePermission('media', { mediaTypes: ['audio', 'video'] })).toBe(false);
+    expect(decidePermission('media')).toBe(false);
   });
 
   it('hands external links to the browser only from a focused window and not too often', () => {

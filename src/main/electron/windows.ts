@@ -475,10 +475,12 @@ export class Windows {
   configureSession(): Session {
     if (this.backendSession !== null) return this.backendSession;
     const backendSession = session.fromPartition(PARTITION);
-    backendSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-      callback(decidePermission(permission));
+    backendSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
+      callback(decidePermission(permission, details));
     });
-    backendSession.setPermissionCheckHandler((_webContents, permission) => decidePermission(permission));
+    backendSession.setPermissionCheckHandler((_webContents, permission, _origin, details) =>
+      decidePermission(permission, details),
+    );
     backendSession.on('will-download', (event) => {
       // Downloads from backend content are not part of the product.
       event.preventDefault();

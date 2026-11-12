@@ -84,11 +84,26 @@ export function decideExternalHandoff(context: ExternalHandoffContext): External
 
 const ALLOWED_PERMISSIONS = new Set(['fullscreen', 'clipboard-sanitized-write']);
 
+/** Media kinds from either Electron permission detail shape, without trusting it. */
+function requestedMediaKinds(details: unknown): string[] {
+  if (typeof details !== 'object' || details === null) return [];
+  const record = details as { mediaTypes?: unknown; mediaType?: unknown };
+  if (Array.isArray(record.mediaTypes)) {
+    return record.mediaTypes.filter((kind): kind is string => typeof kind === 'string');
+  }
+  return typeof record.mediaType === 'string' ? [record.mediaType] : [];
+}
+
 /**
- * Permission requests come from backend content, so the allowlist is tiny:
- * fullscreen and sanitized clipboard writes. Camera, microphone, geolocation,
- * notifications and device access stay denied.
+ * Permission requests come from backend content, so the allowlist stays tiny:
+ * fullscreen, sanitized clipboard writes and the microphone for the WebUI's own
+ * voice input. Camera, geolocation, notifications and device access stay denied.
  */
-export function decidePermission(permission: string): boolean {
-  return ALLOWED_PERMISSIONS.has(permission);
+export function decidePermission(permission: string, details?: unknown): boolean {
+  if (ALLOWED_PERMISSIONS.has(permission)) return true;
+  if (permission !== 'media') return false;
+  const kinds = requestedMediaKinds(details);
+  // Voice input only needs the microphone; a camera request is not part of the
+  // product, so a combined request is refused as a whole.
+  return kinds.includes('audio') && !kinds.includes('video');
 }
