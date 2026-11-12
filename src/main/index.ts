@@ -29,6 +29,8 @@ import {
   isUpdateCritical,
   manualUpdateCommand,
   planSharedUpdate,
+  shouldRefuseQuit,
+  type QuitTrigger,
   type SharedUpdatePlan,
 } from './core/update.js';
 import { createLogger } from './core/logger.js';
@@ -257,6 +259,10 @@ async function bootstrap(): Promise<void> {
     },
     onExternalLink: (url: string) => {
       windows.openExternal(url);
+    },
+    onSessionEnd: () => {
+      log.info('system session end: quitting gracefully');
+      quit('session-end');
     },
     onVisibilityChanged: (visible: boolean) => {
       if (visible) everShown = true;
@@ -541,24 +547,37 @@ async function bootstrap(): Promise<void> {
     healthTimer.unref?.();
   };
 
-  const quit = (): void => {
+  /**
+   * Windows grants only a few seconds between the session-end notification and
+   * termination, so the graceful backend stop is raced against this budget.
+   */
+  const SESSION_END_SHUTDOWN_BUDGET_MS = 4_000;
+
+  const quit = (trigger: QuitTrigger = 'user'): void => {
     if (quitting) return;
     const updatePhase = updateRunner.snapshot().phase;
-    if (updateRunner.running() && isUpdateCritical(updatePhase)) {
+    const updateRunning = updateRunner.running();
+    if (shouldRefuseQuit(trigger, updatePhase, updateRunning)) {
       // The runtime is being replaced or restarted right now: quitting here would
       // leave the isolated root half-swapped and force a repair on the next start.
       log.warn(`quit refused: the update is ${updatePhase}`);
       windows.openUpdateProgress();
       windows.publishUpdate({
         ...updateRunner.snapshot(),
-        detail: 'The runtime is being replaced right now. The app quits as soon as this step finished.',
+        detail: 'The update is preparing or replacing the runtime right now. The app quits as soon as this step finishes.',
       });
       return;
     }
-    if (updateRunner.running()) {
-      // Before the swap nothing but a staging directory changes, so quitting is
-      // safe: the journal is abandoned on the next start.
-      log.info(`quit during update staging (${updatePhase}); the staged install is not activated`);
+    if (trigger === 'session-end' && updateRunning && isUpdateCritical(updatePhase)) {
+      // Windows may terminate the process at any moment now, so there is no time
+      // to finish or roll back the update. Do not block the logoff: stop the
+      // owned backend as far as the grace period allows and keep the journal for
+      // the recovery the next start performs.
+      log.warn(`session end during update ${updatePhase}; exiting best effort, journal kept for recovery`);
+    } else if (updateRunning) {
+      // Only the read-only npm version check reaches here: nothing has been
+      // written to the installation, so quitting is safe.
+      log.info(`quit during update check (${updatePhase}); nothing has been changed`);
     }
     quitting = true;
     log.info('quit requested');
@@ -567,17 +586,24 @@ async function bootstrap(): Promise<void> {
     windows.setQuitting();
     tray?.destroy();
     tray = null;
-    void supervisor
-      .shutdown()
-      .catch((error: unknown) => {
-        log.error(`shutdown failed: ${error instanceof Error ? error.message : 'unknown'}`);
-      })
-      .finally(() => {
-        // Marker read by the next start to separate a clean exit from a kill.
-        log.info(CLEAN_SHUTDOWN_MARKER);
-        windows.destroyAll();
-        app.quit();
-      });
+    const shutdown = supervisor.shutdown().catch((error: unknown) => {
+      log.error(`shutdown failed: ${error instanceof Error ? error.message : 'unknown'}`);
+    });
+    const graceful =
+      trigger === 'session-end'
+        ? Promise.race([
+            shutdown,
+            new Promise<void>((resolve) => {
+              setTimeout(resolve, SESSION_END_SHUTDOWN_BUDGET_MS).unref?.();
+            }),
+          ])
+        : shutdown;
+    void graceful.finally(() => {
+      // Marker read by the next start to separate a clean exit from a kill.
+      log.info(CLEAN_SHUTDOWN_MARKER);
+      windows.destroyAll();
+      app.quit();
+    });
   };
 
   const startTray = (): void => {

@@ -1,6 +1,6 @@
 # DSH WSL — Product & Architecture Contract
 
-Version: 0.1 / M1. Source of truth: [Issue #1](https://github.com/triagmas/dsh-wsl/issues/1). Status: specification only; **not yet a working application**.
+Version: 0.1 / M1. Source of truth: [Issue #1](https://github.com/triagmas/dsh-wsl/issues/1). Status: M1 implementation complete; real Windows/WSL acceptance is still pending (see [evidence/r02.md](evidence/r02.md)).
 
 ## Purpose
 
@@ -56,7 +56,7 @@ Additional states: `HIDDEN_IN_TRAY` (window hidden, still supervised), `RECOVERI
 ## Security boundaries
 
 - Electron `nodeIntegration:false`, `contextIsolation:true`, `sandbox:true`, `webSecurity:true`; no preload granting Node/FS/process APIs to backend WebUI, and no disabling security flags to work around WebUI bugs.
-- Exact origin allowlist for navigation; deny popup/window.open by default. Support external HTTPS links through system browser only after deliberate policy checks, **not** arbitrary `shell.openExternal` from backend content.
+- Exact origin allowlist for navigation; deny popup/window.open by default. Support external HTTPS links through system browser only after deliberate policy checks, **not** arbitrary `shell.openExternal` from backend content: only https links that are neither loopback, LAN nor a literal IP qualify, the app window must be focused, and repeated hand-offs are rate-limited because Electron exposes no user-gesture flag.
 - Verify backend ownership independently from port reachability; local port bind must not expose WebUI to LAN/Internet. Tokenized startup URLs are credentials: no logging, screenshots, clipboard or diagnostic uploads containing secrets.
 - Use `spawn` with fixed argument arrays, validate distro/port/profile args. If invoking a shell inside WSL for compatibility, use fixed scripts and safe argument handling; no interpolation of untrusted user text.
 - Track owned process IDs and lifecycle, handle WSL spawning process trees safely. No `wsl --shutdown`, mass `Stop-Process`, `taskkill`, or killing unrelated service on port.
@@ -67,7 +67,7 @@ Additional states: `HIDDEN_IN_TRAY` (window hidden, still supervised), `RECOVERI
 
 Use a minimal **original** local splash inspired by [21st.dev's Orbital Loader](https://21st.dev/@molecule-lab-rushil/components/orbital-loader), not a wholesale dependency-heavy UI kit. A soft animated orbit, neutral dark background, logo + short stage-specific messages. Allow an optional light look and `prefers-reduced-motion`; no fabricated percentage or imitation of Harness's composer. On reconnect, a slight backdrop dim/blur with “Reconnecting…” is enough. Show Retry/Diagnostics when terminally failed. The actual DSH WebUI remains intact.
 
-The main window keeps a thin permanent bottom bar (30–34 px) owned by the app: connection state, distro and port on the left, the running `DSH` version and the latest published GitHub release on the right, and a gear that opens a compact settings popover. It is chrome around the WebUI, not a redesign of it: the remote page lives in its own `WebContentsView` above the bar with no injected markup, styles or scripts, and the version lookup is informational only — the app never updates DSH. Contract and limits: [footer.md](footer.md).
+The main window keeps a thin permanent bottom bar (30–34 px) owned by the app: connection state, distro and port on the left, the running `DSH` version and the latest published GitHub release on the right, and a gear that opens a compact settings popover. It is chrome around the WebUI, not a redesign of it: the remote page lives in its own `WebContentsView` above the bar with no injected markup, styles or scripts, and the version lookup is informational only — the one update path is the explicit, confirmed one in [update.md](update.md), and it changes the shared WSL installation. Contract and limits: [footer.md](footer.md).
 
 ## Testing and deliverables
 

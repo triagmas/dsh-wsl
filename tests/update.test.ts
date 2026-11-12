@@ -34,6 +34,7 @@ import {
   planTerminalUpdate,
   sanitizeBackupReason,
   sanitizeUpdateLine,
+  shouldRefuseQuit,
   shouldRestartAfterUpdate,
   type SharedInstallObservation,
   type SharedUpdatePlanResult,
@@ -270,12 +271,23 @@ describe('phase model', () => {
     }
   });
 
-  it('refuses to quit while the shared installation is being changed', () => {
-    for (const phase of ['stopping', 'installing', 'verifying', 'starting'] as const) {
+  it('refuses to quit while the snapshot or the shared installation is being changed', () => {
+    for (const phase of ['inspecting', 'stopping', 'installing', 'verifying', 'starting'] as const) {
       expect(isUpdateCritical(phase)).toBe(true);
+      expect(shouldRefuseQuit('user', phase, true)).toBe(true);
     }
-    for (const phase of ['idle', 'checking', 'inspecting', 'done', 'failed', 'rolled-back'] as const) {
+    for (const phase of ['idle', 'checking', 'done', 'failed', 'rolled-back'] as const) {
       expect(isUpdateCritical(phase)).toBe(false);
+      expect(shouldRefuseQuit('user', phase, true)).toBe(false);
+    }
+    expect(shouldRefuseQuit('user', 'installing', false)).toBe(false);
+  });
+
+  it('never blocks a Windows session end on the update guard', () => {
+    // Logoff cannot be refused: blocking only removes the graceful marker and
+    // backend stop. The journal covers the interrupted run on the next start.
+    for (const phase of ['inspecting', 'stopping', 'installing', 'verifying', 'starting'] as const) {
+      expect(shouldRefuseQuit('session-end', phase, true)).toBe(false);
     }
   });
 
@@ -916,8 +928,8 @@ describe('update window and shutdown wiring (review blocker D)', () => {
   it('refuses to quit while the runtime is being replaced', () => {
     expect(indexSource).toContain('quit refused: the update is');
     expect(indexSource).toContain('isUpdateCritical(');
-    // Quitting during staging stays possible, and is logged as an abandoned stage.
-    expect(indexSource).toContain('quit during update staging');
+    // Only the read-only npm version check may be interrupted, and it is logged.
+    expect(indexSource).toContain('quit during update check');
   });
 
   it('rebuilds the terminal once the rolling cap starts dropping lines', () => {

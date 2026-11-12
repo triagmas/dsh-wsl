@@ -11,7 +11,12 @@ import type { Logger } from '../core/logger.js';
 import type { ShellStatus, VersionSnapshot } from '../../shared/types.js';
 import { isUpdateRunning, type UpdateState } from '../core/update.js';
 import { computePopoverBounds, computeViewBounds, type PopoverAnchor } from '../core/footer.js';
-import { decideNavigation, decidePermission, decideWindowOpen } from '../core/navigation.js';
+import {
+  decideExternalHandoff,
+  decideNavigation,
+  decidePermission,
+  decideWindowOpen,
+} from '../core/navigation.js';
 import type { WindowEventContext, WindowEventName, WindowSurface } from '../core/diagnostics.js';
 
 export const PARTITION = 'persist:wsl-web-shell';
@@ -25,6 +30,11 @@ export interface WindowsOptions {
   devToolsEnabled: boolean;
   onRendererGone(reason: string): void;
   onExternalLink(url: string): void;
+  /**
+   * Windows announced a logoff/shutdown: quit gracefully instead of hiding to
+   * tray, otherwise the OS force-kills the app without a clean-shutdown marker.
+   */
+  onSessionEnd?(): void;
   /** Window shown/hidden by the user (close to tray, tray open). */
   onVisibilityChanged(visible: boolean): void;
   /**
@@ -67,6 +77,10 @@ export class Windows {
   private versions: VersionSnapshot | null = null;
   /** True once the app is definitively quitting; close then really closes. */
   private quitting = false;
+  /** True once Windows announced a logoff/shutdown; its close must not be blocked. */
+  private sessionEnding = false;
+  /** Last hand-off to the system browser, used to rate-limit remote requests. */
+  private lastExternalHandoffAt = 0;
 
   constructor(private readonly options: WindowsOptions) {}
 
@@ -114,14 +128,21 @@ export class Windows {
 
     window.on('close', (event) => {
       this.reportWindowEvent('main', 'close-requested', window);
-      // Close always hides to tray; only the explicit Quit path destroys it.
-      if (this.quitting) return;
+      // Close hides to tray; only an explicit Quit or an OS logoff/shutdown may
+      // destroy the window.
+      if (this.quitting || this.sessionEnding) return;
       event.preventDefault();
       window.hide();
     });
     // Windows only: logoff/shutdown is announced before windows are closed, so
     // an OS-initiated close can be told apart from a user click on X.
-    window.on('session-end', () => this.reportWindowEvent('main', 'session-end', window));
+    window.on('session-end', () => {
+      this.sessionEnding = true;
+      this.reportWindowEvent('main', 'session-end', window);
+      // Stop the app-owned backend now: being killed by the OS instead would
+      // skip the clean-shutdown marker and leave the backend record stale.
+      this.options.onSessionEnd?.();
+    });
     window.on('show', () => {
       this.reportWindowEvent('main', 'shown', window);
       this.options.onVisibilityChanged(true);
@@ -232,7 +253,20 @@ export class Windows {
 
     contents.setWindowOpenHandler(({ url }) => {
       const decision = decideWindowOpen(url, this.options.origin());
-      if (decision.action === 'external') this.options.onExternalLink(decision.url);
+      if (decision.action !== 'external') return { action: 'deny' };
+      const window = this.main;
+      const handoff = decideExternalHandoff({
+        focused: window !== null && !window.isDestroyed() && window.isVisible() && window.isFocused(),
+        lastHandoffAt: this.lastExternalHandoffAt,
+        now: Date.now(),
+      });
+      if (handoff.action !== 'open') {
+        this.options.log.warn(`external link not opened (${handoff.reason})`);
+        return { action: 'deny' };
+      }
+      this.lastExternalHandoffAt = Date.now();
+      this.options.log.info('external link handed to the system browser');
+      this.options.onExternalLink(decision.url);
       return { action: 'deny' };
     });
 
