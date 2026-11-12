@@ -242,6 +242,22 @@ export function isUpdateCritical(phase: UpdatePhase): boolean {
   );
 }
 
+export type QuitTrigger = 'user' | 'session-end';
+
+/**
+ * Whether a quit request must be refused.
+ *
+ * The critical-phase guard exists to protect the recovery snapshot and the shared
+ * installation from a user-initiated quit. A Windows logoff/shutdown cannot be
+ * refused: the OS terminates the process after a short grace period, so blocking
+ * there only removes the chance to stop the owned backend and write the
+ * clean-shutdown marker. The session-end path therefore exits best effort and
+ * leaves the journal for the next start to recover from.
+ */
+export function shouldRefuseQuit(trigger: QuitTrigger, phase: UpdatePhase, running: boolean): boolean {
+  return trigger === 'user' && running && isUpdateCritical(phase);
+}
+
 /** The app may only relaunch after a completed update. */
 export function shouldRestartAfterUpdate(phase: UpdatePhase): boolean {
   return phase === 'done';

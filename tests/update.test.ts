@@ -34,6 +34,7 @@ import {
   planTerminalUpdate,
   sanitizeBackupReason,
   sanitizeUpdateLine,
+  shouldRefuseQuit,
   shouldRestartAfterUpdate,
   type SharedInstallObservation,
   type SharedUpdatePlanResult,
@@ -273,9 +274,20 @@ describe('phase model', () => {
   it('refuses to quit while the snapshot or the shared installation is being changed', () => {
     for (const phase of ['inspecting', 'stopping', 'installing', 'verifying', 'starting'] as const) {
       expect(isUpdateCritical(phase)).toBe(true);
+      expect(shouldRefuseQuit('user', phase, true)).toBe(true);
     }
     for (const phase of ['idle', 'checking', 'done', 'failed', 'rolled-back'] as const) {
       expect(isUpdateCritical(phase)).toBe(false);
+      expect(shouldRefuseQuit('user', phase, true)).toBe(false);
+    }
+    expect(shouldRefuseQuit('user', 'installing', false)).toBe(false);
+  });
+
+  it('never blocks a Windows session end on the update guard', () => {
+    // Logoff cannot be refused: blocking only removes the graceful marker and
+    // backend stop. The journal covers the interrupted run on the next start.
+    for (const phase of ['inspecting', 'stopping', 'installing', 'verifying', 'starting'] as const) {
+      expect(shouldRefuseQuit('session-end', phase, true)).toBe(false);
     }
   });
 

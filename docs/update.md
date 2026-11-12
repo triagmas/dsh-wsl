@@ -343,6 +343,10 @@ not closable and tray Quit is refused, so a quit cannot interrupt the recovery
 snapshot or the install. Only the short npm version check before that may be
 interrupted. A finished or rolled-back run is closable.
 
+A Windows logoff or shutdown is not blocked by that guard: the OS terminates the
+process after a short grace period, so the app stops its backend within that
+budget and exits, keeping the journal for the recovery the next start performs.
+
 ## Confirmation window
 
 `src/update/confirm.html` shows the distribution, the executable path, the install

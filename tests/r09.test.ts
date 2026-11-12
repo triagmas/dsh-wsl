@@ -221,7 +221,9 @@ describe('main process wiring', () => {
     );
     expect(sessionBlock).toContain('this.options.onSessionEnd?.()');
     expect(indexSource).toContain('onSessionEnd:');
+    expect(indexSource).toContain("quit('session-end')");
     expect(indexSource).toContain('system session end: quitting gracefully');
+    expect(indexSource).toContain('session end during update');
   });
 
   it('does not re-introduce the reverted Issue #7 automation mode', () => {
