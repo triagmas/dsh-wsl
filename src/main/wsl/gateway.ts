@@ -34,6 +34,7 @@ import {
   buildDshVersionArgs,
   buildListDistrosArgs,
   buildPrepareIsolationArgs,
+  buildFindPortOwnerArgs,
   buildProbeProcessArgs,
   buildResolveRuntimeArgs,
   buildSignalArgs,
@@ -747,6 +748,22 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       const result = await run(buildProbeProcessArgs(distro, pid), 10_000);
       if (result.code !== 0) return null;
       return parseProcessProbe(result.stdout);
+    },
+
+    async findPortOwner(distro: string, port: number, nodePath: string | null): Promise<number | null> {
+      if (nodePath === null) return null;
+      let args: string[];
+      try {
+        args = buildFindPortOwnerArgs(distro, nodePath, port);
+      } catch {
+        // An unusable node path is not a listener fact; the caller keeps its
+        // normal collision handling.
+        return null;
+      }
+      const result = await run(args, 10_000);
+      if (result.code !== 0) return null;
+      const pid = Number(result.stdout.trim());
+      return Number.isInteger(pid) && pid > 1 ? pid : null;
     },
 
     async signal(distro, pid, signal) {

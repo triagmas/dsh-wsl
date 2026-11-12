@@ -64,6 +64,11 @@ export interface ShellStatus {
   detail: string | null;
   /** True when the backend process is owned (and stoppable) by this app. */
   ownedServer: boolean;
+  /**
+   * True when the app connected to a DSH backend it does not own (for example a
+   * systemd unit). Such a process is never stopped, restarted or updated.
+   */
+  externalBackend: boolean;
   canRetry: boolean;
   port: number;
   distro: string;

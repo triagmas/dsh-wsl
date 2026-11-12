@@ -421,3 +421,96 @@ describe('supervisor detach (backend outlives the app)', () => {
     expect(lastStatus(second.statuses).ownedServer).toBe(true);
   });
 });
+
+describe('external backend attach', () => {
+  const EXTERNAL_PID = 4711;
+  const externalWsl = {
+    portOwner: EXTERNAL_PID,
+    probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe() : null),
+  };
+
+  it('attaches to a verified backend it does not own and never signals it', async () => {
+    const harness = createHarness({ portState: 'occupied', wsl: externalWsl });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    const ready = lastStatus(harness.statuses);
+    expect(ready.externalBackend).toBe(true);
+    expect(ready.ownedServer).toBe(false);
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+    // No record is written: the app does not claim a process it does not own.
+    expect(harness.registry.read()).toBeNull();
+
+    // Restart refuses instead of signalling a process outside the app.
+    await supervisor.restart();
+    expect(harness.wsl.signals).toHaveLength(0);
+    expect(lastStatus(harness.statuses).detail).toContain('runs outside this app');
+  });
+
+  it('refuses to update the installation under an attached backend', async () => {
+    const harness = createHarness({ portState: 'occupied', wsl: externalWsl });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+
+    const transition = await supervisor.pauseForUpdate();
+
+    expect(transition.ok).toBe(false);
+    expect(transition.message).toContain('runs outside this app');
+    expect(harness.wsl.signals).toHaveLength(0);
+  });
+
+  it('falls back to the collision error when the stored session is rejected', async () => {
+    const harness = createHarness({
+      portState: 'occupied',
+      web: { health: () => 401 },
+      wsl: externalWsl,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await expect(supervisor.start()).rejects.toThrow(/already in use/);
+    expect(supervisor.state).toBe('ERROR');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(false);
+    // The hint names the real situation: a verified DSH this profile has no
+    // session for, not an arbitrary unknown service.
+    expect(lastStatus(harness.statuses).detail).toContain('has never authenticated');
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+  });
+
+  it('refuses a listener whose command line is not an app-compatible dsh launch', async () => {
+    const harness = createHarness({
+      portState: 'occupied',
+      wsl: { portOwner: EXTERNAL_PID, probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe({ port: 9999 }) : null) },
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await expect(supervisor.start()).rejects.toThrow(/already in use/);
+    expect(supervisor.state).toBe('ERROR');
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+  });
+
+  it('reports a lost attached backend without spawning a competitor', async () => {
+    let healthy = true;
+    const harness = createHarness({
+      portState: 'occupied',
+      web: { health: () => (healthy ? 200 : 401) },
+      wsl: externalWsl,
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    expect(supervisor.state).toBe('READY');
+
+    healthy = false;
+    await supervisor.healthTick();
+    await supervisor.healthTick();
+
+    expect(supervisor.state).toBe('ERROR');
+    expect(lastStatus(harness.statuses).detail).toContain('outside this app');
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+  });
+});

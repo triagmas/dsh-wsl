@@ -8,3 +8,7 @@ coverage/
 Thumbs.db
 /build/
 paint-probe/
+.dsh/
+.npm-cache/
+.r02/
+.vitest/

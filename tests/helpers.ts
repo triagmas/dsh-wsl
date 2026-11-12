@@ -118,6 +118,8 @@ export interface FakeWslOptions {
   failPrepare?: boolean;
   /** Simulate a backend that dies before announcing its WebUI URL. */
   exitBeforeReady?: { code: number | null; stderr?: string };
+  /** PID reported as the listener on a port (attach verification). */
+  portOwner?: number | null | ((port: number) => number | null);
 }
 
 export class FakeWsl implements WslGateway {
@@ -295,6 +297,12 @@ export class FakeWsl implements WslGateway {
     this.readAttempts += 1;
     if (this.options.probe !== undefined) return this.options.probe(pid);
     return pid === BACKEND_PID ? backendProbe() : null;
+  }
+
+  async findPortOwner(_distro: string, port: number): Promise<number | null> {
+    const owner = this.options.portOwner;
+    if (typeof owner === 'function') return owner(port);
+    return owner ?? null;
   }
 
   signalHook: ((pid: number, signal: 'TERM' | 'KILL') => void) | null = null;
