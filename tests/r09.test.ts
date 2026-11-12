@@ -7,12 +7,23 @@
  * contents, the splash and the agreed window behaviour are untouched, and every
  * new IPC channel validates its sender.
  */
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const root = join(import.meta.dirname, '..');
 const read = (relative: string): string => readFileSync(join(root, relative), 'utf8');
+
+/** Every TypeScript source under a directory, as workspace-relative POSIX paths. */
+const sourceFiles = (directory: string): string[] => {
+  const found: string[] = [];
+  for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
+    const child = `${directory}/${entry.name}`;
+    if (entry.isDirectory()) found.push(...sourceFiles(child));
+    else if (entry.isFile() && entry.name.endsWith('.ts')) found.push(child);
+  }
+  return found;
+};
 
 const windowsSource = read('src/main/electron/windows.ts');
 const indexSource = read('src/main/index.ts');
@@ -175,12 +186,42 @@ describe('main process wiring', () => {
     expect(windowsSource).toContain('this.layoutLogged = false');
   });
 
-  it('never downloads, installs or upgrades DSH', () => {
+  it('keeps DSH installation inside the confirmed update path (issue #17)', () => {
+    // The launcher never installs anything: npm runs only inside the fixed WSL
+    // updater scripts, and only when the user confirmed the update. This guard
+    // fails when a new module starts mentioning an install outside the path.
+    const allowed = new Set([
+      'src/main/wsl/update-args.ts', // the scripts that actually run npm
+      'src/main/wsl/gateway.ts', // "install it the usual way" guidance
+      'src/main/core/update.ts', // documents that the target becomes an npm operand
+      'src/main/core/update-runner.ts', // documents the install step it drives
+      'src/main/core/update-recovery.ts', // manual recovery instructions
+    ]);
+    const mentions = sourceFiles('src/main').filter((file) => /npm install/.test(read(file)));
+    expect(mentions.length).toBeGreaterThan(0);
+    for (const file of mentions) expect(allowed.has(file)).toBe(true);
     for (const source of [indexSource, windowsSource, read('src/main/backend/github-versions.ts')]) {
       expect(source).not.toMatch(/npm install/);
-      expect(source).not.toMatch(/execFile\([^)]*npm/);
+      expect(source).not.toMatch(/(?:execFile|spawn)\([^)]*['"]npm['"]/);
       expect(source).not.toMatch(/unlinkSync\('.*runtime/);
     }
+  });
+
+  it('quits gracefully instead of hiding when Windows ends the session', () => {
+    // A logoff must not leave the window hiding to tray: the OS would force-kill
+    // the process before the clean-shutdown marker and the backend stop happen.
+    const closeBlock = windowsSource.slice(
+      windowsSource.indexOf("window.on('close'"),
+      windowsSource.indexOf("window.on('session-end'"),
+    );
+    expect(closeBlock).toContain('this.quitting || this.sessionEnding');
+    const sessionBlock = windowsSource.slice(
+      windowsSource.indexOf("window.on('session-end'"),
+      windowsSource.indexOf("window.on('show'"),
+    );
+    expect(sessionBlock).toContain('this.options.onSessionEnd?.()');
+    expect(indexSource).toContain('onSessionEnd:');
+    expect(indexSource).toContain('system session end: quitting gracefully');
   });
 
   it('does not re-introduce the reverted Issue #7 automation mode', () => {

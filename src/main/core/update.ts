@@ -224,14 +224,22 @@ export function isUpdateRunning(phase: UpdatePhase): boolean {
 /**
  * Phases during which the app must not quit.
  *
- * Before `stopping` only read-only checks run, so a quit is safe and the journal
- * is simply abandoned on the next start. From `stopping` to `starting` the shared
- * WSL installation is being changed or the new backend is starting, and
- * interrupting that is exactly what the journal recovery would have to repair —
- * so the app refuses to quit instead.
+ * `checking` only reads the published version from npm, so quitting there leaves
+ * nothing behind. From `inspecting` the run writes the verified recovery
+ * snapshot of the current installation into the app data root; killing that copy
+ * leaves a partial backup. From `stopping` to `starting` the shared WSL
+ * installation itself is being replaced or the new backend is starting, and
+ * interrupting that is exactly what the journal recovery would have to repair.
+ * The app therefore refuses to quit from `inspecting` onward.
  */
 export function isUpdateCritical(phase: UpdatePhase): boolean {
-  return phase === 'stopping' || phase === 'installing' || phase === 'verifying' || phase === 'starting';
+  return (
+    phase === 'inspecting' ||
+    phase === 'stopping' ||
+    phase === 'installing' ||
+    phase === 'verifying' ||
+    phase === 'starting'
+  );
 }
 
 /** The app may only relaunch after a completed update. */

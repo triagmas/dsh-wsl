@@ -258,6 +258,10 @@ async function bootstrap(): Promise<void> {
     onExternalLink: (url: string) => {
       windows.openExternal(url);
     },
+    onSessionEnd: () => {
+      log.info('system session end: quitting gracefully');
+      quit();
+    },
     onVisibilityChanged: (visible: boolean) => {
       if (visible) everShown = true;
       supervisor.markHidden(!visible);
@@ -551,14 +555,14 @@ async function bootstrap(): Promise<void> {
       windows.openUpdateProgress();
       windows.publishUpdate({
         ...updateRunner.snapshot(),
-        detail: 'The runtime is being replaced right now. The app quits as soon as this step finished.',
+        detail: 'The update is preparing or replacing the runtime right now. The app quits as soon as this step finishes.',
       });
       return;
     }
     if (updateRunner.running()) {
-      // Before the swap nothing but a staging directory changes, so quitting is
-      // safe: the journal is abandoned on the next start.
-      log.info(`quit during update staging (${updatePhase}); the staged install is not activated`);
+      // Only the read-only npm version check reaches here: nothing has been
+      // written to the installation, so quitting is safe.
+      log.info(`quit during update check (${updatePhase}); nothing has been changed`);
     }
     quitting = true;
     log.info('quit requested');

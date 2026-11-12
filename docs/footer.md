@@ -91,7 +91,8 @@ Settings and the launcher share `src/main/core/workspace.ts` (issue #8):
 - `tests/r09.test.ts` — composition guards: WebUI stays in a `WebContentsView` with
   its sandbox and navigation allowlist, no CSS/DOM injection into remote pages, all
   new IPC channels go through the trusted-sender guard, the popover anchor is
-  validated, nothing installs/updates DSH, and issue #7's automation mode stays out.
+  validated, installation stays confined to the explicit update path (issue #17),
+  and issue #7's automation mode stays out.
 - `npm run chrome:smoke` — renders the shipped footer and popover under Xvfb and
   asserts 19 observable facts (labels, tone, arrow, release click, bar height,
   groups, pre-filled values, save round-trip, close). Runs in CI.

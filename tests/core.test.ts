@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { Lifecycle, InvalidTransitionError, backoffDelay, canTransition } from '../src/main/core/lifecycle.js';
-import { decideNavigation, decidePermission, decideWindowOpen } from '../src/main/core/navigation.js';
+import {
+  EXTERNAL_HANDOFF_COOLDOWN_MS,
+  decideExternalHandoff,
+  decideNavigation,
+  decidePermission,
+  decideWindowOpen,
+} from '../src/main/core/navigation.js';
 import { classifyPortSituation } from '../src/main/core/port.js';
 import { applyConfigPatch, normalizeConfig, requiresRestart, isValidPort } from '../src/main/core/config.js';
 import { buildTrayMenu, trayTooltip } from '../src/main/core/tray-model.js';
@@ -113,6 +119,24 @@ describe('navigation policy', () => {
     for (const denied of ['media', 'geolocation', 'notifications', 'midi', 'openExternal']) {
       expect(decidePermission(denied)).toBe(false);
     }
+  });
+
+  it('hands external links to the browser only from a focused window and not too often', () => {
+    expect(decideExternalHandoff({ focused: true, lastHandoffAt: 0, now: 1000 })).toEqual({ action: 'open' });
+    expect(decideExternalHandoff({ focused: false, lastHandoffAt: 0, now: 1000 })).toEqual({
+      action: 'block',
+      reason: 'window-not-focused',
+    });
+    expect(
+      decideExternalHandoff({
+        focused: true,
+        lastHandoffAt: 1000,
+        now: 1000 + EXTERNAL_HANDOFF_COOLDOWN_MS - 1,
+      }),
+    ).toEqual({ action: 'block', reason: 'too-frequent' });
+    expect(
+      decideExternalHandoff({ focused: true, lastHandoffAt: 1000, now: 1000 + EXTERNAL_HANDOFF_COOLDOWN_MS }),
+    ).toEqual({ action: 'open' });
   });
 });
 

@@ -338,8 +338,10 @@ number changes and appends otherwise, so the stream keeps moving past 400 lines.
 Output is sanitized (ANSI/control characters stripped, secrets redacted, 320
 characters per line) and written with `textContent`.
 
-While a run is active the window is not closable and tray Quit is refused, so a
-quit cannot interrupt the install. A finished or rolled-back run is closable.
+While the installation is being inspected, replaced or verified, the window is
+not closable and tray Quit is refused, so a quit cannot interrupt the recovery
+snapshot or the install. Only the short npm version check before that may be
+interrupted. A finished or rolled-back run is closable.
 
 ## Confirmation window
 
