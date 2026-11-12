@@ -776,14 +776,17 @@ export class Supervisor {
           // an inconclusive probe here is not evidence that it is stale. Keep
           // it so a transient probe failure cannot permanently orphan a live
           // backend the way beta.4 did.
-          if (await this.tryAttachExternal(runtime.nodePath)) {
+          const attach = await this.tryAttachExternal(runtime.nodePath);
+          if (attach === 'attached') {
             await this.finishReady();
             return;
           }
           throw new ShellError(
             'port-collision',
             `Port ${config.port} is already in use by a service this app does not own.`,
-            'Close the other service or choose another port in Settings. The app never connects to unknown listeners.',
+            attach === 'no-session'
+              ? 'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.'
+              : 'Close the other service or choose another port in Settings. The app never connects to unknown listeners.',
           );
         }
         this.deps.log.info('reusing app-owned backend');
@@ -1085,30 +1088,30 @@ export class Supervisor {
    * answer), and the stored session cookie authenticates against it. The process
    * stays outside the app's lifecycle: it is never signalled or restarted.
    */
-  private async tryAttachExternal(nodePath: string | null): Promise<boolean> {
-    if (nodePath === null) return false;
+  private async tryAttachExternal(nodePath: string | null): Promise<'attached' | 'no-session' | 'not-ours'> {
+    if (nodePath === null) return 'not-ours';
     try {
       const pid = await this.deps.wsl.findPortOwner(this.distro(), this.port(), nodePath);
-      if (pid === null) return false;
+      if (pid === null) return 'not-ours';
       const probe = await this.deps.wsl.probeProcess(this.distro(), pid);
       if (verifyOwnership(probe, { port: this.port() }) !== 'owned') {
         this.deps.log.debug(`no attach: listener pid ${pid} is not an app-compatible dsh launch`);
-        return false;
+        return 'not-ours';
       }
       this.setState('CONNECTING', 'Connecting to the running DeepSeek Harness');
       if (!(await this.tryExistingSession())) {
         this.deps.log.debug('no attach: the stored session cookie was rejected by the running backend');
-        return false;
+        return 'no-session';
       }
       this.attached = true;
       this.owned = false;
       this.serverPid = null;
       this.serverStartTime = null;
       this.deps.log.info(`attached to the running backend (pid=${pid}); it stays outside the app lifecycle`);
-      return true;
+      return 'attached';
     } catch (error) {
       this.deps.log.warn(`attach probe failed: ${describe(error)}`);
-      return false;
+      return 'not-ours';
     }
   }
 

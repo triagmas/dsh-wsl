@@ -473,6 +473,9 @@ describe('external backend attach', () => {
     await expect(supervisor.start()).rejects.toThrow(/already in use/);
     expect(supervisor.state).toBe('ERROR');
     expect(lastStatus(harness.statuses).externalBackend).toBe(false);
+    // The hint names the real situation: a verified DSH this profile has no
+    // session for, not an arbitrary unknown service.
+    expect(lastStatus(harness.statuses).detail).toContain('has never authenticated');
     expect(harness.wsl.starts).toHaveLength(0);
     expect(harness.wsl.signals).toHaveLength(0);
   });
