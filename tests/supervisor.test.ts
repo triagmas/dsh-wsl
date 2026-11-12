@@ -119,6 +119,47 @@ describe('supervisor startup', () => {
     expect(supervisor.state).toBe('READY');
   });
 
+  it('keeps the ownership record when the port is busy and the probe fails', async () => {
+    const registry = createMemoryRegistry(record);
+    const harness = createHarness({
+      portState: 'occupied',
+      registry,
+      wsl: { probe: () => null },
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await expect(supervisor.start()).rejects.toBeTruthy();
+
+    expect(supervisor.state).toBe('ERROR');
+    // The record is the only proof the next start can use; an inconclusive
+    // probe must not delete it (regression: an orphaned live backend).
+    expect(registry.read()).toEqual(record);
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+  });
+
+  it('adopts the backend once the ownership probe works again', async () => {
+    const registry = createMemoryRegistry(record);
+    let probeWorks = false;
+    const harness = createHarness({
+      portState: 'occupied',
+      registry,
+      wsl: { probe: (pid) => (probeWorks && pid === BACKEND_PID ? backendProbe() : null) },
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await expect(supervisor.start()).rejects.toBeTruthy();
+    expect(registry.read()).toEqual(record);
+
+    probeWorks = true;
+    await supervisor.retry();
+
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+    expect(lastStatus(harness.statuses).ownedServer).toBe(true);
+  });
+
   it('reports missing prerequisites without installing anything', async () => {
     const harness = createHarness({ wsl: { distros: ['Debian'] } });
     const supervisor = new Supervisor(harness.deps);
