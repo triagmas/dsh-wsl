@@ -209,7 +209,8 @@ describe('main process wiring', () => {
 
   it('quits gracefully instead of hiding when Windows ends the session', () => {
     // A logoff must not leave the window hiding to tray: the OS would force-kill
-    // the process before the clean-shutdown marker and the backend stop happen.
+    // the process before the clean-shutdown marker is written. The backend is
+    // left running on purpose; it outlives the app and is adopted on next start.
     const closeBlock = windowsSource.slice(
       windowsSource.indexOf("window.on('close'"),
       windowsSource.indexOf("window.on('session-end'"),
@@ -224,6 +225,14 @@ describe('main process wiring', () => {
     expect(indexSource).toContain("quit('session-end')");
     expect(indexSource).toContain('system session end: quitting gracefully');
     expect(indexSource).toContain('session end during update');
+    // Quit hands the backend off untouched; only the update relaunch path may
+    // stop it through the owned-process shutdown.
+    const quitBlock = indexSource.slice(
+      indexSource.indexOf('const quit = ('),
+      indexSource.indexOf('const startTray ='),
+    );
+    expect(quitBlock).toContain('supervisor.detach()');
+    expect(quitBlock).not.toContain('supervisor.shutdown()');
   });
 
   it('does not re-introduce the reverted Issue #7 automation mode', () => {

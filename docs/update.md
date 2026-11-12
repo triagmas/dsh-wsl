@@ -344,8 +344,8 @@ snapshot or the install. Only the short npm version check before that may be
 interrupted. A finished or rolled-back run is closable.
 
 A Windows logoff or shutdown is not blocked by that guard: the OS terminates the
-process after a short grace period, so the app stops its backend within that
-budget and exits, keeping the journal for the recovery the next start performs.
+process after a short grace period, so the app exits without stopping its backend
+and keeps the journal for the recovery the next start performs.
 
 ## Confirmation window
 

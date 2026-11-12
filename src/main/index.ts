@@ -547,12 +547,6 @@ async function bootstrap(): Promise<void> {
     healthTimer.unref?.();
   };
 
-  /**
-   * Windows grants only a few seconds between the session-end notification and
-   * termination, so the graceful backend stop is raced against this budget.
-   */
-  const SESSION_END_SHUTDOWN_BUDGET_MS = 4_000;
-
   const quit = (trigger: QuitTrigger = 'user'): void => {
     if (quitting) return;
     const updatePhase = updateRunner.snapshot().phase;
@@ -570,9 +564,9 @@ async function bootstrap(): Promise<void> {
     }
     if (trigger === 'session-end' && updateRunning && isUpdateCritical(updatePhase)) {
       // Windows may terminate the process at any moment now, so there is no time
-      // to finish or roll back the update. Do not block the logoff: stop the
-      // owned backend as far as the grace period allows and keep the journal for
-      // the recovery the next start performs.
+      // to finish or roll back the update. Do not block the logoff: leave the
+      // backend as it is and keep the journal for the recovery the next start
+      // performs.
       log.warn(`session end during update ${updatePhase}; exiting best effort, journal kept for recovery`);
     } else if (updateRunning) {
       // Only the read-only npm version check reaches here: nothing has been
@@ -586,19 +580,10 @@ async function bootstrap(): Promise<void> {
     windows.setQuitting();
     tray?.destroy();
     tray = null;
-    const shutdown = supervisor.shutdown().catch((error: unknown) => {
-      log.error(`shutdown failed: ${error instanceof Error ? error.message : 'unknown'}`);
+    const detached = supervisor.detach().catch((error: unknown) => {
+      log.error(`detaching the backend failed: ${error instanceof Error ? error.message : 'unknown'}`);
     });
-    const graceful =
-      trigger === 'session-end'
-        ? Promise.race([
-            shutdown,
-            new Promise<void>((resolve) => {
-              setTimeout(resolve, SESSION_END_SHUTDOWN_BUDGET_MS).unref?.();
-            }),
-          ])
-        : shutdown;
-    void graceful.finally(() => {
+    void detached.finally(() => {
       // Marker read by the next start to separate a clean exit from a kill.
       log.info(CLEAN_SHUTDOWN_MARKER);
       windows.destroyAll();
