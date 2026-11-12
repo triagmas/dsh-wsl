@@ -738,7 +738,10 @@ export class Supervisor {
         const existing = await this.verifyRecordedServer();
         const situation = classifyPortSituation(portState, existing.verdict);
         if (situation === 'collision') {
-          this.deps.registry.clear();
+          // The record is the only proof of ownership the next start can use;
+          // an inconclusive probe here is not evidence that it is stale. Keep
+          // it so a transient probe failure cannot permanently orphan a live
+          // backend the way beta.4 did.
           throw new ShellError(
             'port-collision',
             `Port ${config.port} is already in use by a service this app does not own.`,
@@ -1042,7 +1045,10 @@ export class Supervisor {
     }
     const probe = await this.deps.wsl.probeProcess(this.distro(), record.pid);
     const verdict = verifyOwnership(probe, { port: this.port(), startTime: record.startTime });
-    if (verdict !== 'owned') this.deps.registry.clear();
+    // Only a definite mismatch proves the record wrong. A `gone` verdict also
+    // covers a failed or timed-out probe, which must not destroy the record for
+    // a backend that is in fact alive (a later start can still adopt it).
+    if (verdict === 'foreign') this.deps.registry.clear();
     return { verdict, record };
   }
 
@@ -1111,7 +1117,13 @@ export class Supervisor {
     if (this.server !== null) {
       await this.server.stop().catch(() => undefined);
     }
-    if (pid !== null) this.deps.registry.clear();
+    if (pid !== null) {
+      // Drop the record only when it describes the process handled here. A
+      // failed replacement attempt must never erase the ownership proof for a
+      // different, still running backend.
+      const recorded = this.deps.registry.read();
+      if (recorded === null || recorded.pid === pid) this.deps.registry.clear();
+    }
     this.server = null;
     this.serverPid = null;
     this.serverStartTime = null;
