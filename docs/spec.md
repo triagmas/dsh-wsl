@@ -30,7 +30,7 @@ The official Windows DeepSeek Harness Desktop is **not used or modified**. The a
 | Bind host | 127.0.0.1 | immutable loopback-only |
 | Local port | 3080 | configurable numeric port after validation; never arbitrary URLs |
 | Window Close (X) | Hide to tray | server remains supervised |
-| Tray Quit | Graceful complete exit | cleanup only process *owned* by app, never entire WSL |
+| Tray Quit | Graceful complete exit | leaves the app-owned backend and its launcher running; never tears down WSL; next start adopts it |
 | Health checks | visible ~10s, hidden ~25s | main-process timer; timings adjustable after measurements |
 | Retry policy | bounded exponential backoff | stop with actionable error; avoid duplicate instances |
 | Appearance | dark/light by OS | original UI decides its own theme |
@@ -50,7 +50,7 @@ Additional states: `HIDDEN_IN_TRAY` (window hidden, still supervised), `RECOVERI
 - Load the original WebUI, without injecting replacement buttons or styles. Only show local splash prior to readiness and while reconnecting, never fake backend ready state.
 - Clicking X hides to tray (never kills WSL/DSH), the background main process continues health checks. Tray click/Open re-shows, performs immediate health check, shows the recovering overlay until backend is ready, and restores the original WebUI.
 - Unexpected exit or failed health => attempt controlled restart **of app-owned process** with capped retries and cooldown. If externally managed backend cannot be authenticated as app-owned, display failure and do not terminate/restart it.
-- Tray menu: Open, Connection Status, Restart WebUI, Settings, Quit. Restart is allowed only for owned process. Quit ends Electron and gracefully stops **only** app-owned backend if set by policy, never the distro. Persist only app config/browser session under a dedicated app profile.
+- Tray menu: Open, Connection Status, Restart WebUI, Settings, Quit. Restart is allowed only for owned process. Quit ends Electron but **leaves the app-owned backend running**: its lifetime follows the WSL distribution, not the app window, and the next start verifies the recorded PID/start time and adopts the same process. Only an explicit Restart WebUI, an update swap or a settings change that requires a restart may stop it, and only through the ownership-checked path; the distro itself is never torn down by the app. Persist only app config/browser session under a dedicated app profile.
 - Missing WSL, distro, Node or DSH: show steps to install; never fetch binaries or install a private copy silently. DSH WSL runs the `dsh` the distribution already has (issue #17); the in-app update changes exactly that installation, only after an explicit confirmation.
 
 ## Security boundaries

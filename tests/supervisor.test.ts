@@ -342,3 +342,41 @@ describe('supervisor shutdown', () => {
     expect(harness.statuses.at(-1)?.detail).toContain('started by this app');
   });
 });
+
+describe('supervisor detach (backend outlives the app)', () => {
+  it('leaves the owned backend running and keeps its record', async () => {
+    const registry = createMemoryRegistry();
+    const harness = createHarness({ registry });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    const recorded = registry.read();
+    expect(recorded).not.toBeNull();
+
+    await supervisor.detach();
+
+    expect(supervisor.state).toBe('QUITTING');
+    // No signal, no launcher stop: only the app exits.
+    expect(harness.wsl.signals).toHaveLength(0);
+    expect(harness.wsl.servers[0]?.stopCalls).toBe(0);
+    expect(registry.read()).toEqual(recorded);
+  });
+
+  it('lets the next start adopt the backend that outlived the app', async () => {
+    const registry = createMemoryRegistry();
+    const first = createHarness({ registry });
+    const app = new Supervisor(first.deps);
+    await app.start();
+    const spawned = first.wsl.servers[0];
+    await app.detach();
+
+    const second = createHarness({ portState: 'occupied', registry });
+    const relaunched = new Supervisor(second.deps);
+    await relaunched.start();
+
+    expect(relaunched.state).toBe('READY');
+    expect(second.wsl.starts).toHaveLength(0);
+    expect(second.wsl.signals).toHaveLength(0);
+    expect(spawned?.stopCalls).toBe(0);
+    expect(lastStatus(second.statuses).ownedServer).toBe(true);
+  });
+});

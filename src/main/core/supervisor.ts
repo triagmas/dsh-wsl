@@ -1118,6 +1118,27 @@ export class Supervisor {
     this.owned = false;
   }
 
+  /**
+   * Exit without touching the backend.
+   *
+   * The app-owned backend is a service of the WSL distribution, not of the app
+   * window: closing the app leaves `dsh web` and its launcher running. The
+   * registry record is kept on purpose, so the next start proves ownership and
+   * adopts the same process instead of spawning a second one. Only an explicit
+   * Restart WebUI, an update swap or a settings change that requires a restart
+   * may stop it; the distribution itself is never torn down by this app.
+   */
+  async detach(): Promise<void> {
+    if (this.quitting) return;
+    this.quitting = true;
+    this.lifecycle.forceQuit();
+    this.status = this.buildStatus('QUITTING', null);
+    this.deps.publish(this.status);
+    this.deps.log.info('backend left running: its lifetime follows the WSL distribution, not the app window');
+    // Deliberately no stopOwnedServer(): `server`, `serverPid`, `serverStartTime`
+    // and the registry record stay intact for the next start to verify and adopt.
+  }
+
   /** Fully serialized shutdown; stops only the process this app owns. */
   async shutdown(): Promise<void> {
     if (this.quitting) return;
