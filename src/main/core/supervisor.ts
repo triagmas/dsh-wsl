@@ -179,6 +179,12 @@ export interface WslGateway {
   prepareIsolation(distro: string, root: string): Promise<void>;
   startServer(request: StartServerRequest): ServerHandle;
   probeProcess(distro: string, pid: number): Promise<ProcessProbe | null>;
+  /**
+   * PID of the process listening on one TCP port inside the distribution, or
+   * `null` when it cannot be resolved. Read-only; used to verify a backend the
+   * app did not start.
+   */
+  findPortOwner(distro: string, port: number, nodePath: string | null): Promise<number | null>;
   /** `dsh --version` of the selected executable; `null` when it cannot be read. */
   dshVersion(distro: string, dshPath: string, nodePath: string | null): Promise<string | null>;
   signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
@@ -293,6 +299,11 @@ export class Supervisor {
   private activePort: number | null = null;
   private activeDistro: string | null = null;
   private owned = false;
+  /**
+   * The app is connected to a backend it does not own (started by the owner, for
+   * example a systemd unit). Such a process is never signalled or restarted.
+   */
+  private attached = false;
   private failures = 0;
   private attempt = 0;
   private recoveryRunning = false;
@@ -384,6 +395,7 @@ export class Supervisor {
       // output, exception text or a URL that once carried a launch token.
       detail: sanitizeOptional(detail),
       ownedServer: this.owned,
+      externalBackend: this.attached,
       canRetry: state === 'ERROR',
       port: this.port(),
       distro: config.distro,
@@ -438,7 +450,11 @@ export class Supervisor {
     return this.serial(async () => {
       if (this.quitting || this.refuseDuringUpdate('restart')) return;
       if (!this.owned) {
-        this.setDetail('Only the backend started by this app can be restarted.');
+        this.setDetail(
+          this.attached
+            ? 'The backend runs outside this app; restart it with its own service.'
+            : 'Only the backend started by this app can be restarted.',
+        );
         return;
       }
       this.attempt = 0;
@@ -462,6 +478,9 @@ export class Supervisor {
   pauseForUpdate(): Promise<UpdateTransition> {
     return this.serial(async () => {
       if (this.quitting) return { ok: false, message: 'The app is quitting.' };
+      if (this.attached) {
+        return { ok: false, message: 'The DSH backend runs outside this app; stop it before updating.' };
+      }
       this.updateLocked = true;
       if (!this.owned && this.serverPid === null && this.server === null) {
         this.deps.log.info('update: no app-owned backend is running');
@@ -627,6 +646,20 @@ export class Supervisor {
    */
   private async handleLoss(reason: string): Promise<void> {
     if (this.recoveryRunning || this.recoveryScheduled || this.quitting || this.updateLocked) return;
+    if (this.attached) {
+      // Recovery means spawning a replacement, which would fight the owner's own
+      // launcher for the port. Report the loss and let Retry re-attach instead.
+      this.attached = false;
+      this.deps.log.warn(`attached backend lost (${reason}); recovery is left to its own launcher`);
+      this.fail(
+        new ShellError(
+          'backend-lost',
+          'The DeepSeek Harness backend started outside this app is not reachable.',
+          'Start it again (for example its systemd unit) and press Retry. The app never starts a competing backend on this port.',
+        ),
+      );
+      return;
+    }
     if (this.startInFlight) {
       this.deps.log.debug(`recovery skipped (${reason}): a start is in flight and owns the outcome`);
       return;
@@ -699,6 +732,7 @@ export class Supervisor {
     try {
       this.activePort = config.port;
       this.activeDistro = config.distro;
+      this.attached = false;
       this.setState('CHECKING', null);
       this.failures = 0;
 
@@ -742,6 +776,10 @@ export class Supervisor {
           // an inconclusive probe here is not evidence that it is stale. Keep
           // it so a transient probe failure cannot permanently orphan a live
           // backend the way beta.4 did.
+          if (await this.tryAttachExternal(runtime.nodePath)) {
+            await this.finishReady();
+            return;
+          }
           throw new ShellError(
             'port-collision',
             `Port ${config.port} is already in use by a service this app does not own.`,
@@ -1036,6 +1074,44 @@ export class Supervisor {
     throw new ShellError('health-failed', 'The WebUI did not answer over loopback.', 'Check the log and whether another process holds the port.');
   }
 
+  /**
+   * Connect to a DSH backend the app does not own.
+   *
+   * The owner may run `dsh web` themselves, for example a systemd unit that
+   * starts it at every boot. Refusing forever would leave the app unusable after
+   * each reboot, so an unrecorded listener is accepted only when two independent
+   * checks pass: its command line is our own `dsh web --host 127.0.0.1 --port
+   * <port>` launch (the PID comes from the distribution, never from the port
+   * answer), and the stored session cookie authenticates against it. The process
+   * stays outside the app's lifecycle: it is never signalled or restarted.
+   */
+  private async tryAttachExternal(nodePath: string | null): Promise<boolean> {
+    if (nodePath === null) return false;
+    try {
+      const pid = await this.deps.wsl.findPortOwner(this.distro(), this.port(), nodePath);
+      if (pid === null) return false;
+      const probe = await this.deps.wsl.probeProcess(this.distro(), pid);
+      if (verifyOwnership(probe, { port: this.port() }) !== 'owned') {
+        this.deps.log.debug(`no attach: listener pid ${pid} is not an app-compatible dsh launch`);
+        return false;
+      }
+      this.setState('CONNECTING', 'Connecting to the running DeepSeek Harness');
+      if (!(await this.tryExistingSession())) {
+        this.deps.log.debug('no attach: the stored session cookie was rejected by the running backend');
+        return false;
+      }
+      this.attached = true;
+      this.owned = false;
+      this.serverPid = null;
+      this.serverStartTime = null;
+      this.deps.log.info(`attached to the running backend (pid=${pid}); it stays outside the app lifecycle`);
+      return true;
+    } catch (error) {
+      this.deps.log.warn(`attach probe failed: ${describe(error)}`);
+      return false;
+    }
+  }
+
   private async verifyRecordedServer(): Promise<{ verdict: 'owned' | 'foreign' | 'gone'; record: OwnedServerRecord | null }> {
     const record = this.deps.registry.read();
     if (record === null) return { verdict: 'gone', record: null };
@@ -1072,6 +1148,12 @@ export class Supervisor {
    * close to the signal as possible.
    */
   private async stopOwnedServer(): Promise<void> {
+    if (this.attached) {
+      // The attached process belongs to the owner's own launcher. Stopping it
+      // would take down something the app never started.
+      this.deps.log.debug('stop skipped: the app is attached to an external backend');
+      return;
+    }
     const pid = this.serverPid;
     const startTime = this.serverStartTime;
     const expectation = { port: this.port(), startTime };

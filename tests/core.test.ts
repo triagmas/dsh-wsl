@@ -18,6 +18,7 @@ function status(patch: Partial<ShellStatus> = {}): ShellStatus {
     message: 'Ready',
     detail: null,
     ownedServer: true,
+    externalBackend: false,
     canRetry: false,
     port: 3080,
     distro: 'Ubuntu',

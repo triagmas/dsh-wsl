@@ -379,6 +379,50 @@ export function buildProbeProcessArgs(distro: string, pid: number): string[] {
   ];
 }
 
+/**
+ * Find the process that listens on one TCP port (read-only).
+ *
+ * Ownership of an unrecorded listener can only be argued from its command line,
+ * and that needs the PID, which lives inside WSL. Node.js is already required to
+ * run the backend, so the helper uses the resolved runtime instead of assuming
+ * iproute2 (`ss`) is installed. The script prints the PID and exits; it never
+ * signals anything.
+ */
+export const FIND_PORT_OWNER_SCRIPT = String.raw`const fs = require('fs');
+const port = Number(process.argv[process.argv.length - 1]);
+if (!Number.isInteger(port) || port < 1 || port > 65535) process.exit(2);
+const hex = port.toString(16).toUpperCase().padStart(4, '0');
+const inodes = new Set();
+for (const file of ['/proc/net/tcp', '/proc/net/tcp6']) {
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch (error) { continue; }
+  for (const line of text.split('\n').slice(1)) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length < 10) continue;
+    if (!fields[1].endsWith(':' + hex)) continue;
+    if (fields[3] !== '0A') continue;
+    inodes.add(fields[9]);
+  }
+}
+if (inodes.size === 0) process.exit(3);
+for (const pid of fs.readdirSync('/proc')) {
+  if (!/^\d+$/.test(pid)) continue;
+  let fds = [];
+  try { fds = fs.readdirSync('/proc/' + pid + '/fd'); } catch (error) { continue; }
+  for (const fd of fds) {
+    let link = '';
+    try { link = fs.readlinkSync('/proc/' + pid + '/fd/' + fd); } catch (error) { continue; }
+    if (!link.startsWith('socket:[')) continue;
+    if (inodes.has(link.slice(8, -1))) { process.stdout.write(pid); process.exit(0); }
+  }
+}
+process.exit(4);`;
+
+export function buildFindPortOwnerArgs(distro: string, nodePath: string, port: number): string[] {
+  if (!isValidRuntimeBinary(nodePath)) throw new ArgumentError('invalid-runtime-binary');
+  return ['-d', assertDistroName(distro), '--exec', nodePath, '-e', FIND_PORT_OWNER_SCRIPT, String(assertPort(port))];
+}
+
 /** POSIX signal delivery by number-free name to one verified PID. */
 export function buildSignalArgs(distro: string, pid: number, signal: 'TERM' | 'KILL'): string[] {
   return [
