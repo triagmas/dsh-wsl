@@ -655,6 +655,88 @@ describe('external backend expectation (boot race)', () => {
     expect(harness.wsl.keepalives).toEqual([]);
   });
 
+  it('looks for the launcher on its own port when the recorded fallback died', async () => {
+    const EXTERNAL_PID = 4711;
+    const fallback: OwnedServerRecord = { ...record, port: PORT + 1, pid: 9001, startTime: '777' };
+    const registry = createMemoryRegistry(fallback);
+    const harness = createHarness({
+      portState: (port: number) => (port === PORT ? 'occupied' : 'free'),
+      wsl: {
+        portOwner: (port: number) => (port === PORT ? EXTERNAL_PID : null),
+        // The recorded fallback process is gone; the launcher is on its own port.
+        probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe({ port: PORT }) : null),
+      },
+      registry,
+      external: createMemoryExternalStore(expectation()),
+      attachWaitMs: 30,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    // Discovery belongs on the launcher's port, not on a dead fallback port.
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(lastStatus(harness.statuses).port).toBe(PORT);
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(registry.read()).toBeNull();
+  });
+
+  it('stops its fallback backend with its own port before serving again', async () => {
+    const harness = createHarness({
+      portState: 'free',
+      // The command line of the running process names the fallback port it was
+      // started with, not the port the next start is configured for.
+      wsl: {
+        probe: (pid: number) =>
+          pid === BACKEND_PID ? backendProbe({ port: harness.wsl.lastStartPort() }) : null,
+      },
+      external: createMemoryExternalStore(expectation()),
+      attachWaitMs: 30,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    expect(harness.wsl.starts[0]?.port).toBe(PORT + 1);
+
+    await supervisor.retry();
+
+    // The process is released while its fallback port is still the active one;
+    // otherwise the ownership check reads it as foreign and leaves it behind as
+    // a second writer on the same DSH profile.
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.signals.map((sent) => sent.pid)).toContain(BACKEND_PID);
+    expect(harness.wsl.starts).toHaveLength(2);
+    expect(harness.wsl.starts[1]?.port).toBe(PORT + 1);
+    expect(harness.registry.read()?.port).toBe(PORT + 1);
+  });
+
+  it('takes the reserved port back on an explicit restart', async () => {
+    const harness = createHarness({
+      portState: 'free',
+      wsl: {
+        probe: (pid: number) =>
+          pid === BACKEND_PID ? backendProbe({ port: harness.wsl.lastStartPort() }) : null,
+      },
+      external: createMemoryExternalStore(expectation()),
+      attachWaitMs: 30,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    expect(harness.wsl.starts[0]?.port).toBe(PORT + 1);
+
+    await supervisor.restart();
+
+    // Restart while nothing is attached is the documented "take the port" action.
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(2);
+    expect(harness.wsl.starts[1]?.port).toBe(PORT);
+    expect(lastStatus(harness.statuses).port).toBe(PORT);
+    expect(harness.external.read()).toBeNull();
+  });
+
   it('does not keep a distribution open for a backend it owns', async () => {
     const harness = createHarness({ portState: 'free', attachWaitMs: 30, attachPollMs: 5 });
     const supervisor = new Supervisor(harness.deps);

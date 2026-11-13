@@ -492,18 +492,18 @@ export class Supervisor {
   restart(): Promise<void> {
     return this.serial(async () => {
       if (this.quitting || this.refuseDuringUpdate('restart')) return;
-      if (!this.owned) {
-        if (this.attached) {
-          this.setDetail('The backend runs outside this app; restart it with its own service.');
-          return;
-        }
-        if (!this.externalExpected) {
-          this.setDetail('Only the backend started by this app can be restarted.');
-          return;
-        }
-        // Explicit owner intent: the port belongs to a backend the owner runs,
-        // and they asked the app to serve it instead. Drop the expectation, then
-        // start an app-owned backend.
+      if (this.attached) {
+        this.setDetail('The backend runs outside this app; restart it with its own service.');
+        return;
+      }
+      if (!this.owned && !this.externalExpected) {
+        this.setDetail('Only the backend started by this app can be restarted.');
+        return;
+      }
+      if (this.externalExpected) {
+        // Explicit owner intent: the port is reserved for a backend the owner
+        // runs, and they asked the app to serve it instead. Drop the reservation
+        // before restarting, whether or not a fallback backend is running now.
         this.deps.log.info('restart: the owner asked the app to take the port; dropping the external expectation');
         this.clearExternalExpectation();
       }
@@ -813,16 +813,28 @@ export class Supervisor {
       await this.refreshDshVersion(config.distro, runtime.dshPath, runtime.nodePath);
 
       // A backend this app started on a fallback port in an earlier run is
-      // adopted instead of orphaned: the record is the ownership proof, and
-      // leaving it running would keep a second writer on the same profile.
+      // adopted instead of orphaned: leaving it running would keep a second
+      // writer on the same DSH profile. The record alone is not enough - after a
+      // distribution restart the recorded PID is gone while the launcher may
+      // already serve its own port - so discovery only moves to the fallback
+      // port for a process that is still verifiably this app's backend.
       const recorded = this.deps.registry.read();
       if (
         recorded !== null &&
         recorded.distro === config.distro &&
         isFallbackPort(recorded.port, config.port)
       ) {
-        this.deps.log.info(`adopting the app-owned backend on fallback port ${recorded.port}`);
-        this.activePort = recorded.port;
+        const probe = await this.deps.wsl.probeProcess(config.distro, recorded.pid).catch(() => null);
+        const proof = verifyOwnership(probe, { port: recorded.port, startTime: recorded.startTime });
+        if (proof === 'owned') {
+          this.deps.log.info(`adopting the app-owned backend on fallback port ${recorded.port}`);
+          this.activePort = recorded.port;
+        } else {
+          this.deps.registry.clear();
+          this.deps.log.info(
+            `the app-owned backend on fallback port ${recorded.port} is gone; looking for the launcher on port ${config.port}`,
+          );
+        }
       }
 
       const portState = await this.deps.probePort(this.port());
@@ -1546,7 +1558,17 @@ export class Supervisor {
     }
     const pid = this.serverPid;
     const startTime = this.serverStartTime;
-    const expectation = { port: this.port(), startTime };
+    // The ownership proof names the port the process was launched with, which is
+    // not necessarily the configured one: while the launcher's port is reserved
+    // the app serves on a fallback port, and a later start has already moved
+    // `activePort` back before this runs. Verifying against `this.port()` here
+    // would read the live fallback backend as foreign and leave it behind.
+    const recorded = this.deps.registry.read();
+    const launchedPort =
+      recorded !== null && recorded.pid === pid && recorded.distro === this.distro()
+        ? recorded.port
+        : this.port();
+    const expectation = { port: launchedPort, startTime };
 
     if (pid !== null) {
       const probe = await this.deps.wsl.probeProcess(this.distro(), pid);
@@ -1593,8 +1615,8 @@ export class Supervisor {
       // Drop the record only when it describes the process handled here. A
       // failed replacement attempt must never erase the ownership proof for a
       // different, still running backend.
-      const recorded = this.deps.registry.read();
-      if (recorded === null || recorded.pid === pid) this.deps.registry.clear();
+      const current = this.deps.registry.read();
+      if (current === null || current.pid === pid) this.deps.registry.clear();
     }
     this.server = null;
     this.serverPid = null;

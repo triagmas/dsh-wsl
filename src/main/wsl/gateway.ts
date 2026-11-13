@@ -789,6 +789,13 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
           detached: true,
           stdio: 'ignore',
         });
+        // A failed creation (a missing wsl.exe, for example) arrives as an
+        // asynchronous `error` event. Without a listener Node treats it as an
+        // uncaught exception, and the app's fatal handler would exit over a
+        // best-effort keepalive.
+        child.on('error', (error: unknown) => {
+          options.log.warn(`could not hold the distribution open: ${describeError(error)}`);
+        });
         child.unref();
         options.log.info('holding the WSL distribution open while its backend runs outside the app');
         return child.pid ?? null;
