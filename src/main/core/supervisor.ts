@@ -791,6 +791,7 @@ export class Supervisor {
 
       const portState = await this.deps.probePort(config.port);
       let reassessed = portState;
+      let startOwn = false;
       if (portState === 'occupied') {
         const existing = await this.verifyRecordedServer();
         const situation = classifyPortSituation(portState, existing.verdict);
@@ -807,40 +808,47 @@ export class Supervisor {
             await this.finishReady();
             return;
           }
-          throw new ShellError(
-            'port-collision',
-            `Port ${config.port} is already in use by a service this app does not own.`,
-            outcome === 'rejected'
-              ? 'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.'
-              : 'Close the other service or choose another port in Settings. The app never connects to unknown listeners.',
-          );
+          if (outcome === 'rejected') {
+            throw new ShellError(
+              'port-collision',
+              `Port ${config.port} is already in use by a service this app does not own.`,
+              'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.',
+            );
+          }
+          // The listener exited while it was being waited for: the port is free
+          // again, so serve the WebUI with an app-owned backend instead of
+          // reporting a collision with a service that is gone.
+          this.deps.log.warn(`the listener on port ${config.port} left while waiting for it; starting an app-owned backend`);
+          startOwn = true;
         }
-        this.deps.log.info('reusing app-owned backend');
-        this.owned = true;
-        this.serverPid = existing.record?.pid ?? null;
-        this.serverStartTime = existing.record?.startTime ?? null;
-        // Keep the expectation: an app-owned fallback only borrows the port
-        // until the distribution boots again, when the owner's launcher is
-        // expected to serve it. The miss counter drops it after three absences.
-        this.setState('CONNECTING', null);
-        const authenticated = await this.tryExistingSession();
-        if (authenticated) {
-          await this.finishReady();
-          return;
-        }
-        this.deps.log.warn('owned backend rejected the stored session cookie; restarting it');
-        await this.stopOwnedServer();
-        reassessed = await this.deps.probePort(config.port);
-        if (reassessed === 'occupied') {
-          throw new ShellError(
-            'port-collision',
-            `Port ${config.port} is still in use after stopping the app-owned backend.`,
-            'Check the port with "ss -ltnp" inside WSL and pick another port in Settings.',
-          );
+        if (!startOwn) {
+          this.deps.log.info('reusing app-owned backend');
+          this.owned = true;
+          this.serverPid = existing.record?.pid ?? null;
+          this.serverStartTime = existing.record?.startTime ?? null;
+          // Keep the expectation: an app-owned fallback only borrows the port
+          // until the distribution boots again, when the owner's launcher is
+          // expected to serve it. The miss counter drops it after three absences.
+          this.setState('CONNECTING', null);
+          const authenticated = await this.tryExistingSession();
+          if (authenticated) {
+            await this.finishReady();
+            return;
+          }
+          this.deps.log.warn('owned backend rejected the stored session cookie; restarting it');
+          await this.stopOwnedServer();
+          reassessed = await this.deps.probePort(config.port);
+          if (reassessed === 'occupied') {
+            throw new ShellError(
+              'port-collision',
+              `Port ${config.port} is still in use after stopping the app-owned backend.`,
+              'Check the port with "ss -ltnp" inside WSL and pick another port in Settings.',
+            );
+          }
         }
       }
 
-      if (portState !== 'occupied' && this.externalExpected) {
+      if (!startOwn && portState !== 'occupied' && this.externalExpected) {
         // This profile has attached to an external backend before, so the port
         // belongs to its launcher, not to this app. Wait for it instead of
         // starting a second backend that would fight it for the port and leave
@@ -871,7 +879,7 @@ export class Supervisor {
         }
       }
 
-      if (portState !== 'occupied' && !this.externalExpected) {
+      if (!startOwn && portState !== 'occupied' && !this.externalExpected) {
         // First launch on a machine whose backend is started elsewhere (for
         // example a systemd unit that is still coming up after the same WSL
         // boot). Give that launcher a short head start before taking the port:
@@ -1201,12 +1209,18 @@ export class Supervisor {
    * but fails the checks is reported as a collision instead of being ignored.
    */
   private async discoverExternal(nodePath: string | null): Promise<boolean> {
-    const graceMs = this.deps.discoveryGraceMs ?? 5_000;
+    const graceMs = this.deps.discoveryGraceMs ?? 0;
     if (graceMs <= 0) return false;
     const pollMs = Math.max(1, this.deps.discoveryPollMs ?? 500);
-    const polls = Math.max(1, Math.ceil(graceMs / pollMs));
-    let notReady = false;
-    for (let attempt = 0; attempt <= polls; attempt += 1) {
+    // The attempt cap keeps the loop bounded even when the clock does not move
+    // (test doubles with an instant sleep), the deadline keeps it inside the
+    // window when it does.
+    const maxAttempts = Math.max(1, Math.ceil(graceMs / pollMs));
+    // The deadline covers the attach attempts too: a verified backend that is
+    // still starting already spends about a second per attempt in its session
+    // check, so counting sleeps alone would overrun the window.
+    const deadline = this.deps.now() + graceMs;
+    for (let attempt = 0; ; attempt += 1) {
       if (this.quitting) return false;
       if (attempt === 0) this.deps.log.info(`cold start: waiting ${graceMs} ms for a backend started outside this app`);
       const state = await this.deps.probePort(this.port());
@@ -1226,19 +1240,22 @@ export class Supervisor {
         // A verified DSH backend that cannot answer the session check yet is
         // most likely still starting: keep the window open instead of starting
         // a competitor over it.
-        notReady = true;
       }
-      if (attempt === polls) break;
-      await this.deps.sleep(pollMs);
+      const remaining = deadline - this.deps.now();
+      if (remaining <= 0 || attempt >= maxAttempts) {
+        // A listener that is only verified but never ready is not a stranger,
+        // so it must not be raced for the port.
+        if (state === 'occupied') {
+          throw new ShellError(
+            'port-collision',
+            `Port ${this.port()} is already in use by a service this app does not own.`,
+            'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.',
+          );
+        }
+        return false;
+      }
+      await this.deps.sleep(Math.min(pollMs, remaining));
     }
-    if (notReady) {
-      throw new ShellError(
-        'port-collision',
-        `Port ${this.port()} is already in use by a service this app does not own.`,
-        'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.',
-      );
-    }
-    return false;
   }
 
   /**
@@ -1248,13 +1265,16 @@ export class Supervisor {
    * the ownership or session checks.
    */
   private async awaitExternal(nodePath: string | null): Promise<'attached' | 'absent' | 'rejected'> {
+    const waitMs = this.attachWaitMs();
     const pollMs = this.attachPollMs();
-    const polls = Math.max(1, Math.ceil(this.attachWaitMs() / pollMs));
-    this.deps.log.info(`waiting up to ${this.attachWaitMs()} ms for the backend started outside this app`);
-    let notReady = false;
-    for (let attempt = 0; attempt <= polls; attempt += 1) {
+    const maxAttempts = Math.max(1, Math.ceil(waitMs / pollMs));
+    const deadline = this.deps.now() + waitMs;
+    this.deps.log.info(`waiting up to ${waitMs} ms for the backend started outside this app`);
+    for (let attempt = 0; ; attempt += 1) {
       if (this.quitting) return 'absent';
-      if (attempt > 0) this.setState('CONNECTING', 'Waiting for the DeepSeek Harness started outside this app');
+      if (attempt > 0 && this.lifecycle.state !== 'CONNECTING') {
+        this.setState('CONNECTING', 'Waiting for the DeepSeek Harness started outside this app');
+      }
       const state = await this.deps.probePort(this.port());
       if (state === 'occupied') {
         const attach = await this.tryAttachExternal(nodePath);
@@ -1263,16 +1283,17 @@ export class Supervisor {
           this.deps.log.warn(`the listener on port ${this.port()} is not this profile's backend`);
           return 'rejected';
         }
-        notReady = true;
       }
-      if (attempt === polls) break;
-      await this.deps.sleep(pollMs);
+      const remaining = deadline - this.deps.now();
+      if (remaining <= 0 || attempt >= maxAttempts) {
+        if (state === 'occupied') {
+          this.deps.log.warn(`the backend on port ${this.port()} never accepted this profile's session`);
+          return 'rejected';
+        }
+        return 'absent';
+      }
+      await this.deps.sleep(Math.min(pollMs, remaining));
     }
-    if (notReady) {
-      this.deps.log.warn(`the backend on port ${this.port()} never accepted this profile's session`);
-      return 'rejected';
-    }
-    return 'absent';
   }
 
   /**

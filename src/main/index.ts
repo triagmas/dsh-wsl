@@ -470,6 +470,10 @@ async function bootstrap(): Promise<void> {
     web,
     registry,
     external,
+    // A cold start gives a backend the owner runs outside this app a short head
+    // start before the app takes the port for its own backend.
+    discoveryGraceMs: 5_000,
+    discoveryPollMs: 500,
     log,
     probePort,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),

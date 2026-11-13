@@ -731,6 +731,22 @@ describe('external expectation edge cases from review', () => {
     expect(harness.wsl.starts).toHaveLength(0);
   });
 
+  it('starts an app-owned backend when the listener leaves during the wait', async () => {
+    let probes = 0;
+    const harness = createHarness({
+      portState: () => (probes++ < 1 ? 'occupied' : 'free'),
+      attachWaitMs: 20,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(1);
+    expect(lastStatus(harness.statuses).externalBackend).toBe(false);
+  });
+
   it('keeps waiting for a verified backend that cannot answer the session check yet', async () => {
     const external = createMemoryExternalStore({ distro: 'Ubuntu', port: PORT, recordedAt: '2026-01-01T00:00:00.000Z' });
     let healthCalls = 0;
