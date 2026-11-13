@@ -16,6 +16,7 @@ import type { ProcessProbe } from '../src/main/wsl/output.js';
 import type { SharedInstallObservation } from '../src/main/core/update.js';
 import type { DshInstallation, SharedDshReport } from '../src/main/core/dsh-locate.js';
 import type { WebClient } from '../src/main/core/supervisor.js';
+import { createMemoryExternalStore } from '../src/main/core/external.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
 import { createNullLogger } from '../src/main/core/logger.js';
 import { DEFAULT_CONFIG, type AppConfig, type ShellStatus } from '../src/shared/types.js';
@@ -345,6 +346,12 @@ export interface HarnessOptions {
   web?: { bootstrapStatus?: number; health?: () => number };
   portState?: PortState | (() => PortState);
   registry?: ReturnType<typeof createMemoryRegistry>;
+  external?: ReturnType<typeof createMemoryExternalStore>;
+  /** Bounded wait for an expected external backend; tests keep it short. */
+  attachWaitMs?: number;
+  attachPollMs?: number;
+  discoveryGraceMs?: number;
+  discoveryPollMs?: number;
 }
 
 export function createHarness(options: HarnessOptions = {}) {
@@ -353,12 +360,14 @@ export function createHarness(options: HarnessOptions = {}) {
   const wsl = new FakeWsl(options.wsl);
   const web = new FakeWeb(options.web);
   const registry = options.registry ?? createMemoryRegistry();
+  const external = options.external ?? createMemoryExternalStore();
   const probeCalls: number[] = [];
   return {
     config,
     wsl,
     web,
     registry,
+    external,
     statuses,
     probeCalls,
     deps: {
@@ -366,6 +375,7 @@ export function createHarness(options: HarnessOptions = {}) {
       wsl,
       web,
       registry,
+      external,
       log: createNullLogger(),
       probePort: async (port: number) => {
         probeCalls.push(port);
@@ -380,6 +390,10 @@ export function createHarness(options: HarnessOptions = {}) {
       startupTimeoutMs: 2_000,
       healthAttempts: 2,
       stopGraceMs: 0,
+      attachWaitMs: options.attachWaitMs ?? 20,
+      attachPollMs: options.attachPollMs ?? 5,
+      discoveryGraceMs: options.discoveryGraceMs ?? 0,
+      discoveryPollMs: options.discoveryPollMs ?? 5,
     },
   };
 }

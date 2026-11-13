@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { Supervisor } from '../src/main/core/supervisor.js';
 import type { ServerHandle, StartServerRequest, WslGateway, WebClient } from '../src/main/core/supervisor.js';
+import { createMemoryExternalStore } from '../src/main/core/external.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
 import {
   BACKEND_PID,
@@ -150,6 +151,7 @@ function createCrashHarness(options: { config?: Partial<AppConfig>; portState?: 
       wsl: wsl as unknown as WslGateway,
       web: web as unknown as WebClient,
       registry,
+      external: createMemoryExternalStore(),
       log: logger.log,
       probePort: async () => options.portState ?? 'free',
       sleep: async () => undefined,
@@ -160,6 +162,8 @@ function createCrashHarness(options: { config?: Partial<AppConfig>; portState?: 
       startupTimeoutMs: 2_000,
       healthAttempts: 2,
       stopGraceMs: 0,
+      attachWaitMs: 20,
+      attachPollMs: 5,
     },
   };
 }

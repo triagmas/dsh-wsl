@@ -9,6 +9,7 @@ import { LOOPBACK_HOST } from '../../shared/types.js';
 import { parseStartupLine, buildOrigin } from '../backend/urls.js';
 import type { ProcessProbe } from '../wsl/output.js';
 import type { Logger } from './logger.js';
+import type { ExternalBackendStore } from './external.js';
 import type { RegistryStore } from './registry.js';
 import { Lifecycle, backoffDelay } from './lifecycle.js';
 import { verifyOwnership, type OwnedServerRecord } from './ownership.js';
@@ -231,6 +232,11 @@ export interface SupervisorDeps {
   wsl: WslGateway;
   web: WebClient;
   registry: RegistryStore;
+  /**
+   * Remembers that the fixed port is served by a backend the owner started, so
+   * a later launch waits for it instead of spawning a competitor.
+   */
+  external: ExternalBackendStore;
   log: Logger;
   probePort(port: number): Promise<PortState>;
   sleep(ms: number): Promise<void>;
@@ -241,6 +247,14 @@ export interface SupervisorDeps {
   startupTimeoutMs?: number;
   healthAttempts?: number;
   stopGraceMs?: number;
+  /** Bounded wait for an expected external backend before giving up. */
+  attachWaitMs?: number;
+  /** Poll interval used while waiting for that backend. */
+  attachPollMs?: number;
+  /** Cold-start head start for a launcher this profile has not attached to yet. */
+  discoveryGraceMs?: number;
+  /** Poll interval used during that discovery window. */
+  discoveryPollMs?: number;
 }
 
 export type ShellErrorCode =
@@ -304,6 +318,13 @@ export class Supervisor {
    * example a systemd unit). Such a process is never signalled or restarted.
    */
   private attached = false;
+  /**
+   * The profile expects this port to be served by a backend the owner started
+   * (a previous attach succeeded). While true the app waits for that backend
+   * first and starts its own only when it does not appear, so it never races the
+   * owner's launcher for the fixed port (the boot race seen after beta.5).
+   */
+  private externalExpected = false;
   private failures = 0;
   private attempt = 0;
   private recoveryRunning = false;
@@ -445,17 +466,24 @@ export class Supervisor {
     });
   }
 
-  /** Tray "Restart WebUI": always restarts the app-owned backend. */
+  /** Tray "Restart WebUI": restarts the app-owned backend, or takes the port back. */
   restart(): Promise<void> {
     return this.serial(async () => {
       if (this.quitting || this.refuseDuringUpdate('restart')) return;
       if (!this.owned) {
-        this.setDetail(
-          this.attached
-            ? 'The backend runs outside this app; restart it with its own service.'
-            : 'Only the backend started by this app can be restarted.',
-        );
-        return;
+        if (this.attached) {
+          this.setDetail('The backend runs outside this app; restart it with its own service.');
+          return;
+        }
+        if (!this.externalExpected) {
+          this.setDetail('Only the backend started by this app can be restarted.');
+          return;
+        }
+        // Explicit owner intent: the port belongs to a backend the owner runs,
+        // and they asked the app to serve it instead. Drop the expectation, then
+        // start an app-owned backend.
+        this.deps.log.info('restart: the owner asked the app to take the port; dropping the external expectation');
+        this.clearExternalExpectation();
       }
       this.attempt = 0;
       this.setState('RECOVERING', 'Restarting DeepSeek Harness');
@@ -647,18 +675,12 @@ export class Supervisor {
   private async handleLoss(reason: string): Promise<void> {
     if (this.recoveryRunning || this.recoveryScheduled || this.quitting || this.updateLocked) return;
     if (this.attached) {
-      // Recovery means spawning a replacement, which would fight the owner's own
-      // launcher for the port. Report the loss and let Retry re-attach instead.
+      // The backend belongs to its own launcher, so the app must not signal or
+      // stop it. Normal recovery is safe here: it re-attaches to that backend
+      // when its launcher brings it back, and only starts an app-owned one when
+      // it really is gone (see bringUp and the external expectation).
       this.attached = false;
-      this.deps.log.warn(`attached backend lost (${reason}); recovery is left to its own launcher`);
-      this.fail(
-        new ShellError(
-          'backend-lost',
-          'The DeepSeek Harness backend started outside this app is not reachable.',
-          'Start it again (for example its systemd unit) and press Retry. The app never starts a competing backend on this port.',
-        ),
-      );
-      return;
+      this.deps.log.warn(`attached backend lost (${reason}); recovery re-attaches or starts an app-owned backend`);
     }
     if (this.startInFlight) {
       this.deps.log.debug(`recovery skipped (${reason}): a start is in flight and owns the outcome`);
@@ -733,6 +755,7 @@ export class Supervisor {
       this.activePort = config.port;
       this.activeDistro = config.distro;
       this.attached = false;
+      this.externalExpected = this.expectExternalBackend();
       this.setState('CHECKING', null);
       this.failures = 0;
 
@@ -768,6 +791,7 @@ export class Supervisor {
 
       const portState = await this.deps.probePort(config.port);
       let reassessed = portState;
+      let startOwn = false;
       if (portState === 'occupied') {
         const existing = await this.verifyRecordedServer();
         const situation = classifyPortSituation(portState, existing.verdict);
@@ -776,38 +800,99 @@ export class Supervisor {
           // an inconclusive probe here is not evidence that it is stale. Keep
           // it so a transient probe failure cannot permanently orphan a live
           // backend the way beta.4 did.
-          const attach = await this.tryAttachExternal(runtime.nodePath);
-          if (attach === 'attached') {
+          // A verified DSH backend that is still starting answers the port
+          // before it accepts this profile's session, so the attach gets the
+          // same bounded window as a launcher that has yet to appear.
+          const outcome = await this.awaitExternal(runtime.nodePath);
+          if (outcome === 'attached') {
             await this.finishReady();
             return;
           }
-          throw new ShellError(
-            'port-collision',
-            `Port ${config.port} is already in use by a service this app does not own.`,
-            attach === 'no-session'
-              ? 'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.'
-              : 'Close the other service or choose another port in Settings. The app never connects to unknown listeners.',
-          );
+          if (outcome === 'rejected') {
+            throw new ShellError(
+              'port-collision',
+              `Port ${config.port} is already in use by a service this app does not own.`,
+              'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.',
+            );
+          }
+          // The listener exited while it was being waited for: the port is free
+          // again, so serve the WebUI with an app-owned backend instead of
+          // reporting a collision with a service that is gone.
+          if (this.quitting) return;
+          this.deps.log.warn(`the listener on port ${config.port} left while waiting for it; starting an app-owned backend`);
+          startOwn = true;
         }
-        this.deps.log.info('reusing app-owned backend');
-        this.owned = true;
-        this.serverPid = existing.record?.pid ?? null;
-        this.serverStartTime = existing.record?.startTime ?? null;
-        this.setState('CONNECTING', null);
-        const authenticated = await this.tryExistingSession();
-        if (authenticated) {
+        if (!startOwn) {
+          this.deps.log.info('reusing app-owned backend');
+          this.owned = true;
+          this.serverPid = existing.record?.pid ?? null;
+          this.serverStartTime = existing.record?.startTime ?? null;
+          // Keep the expectation: an app-owned fallback only borrows the port
+          // until the distribution boots again, when the owner's launcher is
+          // expected to serve it. The miss counter drops it after three absences.
+          this.setState('CONNECTING', null);
+          const authenticated = await this.tryExistingSession();
+          if (authenticated) {
+            await this.finishReady();
+            return;
+          }
+          this.deps.log.warn('owned backend rejected the stored session cookie; restarting it');
+          await this.stopOwnedServer();
+          reassessed = await this.deps.probePort(config.port);
+          if (reassessed === 'occupied') {
+            throw new ShellError(
+              'port-collision',
+              `Port ${config.port} is still in use after stopping the app-owned backend.`,
+              'Check the port with "ss -ltnp" inside WSL and pick another port in Settings.',
+            );
+          }
+        }
+      }
+
+      if (!startOwn && portState !== 'occupied' && this.externalExpected) {
+        // This profile has attached to an external backend before, so the port
+        // belongs to its launcher, not to this app. Wait for it instead of
+        // starting a second backend that would fight it for the port and leave
+        // the owner's unit in a permanent restart loop.
+        const outcome = await this.awaitExternal(runtime.nodePath);
+        if (outcome === 'attached') {
           await this.finishReady();
           return;
         }
-        this.deps.log.warn('owned backend rejected the stored session cookie; restarting it');
-        await this.stopOwnedServer();
-        reassessed = await this.deps.probePort(config.port);
-        if (reassessed === 'occupied') {
+        if (outcome === 'rejected') {
           throw new ShellError(
             'port-collision',
-            `Port ${config.port} is still in use after stopping the app-owned backend.`,
-            'Check the port with "ss -ltnp" inside WSL and pick another port in Settings.',
+            `Port ${config.port} is already in use by a service this app does not own.`,
+            'The backend this profile used to attach to is no longer answering, and something else holds the port now. Close it or choose another port in Settings. The app never connects to unknown listeners.',
           );
+        }
+        // A wait that was canceled by quitting did not learn anything about the
+        // launcher, so it must not count as a miss or drop the expectation.
+        if (this.quitting) return;
+        // The backend the owner usually runs is not there right now. The app
+        // still has to serve the WebUI, so it starts its own backend, exactly as
+        // it would on a machine without one. Repeated misses drop the
+        // expectation so a removed launcher cannot cost a wait on every boot.
+        const misses = (this.deps.external.read()?.misses ?? 0) + 1;
+        if (misses >= 3) {
+          this.deps.log.warn('no external backend appeared in three starts; dropping the expectation');
+          this.clearExternalExpectation();
+        } else {
+          this.deps.log.warn(`no external backend appeared; starting an app-owned one (miss ${misses} of 3)`);
+          this.recordExternalExpectation(misses);
+        }
+      }
+
+      if (!startOwn && portState !== 'occupied' && !this.externalExpected) {
+        // First launch on a machine whose backend is started elsewhere (for
+        // example a systemd unit that is still coming up after the same WSL
+        // boot). Give that launcher a short head start before taking the port:
+        // the cost is a few seconds on a cold start, the benefit is that the
+        // app and the owner's unit never race for the port again.
+        const discovered = await this.discoverExternal(runtime.nodePath);
+        if (discovered) {
+          await this.finishReady();
+          return;
         }
       }
 
@@ -1077,6 +1162,144 @@ export class Supervisor {
     throw new ShellError('health-failed', 'The WebUI did not answer over loopback.', 'Check the log and whether another process holds the port.');
   }
 
+  private attachWaitMs(): number {
+    return this.deps.attachWaitMs ?? 20_000;
+  }
+
+  private attachPollMs(): number {
+    return Math.max(1, this.deps.attachPollMs ?? 1_000);
+  }
+
+  /**
+   * Does this profile expect the fixed port to belong to a backend the owner
+   * runs? A record written for another distribution or port describes old user
+   * intent and is dropped instead of blocking the current settings.
+   */
+  private expectExternalBackend(): boolean {
+    const record = this.deps.external.read();
+    if (record === null) return false;
+    if (record.distro !== this.distro() || record.port !== this.port()) {
+      this.deps.log.debug('dropping an external-backend expectation written for other settings');
+      this.deps.external.clear();
+      return false;
+    }
+    return true;
+  }
+
+  private recordExternalExpectation(misses = 0): void {
+    try {
+      this.deps.external.write({
+        distro: this.distro(),
+        port: this.port(),
+        recordedAt: new Date(this.deps.now()).toISOString(),
+        ...(misses > 0 ? { misses } : {}),
+      });
+    } catch (error) {
+      // A read-only or full profile must not turn a verified attach into a
+      // failure, nor stop the fallback backend from starting.
+      this.deps.log.warn(`could not record the external-backend expectation: ${describe(error)}`);
+    }
+  }
+
+  private clearExternalExpectation(): void {
+    this.externalExpected = false;
+    this.deps.external.clear();
+  }
+
+  /**
+   * Short cold-start discovery: is a verified external backend about to take
+   * the free port? Attaches when one appears within the grace window and
+   * returns `false` when the app should start its own. A listener that answers
+   * but fails the checks is reported as a collision instead of being ignored.
+   */
+  private async discoverExternal(nodePath: string | null): Promise<boolean> {
+    const graceMs = this.deps.discoveryGraceMs ?? 0;
+    if (graceMs <= 0) return false;
+    const pollMs = Math.max(1, this.deps.discoveryPollMs ?? 500);
+    // The attempt cap keeps the loop bounded even when the clock does not move
+    // (test doubles with an instant sleep), the deadline keeps it inside the
+    // window when it does.
+    const maxAttempts = Math.max(1, Math.ceil(graceMs / pollMs));
+    // The deadline covers the attach attempts too: a verified backend that is
+    // still starting already spends about a second per attempt in its session
+    // check, so counting sleeps alone would overrun the window.
+    const deadline = this.deps.now() + graceMs;
+    for (let attempt = 0; ; attempt += 1) {
+      if (this.quitting) return false;
+      if (attempt === 0) this.deps.log.info(`cold start: waiting ${graceMs} ms for a backend started outside this app`);
+      const state = await this.deps.probePort(this.port());
+      if (state === 'occupied') {
+        const attach = await this.tryAttachExternal(nodePath);
+        if (attach === 'attached') {
+          this.deps.log.info('attached to the backend that started during the cold-start window');
+          return true;
+        }
+        if (attach === 'not-ours') {
+          throw new ShellError(
+            'port-collision',
+            `Port ${this.port()} is already in use by a service this app does not own.`,
+            'Close the other service or choose another port in Settings. The app never connects to unknown listeners.',
+          );
+        }
+        // A verified DSH backend that cannot answer the session check yet is
+        // most likely still starting: keep the window open instead of starting
+        // a competitor over it.
+      }
+      const remaining = deadline - this.deps.now();
+      if (remaining <= 0 || attempt >= maxAttempts) {
+        // A listener that is only verified but never ready is not a stranger,
+        // so it must not be raced for the port.
+        if (state === 'occupied') {
+          throw new ShellError(
+            'port-collision',
+            `Port ${this.port()} is already in use by a service this app does not own.`,
+            'A DSH backend started outside this app holds the port, and this app profile has never authenticated against it, so it cannot be trusted yet. Stop it and let the app start its own backend, or choose another port in Settings.',
+          );
+        }
+        return false;
+      }
+      await this.deps.sleep(Math.min(pollMs, remaining));
+    }
+  }
+
+  /**
+   * Wait, bounded, for the backend the owner started on the fixed port and
+   * attach to it. Never spawns a replacement: `absent` means nothing took the
+   * port in the wait window, `rejected` means a listener answered but failed
+   * the ownership or session checks.
+   */
+  private async awaitExternal(nodePath: string | null): Promise<'attached' | 'absent' | 'rejected'> {
+    const waitMs = this.attachWaitMs();
+    const pollMs = this.attachPollMs();
+    const maxAttempts = Math.max(1, Math.ceil(waitMs / pollMs));
+    const deadline = this.deps.now() + waitMs;
+    this.deps.log.info(`waiting up to ${waitMs} ms for the backend started outside this app`);
+    for (let attempt = 0; ; attempt += 1) {
+      if (this.quitting) return 'absent';
+      if (attempt > 0 && this.lifecycle.state !== 'CONNECTING') {
+        this.setState('CONNECTING', 'Waiting for the DeepSeek Harness started outside this app');
+      }
+      const state = await this.deps.probePort(this.port());
+      if (state === 'occupied') {
+        const attach = await this.tryAttachExternal(nodePath);
+        if (attach === 'attached') return 'attached';
+        if (attach === 'not-ours') {
+          this.deps.log.warn(`the listener on port ${this.port()} is not this profile's backend`);
+          return 'rejected';
+        }
+      }
+      const remaining = deadline - this.deps.now();
+      if (remaining <= 0 || attempt >= maxAttempts) {
+        if (state === 'occupied') {
+          this.deps.log.warn(`the backend on port ${this.port()} never accepted this profile's session`);
+          return 'rejected';
+        }
+        return 'absent';
+      }
+      await this.deps.sleep(Math.min(pollMs, remaining));
+    }
+  }
+
   /**
    * Connect to a DSH backend the app does not own.
    *
@@ -1107,6 +1330,8 @@ export class Supervisor {
       this.owned = false;
       this.serverPid = null;
       this.serverStartTime = null;
+      this.externalExpected = true;
+      this.recordExternalExpectation();
       this.deps.log.info(`attached to the running backend (pid=${pid}); it stays outside the app lifecycle`);
       return 'attached';
     } catch (error) {

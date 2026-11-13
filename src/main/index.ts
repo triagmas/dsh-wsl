@@ -37,6 +37,7 @@ import { createLogger } from './core/logger.js';
 import { isNewer } from './core/versions.js';
 import { parsePopoverAnchor } from './core/footer.js';
 import { probePort } from './core/port.js';
+import { createFileExternalStore } from './core/external.js';
 import { createFileRegistry } from './core/registry.js';
 import { ShellError, Supervisor } from './core/supervisor.js';
 import { buildOrigin } from './backend/urls.js';
@@ -237,6 +238,7 @@ async function bootstrap(): Promise<void> {
   const configStore = createConfigStore(join(userData, 'config.json'));
   let config: AppConfig = configStore.load();
   const registry = createFileRegistry(join(userData, 'owned-server.json'));
+  const external = createFileExternalStore(join(userData, 'external-backend.json'));
   const rendererDir = join(__dirname, '..');
   const preloadDir = join(__dirname, '..', 'preload');
 
@@ -467,6 +469,11 @@ async function bootstrap(): Promise<void> {
     wsl,
     web,
     registry,
+    external,
+    // A cold start gives a backend the owner runs outside this app a short head
+    // start before the app takes the port for its own backend.
+    discoveryGraceMs: 5_000,
+    discoveryPollMs: 500,
     log,
     probePort,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
