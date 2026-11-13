@@ -549,21 +549,26 @@ describe('external backend expectation (boot race)', () => {
     expect(harness.registry.read()).toBeNull();
   });
 
-  it('starts its own backend when the expected backend does not appear, and counts the miss', async () => {
+  it('serves beside the reserved port when the expected backend does not appear, and counts the miss', async () => {
     const external = createMemoryExternalStore(expectation());
     const harness = createHarness({ portState: 'free', external, attachWaitMs: 30, attachPollMs: 5 });
     const supervisor = new Supervisor(harness.deps);
 
     await supervisor.start();
 
-    // The WebUI has to be served even when the owner's launcher is down.
+    // The WebUI has to be served even when the owner's launcher is down, but the
+    // launcher's port stays free for it: a competitor there would put its unit
+    // into a permanent EADDRINUSE restart loop.
     expect(supervisor.state).toBe('READY');
     expect(harness.wsl.starts).toHaveLength(1);
+    expect(harness.wsl.starts[0]?.port).toBe(PORT + 1);
+    expect(lastStatus(harness.statuses).port).toBe(PORT + 1);
     expect(lastStatus(harness.statuses).externalBackend).toBe(false);
     expect(external.read()?.misses).toBe(1);
+    expect(external.read()?.port).toBe(PORT);
   });
 
-  it('drops the expectation after three misses instead of waiting forever', async () => {
+  it('keeps the port reserved after three misses and skips the wait', async () => {
     const external = createMemoryExternalStore({ ...expectation(), misses: 2 });
     const harness = createHarness({ portState: 'free', external, attachWaitMs: 30, attachPollMs: 5 });
     const supervisor = new Supervisor(harness.deps);
@@ -572,7 +577,92 @@ describe('external backend expectation (boot race)', () => {
 
     expect(supervisor.state).toBe('READY');
     expect(harness.wsl.starts).toHaveLength(1);
-    expect(external.read()).toBeNull();
+    // The expectation survives: only an explicit "take the port" action gives it
+    // up, and the port stays reserved for the launcher on every later start.
+    expect(external.read()?.misses).toBe(3);
+    expect(external.read()?.port).toBe(PORT);
+    expect(harness.wsl.starts[0]?.port).toBe(PORT + 1);
+  });
+
+  it('hands the reserved port back once the launcher answers, and keeps WSL open after', async () => {
+    const EXTERNAL_PID = 4711;
+    let launcherUp = false;
+    const external = createMemoryExternalStore(expectation());
+    const harness = createHarness({
+      portState: (port: number) => (port === PORT && launcherUp ? 'occupied' : 'free'),
+      wsl: {
+        portOwner: (port: number) => (port === PORT && launcherUp ? EXTERNAL_PID : null),
+        probe: (pid: number) => {
+          if (pid === EXTERNAL_PID) return backendProbe({ port: PORT });
+          if (pid === BACKEND_PID) return backendProbe({ port: PORT + 1 });
+          return null;
+        },
+      },
+      external,
+      attachWaitMs: 30,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    expect(harness.wsl.starts[0]?.port).toBe(PORT + 1);
+
+    // The owner's launcher binds its own port again.
+    launcherUp = true;
+    await supervisor.healthTick();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(lastStatus(harness.statuses).port).toBe(PORT);
+    // The fallback backend is stopped, never the launcher's process.
+    expect(harness.wsl.signals.length).toBeGreaterThan(0);
+    expect(harness.wsl.signals.every((sent) => sent.pid === BACKEND_PID)).toBe(true);
+    // WSL2 powers a distribution off without a client; the attached mode has to
+    // keep one, or the owner's backend dies about ten seconds later.
+    expect(harness.wsl.keepalives).toEqual(['Ubuntu']);
+  });
+
+  it('keeps serving beside the reserved port when the launcher rejects this profile', async () => {
+    const EXTERNAL_PID = 4711;
+    let launcherUp = false;
+    const harness = createHarness({
+      portState: (port: number) => (port === PORT && launcherUp ? 'occupied' : 'free'),
+      wsl: {
+        portOwner: (port: number) => (port === PORT && launcherUp ? EXTERNAL_PID : null),
+        probe: (pid: number) => {
+          if (pid === EXTERNAL_PID) return backendProbe({ port: PORT });
+          if (pid === BACKEND_PID) return backendProbe({ port: PORT + 1 });
+          return null;
+        },
+      },
+      // The launcher answers the port but not this profile's session.
+      web: { health: (origin: string) => (origin.endsWith(`:${PORT}`) ? 401 : 200) },
+      external: createMemoryExternalStore(expectation()),
+      attachWaitMs: 30,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+
+    launcherUp = true;
+    await supervisor.healthTick();
+
+    // Handing the port to a backend that would not serve this profile would
+    // leave the owner with nothing, so the app keeps its own backend.
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(false);
+    expect(lastStatus(harness.statuses).port).toBe(PORT + 1);
+    expect(harness.wsl.signals).toHaveLength(0);
+    expect(harness.wsl.keepalives).toEqual([]);
+  });
+
+  it('does not keep a distribution open for a backend it owns', async () => {
+    const harness = createHarness({ portState: 'free', attachWaitMs: 30, attachPollMs: 5 });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.keepalives).toEqual([]);
   });
 
   it('re-attaches by itself when the external backend comes back', async () => {

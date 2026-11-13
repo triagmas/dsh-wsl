@@ -18,6 +18,7 @@ import type { Logger } from '../core/logger.js';
 import type { ProcessProbe } from './output.js';
 import { parseDshVersion } from '../core/versions.js';
 import { backupFailureDetail } from '../core/update.js';
+import { describeError } from '../core/diagnostics.js';
 import {
   decodeWslOutput,
   LineBuffer,
@@ -34,7 +35,9 @@ import {
   buildDshVersionArgs,
   buildListDistrosArgs,
   buildPrepareIsolationArgs,
+  buildFindKeepaliveArgs,
   buildFindPortOwnerArgs,
+  buildKeepaliveArgs,
   buildProbeProcessArgs,
   buildResolveRuntimeArgs,
   buildSignalArgs,
@@ -764,6 +767,35 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       if (result.code !== 0) return null;
       const pid = Number(result.stdout.trim());
       return Number.isInteger(pid) && pid > 1 ? pid : null;
+    },
+
+    async ensureKeepalive(distro: string, nodePath: string | null): Promise<number | null> {
+      if (nodePath !== null) {
+        try {
+          const found = await run(buildFindKeepaliveArgs(distro, nodePath), 10_000);
+          const pid = Number(found.stdout.trim());
+          if (found.code === 0 && Number.isInteger(pid) && pid > 1) {
+            options.log.debug(`distribution keepalive already running (pid=${pid})`);
+            return pid;
+          }
+        } catch {
+          // An unusable runtime must not stop the keepalive: the session below
+          // is the part that matters, and a duplicate one is harmless.
+        }
+      }
+      try {
+        const child = spawnImpl(wslExe, buildKeepaliveArgs(distro), {
+          windowsHide: true,
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.unref();
+        options.log.info('holding the WSL distribution open while its backend runs outside the app');
+        return child.pid ?? null;
+      } catch (error) {
+        options.log.warn(`could not hold the distribution open: ${describeError(error)}`);
+        return null;
+      }
     },
 
     async signal(distro, pid, signal) {
