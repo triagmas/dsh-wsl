@@ -683,6 +683,35 @@ describe('external backend expectation (boot race)', () => {
     expect(registry.read()).toBeNull();
   });
 
+  it('keeps the fallback record when its process cannot be probed', async () => {
+    const EXTERNAL_PID = 4711;
+    const fallback: OwnedServerRecord = { ...record, port: PORT + 1, pid: 9001, startTime: '777' };
+    const registry = createMemoryRegistry(fallback);
+    const harness = createHarness({
+      portState: (port: number) => (port === PORT ? 'occupied' : 'free'),
+      wsl: {
+        portOwner: (port: number) => (port === PORT ? EXTERNAL_PID : null),
+        probe: (pid: number) => {
+          if (pid === EXTERNAL_PID) return backendProbe({ port: PORT });
+          throw new Error('probe timed out');
+        },
+      },
+      registry,
+      external: createMemoryExternalStore(expectation()),
+      attachWaitMs: 30,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    // A failed probe is not evidence of a dead process: dropping the record
+    // would orphan a backend that may still be running as a second writer.
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(registry.read()).toMatchObject({ port: PORT + 1, pid: 9001 });
+  });
+
   it('stops its fallback backend with its own port before serving again', async () => {
     const harness = createHarness({
       portState: 'free',

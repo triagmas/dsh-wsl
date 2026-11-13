@@ -824,16 +824,29 @@ export class Supervisor {
         recorded.distro === config.distro &&
         isFallbackPort(recorded.port, config.port)
       ) {
-        const probe = await this.deps.wsl.probeProcess(config.distro, recorded.pid).catch(() => null);
-        const proof = verifyOwnership(probe, { port: recorded.port, startTime: recorded.startTime });
-        if (proof === 'owned') {
-          this.deps.log.info(`adopting the app-owned backend on fallback port ${recorded.port}`);
-          this.activePort = recorded.port;
-        } else {
-          this.deps.registry.clear();
-          this.deps.log.info(
-            `the app-owned backend on fallback port ${recorded.port} is gone; looking for the launcher on port ${config.port}`,
+        // `undefined` marks a probe that failed, which is not evidence of a dead
+        // process: the record is kept so a later start can still adopt it.
+        const probe = await this.deps.wsl.probeProcess(config.distro, recorded.pid).catch((error: unknown) => {
+          this.deps.log.warn(
+            `could not verify the backend on fallback port ${recorded.port}: ${describe(error)}`,
           );
+          return undefined;
+        });
+        if (probe === undefined) {
+          this.deps.log.info(
+            `serving on port ${config.port}; the app-owned backend on fallback port ${recorded.port} stays recorded for a later start`,
+          );
+        } else {
+          const proof = verifyOwnership(probe, { port: recorded.port, startTime: recorded.startTime });
+          if (proof === 'owned') {
+            this.deps.log.info(`adopting the app-owned backend on fallback port ${recorded.port}`);
+            this.activePort = recorded.port;
+          } else {
+            this.deps.registry.clear();
+            this.deps.log.info(
+              `the app-owned backend on fallback port ${recorded.port} is gone; looking for the launcher on port ${config.port}`,
+            );
+          }
         }
       }
 
@@ -1518,7 +1531,10 @@ export class Supervisor {
     const record = this.deps.registry.read();
     if (record === null) return { verdict: 'gone', record: null };
     if (record.distro !== this.distro() || record.port !== this.port()) {
-      this.deps.registry.clear();
+      // A record for a fallback port beside the configured one is not this
+      // port's proof, but it may still describe a live app-owned backend whose
+      // probe just failed. Start decides its fate and keeps or drops it.
+      if (!isFallbackPort(record.port, this.port())) this.deps.registry.clear();
       return { verdict: 'gone', record: null };
     }
     const probe = await this.deps.wsl.probeProcess(this.distro(), record.pid);
