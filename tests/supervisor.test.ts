@@ -676,3 +676,78 @@ describe('cold-start discovery of a backend the owner starts', () => {
     expect(harness.wsl.starts).toHaveLength(0);
   });
 });
+
+describe('external expectation edge cases from review', () => {
+  it('keeps the expectation while it reuses the app-owned fallback', async () => {
+    const external = createMemoryExternalStore({ distro: 'Ubuntu', port: PORT, recordedAt: '2026-01-01T00:00:00.000Z', misses: 1 });
+    const harness = createHarness({ portState: 'occupied', registry: createMemoryRegistry(record), external });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).ownedServer).toBe(true);
+    // The port is borrowed until the distribution boots again.
+    expect(external.read()?.misses).toBe(1);
+  });
+
+  it('attaches even when the profile cannot remember the expectation', async () => {
+    const failing = {
+      read: () => null,
+      write: () => {
+        throw new Error('EACCES: read-only profile');
+      },
+      clear: () => undefined,
+      path: () => '/tmp/external-backend.json',
+    };
+    const harness = createHarness({
+      portState: 'occupied',
+      external: failing,
+      wsl: { portOwner: 4711, probe: (pid: number) => (pid === 4711 ? backendProbe() : null) },
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(harness.wsl.starts).toHaveLength(0);
+  });
+
+  it('checks the port again on the last polling tick instead of sleeping it away', async () => {
+    let probes = 0;
+    const harness = createHarness({
+      portState: () => (probes++ <= 20 ? 'free' : 'occupied'),
+      wsl: { portOwner: 4711, probe: (pid: number) => (pid === 4711 ? backendProbe() : null) },
+      discoveryGraceMs: 100,
+      discoveryPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(harness.wsl.starts).toHaveLength(0);
+  });
+
+  it('keeps waiting for a verified backend that cannot answer the session check yet', async () => {
+    const external = createMemoryExternalStore({ distro: 'Ubuntu', port: PORT, recordedAt: '2026-01-01T00:00:00.000Z' });
+    let healthCalls = 0;
+    const harness = createHarness({
+      portState: 'occupied',
+      external,
+      wsl: { portOwner: 4711, probe: (pid: number) => (pid === 4711 ? backendProbe() : null) },
+      web: { health: () => (healthCalls++ < 3 ? 500 : 200) },
+      attachWaitMs: 100,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(harness.wsl.starts).toHaveLength(0);
+  });
+});
