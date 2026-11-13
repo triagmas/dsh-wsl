@@ -39,6 +39,7 @@ export const DEFAULT_INSTALLATION: DshInstallation = {
 };
 
 export const BACKEND_PID = 4242;
+export const KEEPALIVE_PID = 5151;
 export type PortState = 'free' | 'occupied';
 export const BACKEND_START_TIME = '918273';
 export const PORT = 3080;
@@ -297,13 +298,30 @@ export class FakeWsl implements WslGateway {
   async probeProcess(_distro: string, pid: number): Promise<ProcessProbe | null> {
     this.readAttempts += 1;
     if (this.options.probe !== undefined) return this.options.probe(pid);
-    return pid === BACKEND_PID ? backendProbe() : null;
+    // The command line of a backend this fake started carries the port it was
+    // started with: the app may serve beside a reserved port, and ownership is
+    // verified against the port in use.
+    return pid === BACKEND_PID ? backendProbe({ port: this.lastStartPort() }) : null;
+  }
+
+  /** Port of the most recent start request, or the fixed port before one. */
+  lastStartPort(): number {
+    const last = this.starts[this.starts.length - 1];
+    return last === undefined ? PORT : last.port;
   }
 
   async findPortOwner(_distro: string, port: number): Promise<number | null> {
     const owner = this.options.portOwner;
     if (typeof owner === 'function') return owner(port);
     return owner ?? null;
+  }
+
+  /** Sessions this fake was asked to keep alive, by distribution. */
+  readonly keepalives: string[] = [];
+
+  async ensureKeepalive(distro: string): Promise<number | null> {
+    this.keepalives.push(distro);
+    return KEEPALIVE_PID;
   }
 
   signalHook: ((pid: number, signal: 'TERM' | 'KILL') => void) | null = null;
@@ -325,7 +343,7 @@ export class FakeWeb implements WebClient {
   constructor(
     private readonly options: {
       bootstrapStatus?: number;
-      health?: () => number;
+      health?: (origin: string) => number;
     } = {},
   ) {}
 
@@ -334,17 +352,17 @@ export class FakeWeb implements WebClient {
     return this.options.bootstrapStatus ?? 200;
   }
 
-  async health(): Promise<number> {
+  async health(origin = ''): Promise<number> {
     this.healthCalls += 1;
-    return this.options.health === undefined ? 200 : this.options.health();
+    return this.options.health === undefined ? 200 : this.options.health(origin);
   }
 }
 
 export interface HarnessOptions {
   config?: Partial<AppConfig>;
   wsl?: FakeWslOptions;
-  web?: { bootstrapStatus?: number; health?: () => number };
-  portState?: PortState | (() => PortState);
+  web?: { bootstrapStatus?: number; health?: (origin: string) => number };
+  portState?: PortState | ((port: number) => PortState);
   registry?: ReturnType<typeof createMemoryRegistry>;
   external?: ReturnType<typeof createMemoryExternalStore>;
   /** Bounded wait for an expected external backend; tests keep it short. */
@@ -380,7 +398,7 @@ export function createHarness(options: HarnessOptions = {}) {
       probePort: async (port: number) => {
         probeCalls.push(port);
         const state = options.portState ?? 'free';
-        return typeof state === 'function' ? state() : state;
+        return typeof state === 'function' ? state(port) : state;
       },
       sleep: async (_ms: number) => undefined,
       now: () => Date.now(),

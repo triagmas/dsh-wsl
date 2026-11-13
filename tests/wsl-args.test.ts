@@ -7,7 +7,11 @@ import {
   SCRIPT_ARGV0,
   START_WRAPPER_SCRIPT,
   VERSION_PROBE_SCRIPT,
+  FIND_KEEPALIVE_SCRIPT,
+  KEEPALIVE_SLEEP_SECONDS,
   buildDshPathCheckArgs,
+  buildFindKeepaliveArgs,
+  buildKeepaliveArgs,
   buildDshVersionArgs,
   buildListDistrosArgs,
   buildProbeProcessArgs,
@@ -221,6 +225,49 @@ describe('installed version probe', () => {
       expect(parseDshVersion(fixed.stdout)).toBe('0.2.1-rc.5');
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('distribution keepalive', () => {
+  it('builds a keepalive session that is only a sleep, never a backend', () => {
+    expect(buildKeepaliveArgs('Ubuntu')).toEqual([
+      '-d',
+      'Ubuntu',
+      '--exec',
+      '/bin/sh',
+      '-c',
+      `exec sleep ${KEEPALIVE_SLEEP_SECONDS}`,
+    ]);
+    const find = buildFindKeepaliveArgs('Ubuntu', '/usr/bin/node');
+    expect(find).toContain(FIND_KEEPALIVE_SCRIPT);
+    expect(find.at(-1)).toBe(String(KEEPALIVE_SLEEP_SECONDS));
+  });
+
+  it('rejects an unusable runtime path for the lookup', () => {
+    expect(() => buildFindKeepaliveArgs('Ubuntu', 'node')).toThrow(ArgumentError);
+  });
+
+  // The finder reads /proc, so it can only be exercised on a Linux host.
+  const itLinux = it.skipIf(process.platform !== 'linux');
+
+  itLinux('finds the keepalive it started and ignores other idle sleeps', async () => {
+    const { spawn, spawnSync } = await import('node:child_process');
+    const marker = spawn('sleep', [String(KEEPALIVE_SLEEP_SECONDS)], { stdio: 'ignore' });
+    const decoy = spawn('sleep', ['123'], { stdio: 'ignore' });
+    try {
+      const found = spawnSync(process.execPath, ['-e', FIND_KEEPALIVE_SCRIPT, String(KEEPALIVE_SLEEP_SECONDS)], {
+        encoding: 'utf8',
+      });
+      expect(found.status).toBe(0);
+      expect(Number(found.stdout.trim())).toBe(marker.pid);
+
+      // The same script must not mistake another idle sleep for the keepalive.
+      const wrong = spawnSync(process.execPath, ['-e', FIND_KEEPALIVE_SCRIPT, '999'], { encoding: 'utf8' });
+      expect(wrong.status).toBe(3);
+    } finally {
+      marker.kill();
+      decoy.kill();
     }
   });
 });

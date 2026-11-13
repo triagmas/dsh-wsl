@@ -18,6 +18,17 @@ import { sanitizeOptional } from './display.js';
 import { buildIsolationPlan, isolationRootArg, resolveLaunchWorkspace, type IsolationPlan } from './isolation.js';
 import type { SharedDshReport } from './dsh-locate.js';
 
+/**
+ * How many ports above the configured one an app-owned backend may use while the
+ * configured port stays reserved for the backend the owner runs.
+ */
+const FALLBACK_PORT_WINDOW = 8;
+
+/** Is `port` one of the fallback ports that belong to `base`? */
+function isFallbackPort(port: number, base: number): boolean {
+  return Number.isInteger(port) && port > base && port <= base + FALLBACK_PORT_WINDOW && port <= 65535;
+}
+
 export interface ExitInfo {
   code: number | null;
   signal: string | null;
@@ -186,6 +197,15 @@ export interface WslGateway {
    * app did not start.
    */
   findPortOwner(distro: string, port: number, nodePath: string | null): Promise<number | null>;
+  /**
+   * Keep the distribution alive while a backend the app does not own is serving.
+   *
+   * Detached and left behind on quit on purpose: WSL2 powers a distribution off
+   * about ten seconds after its last client exits, so a session owned by this
+   * process would take the owner's backend down with the app. Returns the PID of
+   * the session in use, or `null` when none could be kept.
+   */
+  ensureKeepalive(distro: string, nodePath: string | null): Promise<number | null>;
   /** `dsh --version` of the selected executable; `null` when it cannot be read. */
   dshVersion(distro: string, dshPath: string, nodePath: string | null): Promise<string | null>;
   signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
@@ -325,6 +345,8 @@ export class Supervisor {
    * owner's launcher for the fixed port (the boot race seen after beta.5).
    */
   private externalExpected = false;
+  /** A hand-back to the launcher that just came up is in flight. */
+  private handBackRunning = false;
   private failures = 0;
   private attempt = 0;
   private recoveryRunning = false;
@@ -470,18 +492,18 @@ export class Supervisor {
   restart(): Promise<void> {
     return this.serial(async () => {
       if (this.quitting || this.refuseDuringUpdate('restart')) return;
-      if (!this.owned) {
-        if (this.attached) {
-          this.setDetail('The backend runs outside this app; restart it with its own service.');
-          return;
-        }
-        if (!this.externalExpected) {
-          this.setDetail('Only the backend started by this app can be restarted.');
-          return;
-        }
-        // Explicit owner intent: the port belongs to a backend the owner runs,
-        // and they asked the app to serve it instead. Drop the expectation, then
-        // start an app-owned backend.
+      if (this.attached) {
+        this.setDetail('The backend runs outside this app; restart it with its own service.');
+        return;
+      }
+      if (!this.owned && !this.externalExpected) {
+        this.setDetail('Only the backend started by this app can be restarted.');
+        return;
+      }
+      if (this.externalExpected) {
+        // Explicit owner intent: the port is reserved for a backend the owner
+        // runs, and they asked the app to serve it instead. Drop the reservation
+        // before restarting, whether or not a fallback backend is running now.
         this.deps.log.info('restart: the owner asked the app to take the port; dropping the external expectation');
         this.clearExternalExpectation();
       }
@@ -625,6 +647,7 @@ export class Supervisor {
     }
     if (code === 200) {
       this.failures = 0;
+      await this.maybeHandBack();
       return;
     }
     this.failures += 1;
@@ -789,7 +812,45 @@ export class Supervisor {
       this.runtime = { ...runtime, canonicalRoot: runtime.canonicalRoot ?? null };
       await this.refreshDshVersion(config.distro, runtime.dshPath, runtime.nodePath);
 
-      const portState = await this.deps.probePort(config.port);
+      // A backend this app started on a fallback port in an earlier run is
+      // adopted instead of orphaned: leaving it running would keep a second
+      // writer on the same DSH profile. The record alone is not enough - after a
+      // distribution restart the recorded PID is gone while the launcher may
+      // already serve its own port - so discovery only moves to the fallback
+      // port for a process that is still verifiably this app's backend.
+      const recorded = this.deps.registry.read();
+      if (
+        recorded !== null &&
+        recorded.distro === config.distro &&
+        isFallbackPort(recorded.port, config.port)
+      ) {
+        // `undefined` marks a probe that failed, which is not evidence of a dead
+        // process: the record is kept so a later start can still adopt it.
+        const probe = await this.deps.wsl.probeProcess(config.distro, recorded.pid).catch((error: unknown) => {
+          this.deps.log.warn(
+            `could not verify the backend on fallback port ${recorded.port}: ${describe(error)}`,
+          );
+          return undefined;
+        });
+        if (probe === undefined) {
+          this.deps.log.info(
+            `serving on port ${config.port}; the app-owned backend on fallback port ${recorded.port} stays recorded for a later start`,
+          );
+        } else {
+          const proof = verifyOwnership(probe, { port: recorded.port, startTime: recorded.startTime });
+          if (proof === 'owned') {
+            this.deps.log.info(`adopting the app-owned backend on fallback port ${recorded.port}`);
+            this.activePort = recorded.port;
+          } else {
+            this.deps.registry.clear();
+            this.deps.log.info(
+              `the app-owned backend on fallback port ${recorded.port} is gone; looking for the launcher on port ${config.port}`,
+            );
+          }
+        }
+      }
+
+      const portState = await this.deps.probePort(this.port());
       let reassessed = portState;
       let startOwn = false;
       if (portState === 'occupied') {
@@ -838,7 +899,7 @@ export class Supervisor {
           }
           this.deps.log.warn('owned backend rejected the stored session cookie; restarting it');
           await this.stopOwnedServer();
-          reassessed = await this.deps.probePort(config.port);
+          reassessed = await this.deps.probePort(this.port());
           if (reassessed === 'occupied') {
             throw new ShellError(
               'port-collision',
@@ -851,35 +912,36 @@ export class Supervisor {
 
       if (!startOwn && portState !== 'occupied' && this.externalExpected) {
         // This profile has attached to an external backend before, so the port
-        // belongs to its launcher, not to this app. Wait for it instead of
-        // starting a second backend that would fight it for the port and leave
-        // the owner's unit in a permanent restart loop.
-        const outcome = await this.awaitExternal(runtime.nodePath);
-        if (outcome === 'attached') {
-          await this.finishReady();
-          return;
-        }
-        if (outcome === 'rejected') {
-          throw new ShellError(
-            'port-collision',
-            `Port ${config.port} is already in use by a service this app does not own.`,
-            'The backend this profile used to attach to is no longer answering, and something else holds the port now. Close it or choose another port in Settings. The app never connects to unknown listeners.',
-          );
-        }
-        // A wait that was canceled by quitting did not learn anything about the
-        // launcher, so it must not count as a miss or drop the expectation.
-        if (this.quitting) return;
-        // The backend the owner usually runs is not there right now. The app
-        // still has to serve the WebUI, so it starts its own backend, exactly as
-        // it would on a machine without one. Repeated misses drop the
-        // expectation so a removed launcher cannot cost a wait on every boot.
-        const misses = (this.deps.external.read()?.misses ?? 0) + 1;
+        // belongs to its launcher, not to this app. Wait for it first: when it
+        // answers, the app attaches instead of starting a competitor.
+        const misses = this.deps.external.read()?.misses ?? 0;
         if (misses >= 3) {
-          this.deps.log.warn('no external backend appeared in three starts; dropping the expectation');
-          this.clearExternalExpectation();
+          // The launcher has been away for several starts. The port stays
+          // reserved for it, but the app no longer spends the wait on every
+          // start: it serves itself beside the port and hands the port back as
+          // soon as the launcher answers (see maybeHandBack).
+          this.deps.log.info('the launcher has not appeared in three starts; keeping its port free without waiting');
         } else {
-          this.deps.log.warn(`no external backend appeared; starting an app-owned one (miss ${misses} of 3)`);
-          this.recordExternalExpectation(misses);
+          const outcome = await this.awaitExternal(runtime.nodePath);
+          if (outcome === 'attached') {
+            await this.finishReady();
+            return;
+          }
+          if (outcome === 'rejected') {
+            throw new ShellError(
+              'port-collision',
+              `Port ${config.port} is already in use by a service this app does not own.`,
+              'The backend this profile used to attach to is no longer answering, and something else holds the port now. Close it or choose another port in Settings. The app never connects to unknown listeners.',
+            );
+          }
+          // A wait that was canceled by quitting did not learn anything about
+          // the launcher, so it must not count as a miss.
+          if (this.quitting) return;
+          const next = misses + 1;
+          this.recordExternalExpectation(next);
+          this.deps.log.warn(
+            `no external backend appeared; keeping port ${config.port} free for its launcher (miss ${next} of 3)`,
+          );
         }
       }
 
@@ -896,6 +958,13 @@ export class Supervisor {
         }
       }
 
+      const servePort = await this.chooseServePort(config);
+      if (servePort !== this.port()) {
+        this.deps.log.warn(
+          `serving the app-owned backend on port ${servePort}: port ${config.port} stays free for the backend started outside this app`,
+        );
+      }
+      this.activePort = servePort;
       await this.spawnServer(runtime, plan);
       await this.finishReady();
     } catch (error) {
@@ -1155,6 +1224,7 @@ export class Supervisor {
         const target: LifecycleState = this.windowHidden ? 'HIDDEN_IN_TRAY' : 'READY';
         if (this.lifecycle.state !== target) this.setState(target, null);
         this.deps.log.info('backend ready');
+        if (this.attached) await this.ensureDistroKeepalive();
         return;
       }
       await this.deps.sleep(250);
@@ -1171,6 +1241,120 @@ export class Supervisor {
   }
 
   /**
+   * Hold WSL open while an attached backend serves the WebUI.
+   *
+   * WSL2 powers a distribution off about ten seconds after its last client
+   * exits, which kills every process inside it, the owner's backend included.
+   * While attached the app owns no client, so it keeps one lightweight session.
+   * Failure is logged, never fatal: the backend is alive at this point, and the
+   * app must not turn a working WebUI into an error.
+   */
+  private async ensureDistroKeepalive(): Promise<void> {
+    const nodePath = this.runtime?.nodePath ?? null;
+    try {
+      const pid = await this.deps.wsl.ensureKeepalive(this.distro(), nodePath);
+      if (pid !== null) this.deps.log.info(`the distribution is kept open while attached (keepalive pid=${pid})`);
+    } catch (error) {
+      this.deps.log.warn(`could not keep the distribution open: ${describe(error)}`);
+    }
+  }
+
+  /**
+   * Port an app-owned backend should serve on.
+   *
+   * When this profile expects a launcher on the fixed port, the app serves
+   * itself on the next free port instead. The launcher must always find its own
+   * port free, otherwise its unit restarts forever on EADDRINUSE - which is
+   * exactly what happened in beta.6. The window is small and bounded; when no
+   * port beside the fixed one is free the app takes the fixed port rather than
+   * leaving the owner without a WebUI.
+   */
+  private async chooseServePort(config: AppConfig): Promise<number> {
+    if (!this.externalExpected) return config.port;
+    for (let candidate = config.port + 1; candidate <= config.port + FALLBACK_PORT_WINDOW; candidate += 1) {
+      if (candidate > 65535) break;
+      if ((await this.deps.probePort(candidate)) === 'free') return candidate;
+    }
+    this.deps.log.warn(
+      `no free port beside ${config.port}; the app-owned backend will use the port its launcher expects`,
+    );
+    return config.port;
+  }
+
+  /**
+   * Hand the fixed port back to the launcher that came up meanwhile.
+   *
+   * Runs on the health tick, so the switch happens within one interval of the
+   * launcher answering on its own port. Verification is the same pair the attach
+   * uses - a listener whose command line is our `dsh web` launch - so an
+   * unrelated service that grabs the port is handed nothing and the app-owned
+   * backend keeps serving.
+   */
+  private async maybeHandBack(): Promise<void> {
+    if (this.quitting || this.updateLocked || this.attached || !this.owned) return;
+    if (!this.externalExpected || this.handBackRunning) return;
+    const config = this.deps.config();
+    if (this.port() === config.port) return;
+    const nodePath = this.runtime?.nodePath ?? null;
+    if (nodePath === null) return;
+    this.handBackRunning = true;
+    try {
+      if ((await this.deps.probePort(config.port)) !== 'occupied') return;
+      if (!(await this.isLauncherOn(config.port, nodePath))) return;
+      // Only hand the port back when this profile's session really works there:
+      // a verified listener that rejects it would leave the owner without a
+      // WebUI once the fallback backend is gone.
+      if (!(await this.answersThisProfile(config.port))) return;
+      this.deps.log.info(
+        `the backend started outside this app is serving port ${config.port} again; handing the port back`,
+      );
+      await this.serial(async () => {
+        if (this.quitting || this.updateLocked || this.attached) return;
+        this.attempt = 0;
+        this.setState('RECOVERING', 'Connecting to the backend started outside this app');
+        await this.stopOwnedServer();
+        await this.bringUp();
+      });
+    } catch (error) {
+      // bringUp reports its own failures; this branch only catches the stop, so
+      // the state has to be made terminal here or recovery would never run again.
+      const detail = describe(error);
+      this.deps.log.error(`handing the port back failed: ${detail}`);
+      this.fail(
+        error instanceof ShellError
+          ? error
+          : new ShellError('unexpected', detail, 'See the log for details.'),
+      );
+    } finally {
+      this.handBackRunning = false;
+    }
+  }
+
+  /** Does the WebUI on `port` accept this profile's stored session? */
+  private async answersThisProfile(port: number): Promise<boolean> {
+    try {
+      return (await this.deps.web.health(buildOrigin(port))) === 200;
+    } catch (error) {
+      this.deps.log.debug(`session probe on port ${port} failed: ${describe(error)}`);
+      return false;
+    }
+  }
+
+  /** Is a verified `dsh web` launch of this profile listening on `port`? */
+  private async isLauncherOn(port: number, nodePath: string | null): Promise<boolean> {
+    if (nodePath === null) return false;
+    try {
+      const pid = await this.deps.wsl.findPortOwner(this.distro(), port, nodePath);
+      if (pid === null) return false;
+      const probe = await this.deps.wsl.probeProcess(this.distro(), pid);
+      return verifyOwnership(probe, { port }) === 'owned';
+    } catch (error) {
+      this.deps.log.debug(`launcher probe failed: ${describe(error)}`);
+      return false;
+    }
+  }
+
+  /**
    * Does this profile expect the fixed port to belong to a backend the owner
    * runs? A record written for another distribution or port describes old user
    * intent and is dropped instead of blocking the current settings.
@@ -1178,7 +1362,9 @@ export class Supervisor {
   private expectExternalBackend(): boolean {
     const record = this.deps.external.read();
     if (record === null) return false;
-    if (record.distro !== this.distro() || record.port !== this.port()) {
+    // Always compared against the configured port: an app-owned backend may
+    // serve on a fallback port beside it, which is not the launcher's port.
+    if (record.distro !== this.distro() || record.port !== this.deps.config().port) {
       this.deps.log.debug('dropping an external-backend expectation written for other settings');
       this.deps.external.clear();
       return false;
@@ -1190,7 +1376,8 @@ export class Supervisor {
     try {
       this.deps.external.write({
         distro: this.distro(),
-        port: this.port(),
+        // The launcher's port, never the fallback port the app may serve on.
+        port: this.deps.config().port,
         recordedAt: new Date(this.deps.now()).toISOString(),
         ...(misses > 0 ? { misses } : {}),
       });
@@ -1344,7 +1531,10 @@ export class Supervisor {
     const record = this.deps.registry.read();
     if (record === null) return { verdict: 'gone', record: null };
     if (record.distro !== this.distro() || record.port !== this.port()) {
-      this.deps.registry.clear();
+      // A record for a fallback port beside the configured one is not this
+      // port's proof, but it may still describe a live app-owned backend whose
+      // probe just failed. Start decides its fate and keeps or drops it.
+      if (!isFallbackPort(record.port, this.port())) this.deps.registry.clear();
       return { verdict: 'gone', record: null };
     }
     const probe = await this.deps.wsl.probeProcess(this.distro(), record.pid);
@@ -1384,7 +1574,17 @@ export class Supervisor {
     }
     const pid = this.serverPid;
     const startTime = this.serverStartTime;
-    const expectation = { port: this.port(), startTime };
+    // The ownership proof names the port the process was launched with, which is
+    // not necessarily the configured one: while the launcher's port is reserved
+    // the app serves on a fallback port, and a later start has already moved
+    // `activePort` back before this runs. Verifying against `this.port()` here
+    // would read the live fallback backend as foreign and leave it behind.
+    const recorded = this.deps.registry.read();
+    const launchedPort =
+      recorded !== null && recorded.pid === pid && recorded.distro === this.distro()
+        ? recorded.port
+        : this.port();
+    const expectation = { port: launchedPort, startTime };
 
     if (pid !== null) {
       const probe = await this.deps.wsl.probeProcess(this.distro(), pid);
@@ -1431,8 +1631,8 @@ export class Supervisor {
       // Drop the record only when it describes the process handled here. A
       // failed replacement attempt must never erase the ownership proof for a
       // different, still running backend.
-      const recorded = this.deps.registry.read();
-      if (recorded === null || recorded.pid === pid) this.deps.registry.clear();
+      const current = this.deps.registry.read();
+      if (current === null || current.pid === pid) this.deps.registry.clear();
     }
     this.server = null;
     this.serverPid = null;

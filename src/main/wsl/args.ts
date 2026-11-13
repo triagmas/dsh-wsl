@@ -423,6 +423,54 @@ export function buildFindPortOwnerArgs(distro: string, nodePath: string, port: n
   return ['-d', assertDistroName(distro), '--exec', nodePath, '-e', FIND_PORT_OWNER_SCRIPT, String(assertPort(port))];
 }
 
+/**
+ * How long the distribution keepalive sleeps, in seconds.
+ *
+ * The value doubles as the marker: an idle sleep of this exact length is how the
+ * app recognises a keepalive it started before, so repeated starts reuse one
+ * session instead of piling them up.
+ */
+export const KEEPALIVE_SLEEP_SECONDS = 2147483647;
+
+/**
+ * Hold a distribution open without starting or touching any backend.
+ *
+ * WSL2 powers a distribution off about ten seconds after its last `wsl.exe`
+ * client exits, which kills everything inside it. While the app is attached to a
+ * backend it does not own it has no client of its own, so it keeps this one.
+ * The session is detached and deliberately left behind: quitting the app must
+ * never take the distribution, and the owner's backend, down with it.
+ */
+export function buildKeepaliveArgs(distro: string): string[] {
+  return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', `exec sleep ${KEEPALIVE_SLEEP_SECONDS}`];
+}
+
+/** Find a keepalive session this profile started earlier (read-only). */
+export const FIND_KEEPALIVE_SCRIPT = String.raw`const fs = require('fs');
+const want = process.argv[process.argv.length - 1];
+for (const pid of fs.readdirSync('/proc')) {
+  if (!/^\d+$/.test(pid)) continue;
+  let raw = '';
+  try { raw = fs.readFileSync('/proc/' + pid + '/cmdline', 'utf8'); } catch (error) { continue; }
+  if (raw === '') continue;
+  const argv = raw.split('\u0000');
+  if (argv.length >= 2 && argv[0] === 'sleep' && argv[1] === want) { process.stdout.write(pid); process.exit(0); }
+}
+process.exit(3);`;
+
+export function buildFindKeepaliveArgs(distro: string, nodePath: string): string[] {
+  if (!isValidRuntimeBinary(nodePath)) throw new ArgumentError('invalid-runtime-binary');
+  return [
+    '-d',
+    assertDistroName(distro),
+    '--exec',
+    nodePath,
+    '-e',
+    FIND_KEEPALIVE_SCRIPT,
+    String(KEEPALIVE_SLEEP_SECONDS),
+  ];
+}
+
 /** POSIX signal delivery by number-free name to one verified PID. */
 export function buildSignalArgs(distro: string, pid: number, signal: 'TERM' | 'KILL'): string[] {
   return [
