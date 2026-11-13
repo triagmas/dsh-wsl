@@ -248,7 +248,10 @@ describe('distribution keepalive', () => {
     expect(() => buildFindKeepaliveArgs('Ubuntu', 'node')).toThrow(ArgumentError);
   });
 
-  it('finds the keepalive it started and ignores other idle sleeps', async () => {
+  // The finder reads /proc, so it can only be exercised on a Linux host.
+  const itLinux = it.skipIf(process.platform !== 'linux');
+
+  itLinux('finds the keepalive it started and ignores other idle sleeps', async () => {
     const { spawn, spawnSync } = await import('node:child_process');
     const marker = spawn('sleep', [String(KEEPALIVE_SLEEP_SECONDS)], { stdio: 'ignore' });
     const decoy = spawn('sleep', ['123'], { stdio: 'ignore' });
