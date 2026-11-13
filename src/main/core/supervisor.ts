@@ -818,6 +818,7 @@ export class Supervisor {
           // The listener exited while it was being waited for: the port is free
           // again, so serve the WebUI with an app-owned backend instead of
           // reporting a collision with a service that is gone.
+          if (this.quitting) return;
           this.deps.log.warn(`the listener on port ${config.port} left while waiting for it; starting an app-owned backend`);
           startOwn = true;
         }
@@ -865,6 +866,9 @@ export class Supervisor {
             'The backend this profile used to attach to is no longer answering, and something else holds the port now. Close it or choose another port in Settings. The app never connects to unknown listeners.',
           );
         }
+        // A wait that was canceled by quitting did not learn anything about the
+        // launcher, so it must not count as a miss or drop the expectation.
+        if (this.quitting) return;
         // The backend the owner usually runs is not there right now. The app
         // still has to serve the WebUI, so it starts its own backend, exactly as
         // it would on a machine without one. Repeated misses drop the

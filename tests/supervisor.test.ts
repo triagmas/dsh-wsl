@@ -747,6 +747,32 @@ describe('external expectation edge cases from review', () => {
     expect(lastStatus(harness.statuses).externalBackend).toBe(false);
   });
 
+  it('does not count a wait that was canceled by quitting as a miss', async () => {
+    const external = createMemoryExternalStore({
+      distro: 'Ubuntu',
+      port: PORT,
+      recordedAt: '2026-01-01T00:00:00.000Z',
+      misses: 1,
+    });
+    let probes = 0;
+    let supervisor: Supervisor | null = null;
+    const harness = createHarness({
+      portState: () => {
+        if (probes++ === 2) void supervisor?.detach();
+        return 'free';
+      },
+      external,
+      attachWaitMs: 20,
+      attachPollMs: 5,
+    });
+    supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(external.read()?.misses).toBe(1);
+    expect(harness.wsl.starts).toHaveLength(0);
+  });
+
   it('keeps waiting for a verified backend that cannot answer the session check yet', async () => {
     const external = createMemoryExternalStore({ distro: 'Ubuntu', port: PORT, recordedAt: '2026-01-01T00:00:00.000Z' });
     let healthCalls = 0;
