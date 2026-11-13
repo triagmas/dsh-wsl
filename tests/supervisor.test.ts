@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { Supervisor } from '../src/main/core/supervisor.js';
+import { createMemoryExternalStore } from '../src/main/core/external.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
 import { backendProbe, createHarness, lastStatus, BACKEND_PID, BACKEND_START_TIME, PORT } from './helpers.js';
 import type { OwnedServerRecord } from '../src/main/core/ownership.js';
@@ -512,5 +513,166 @@ describe('external backend attach', () => {
     expect(lastStatus(harness.statuses).detail).toContain('outside this app');
     expect(harness.wsl.starts).toHaveLength(0);
     expect(harness.wsl.signals).toHaveLength(0);
+  });
+});
+
+describe('external backend expectation (boot race)', () => {
+  const EXTERNAL_PID = 4711;
+  const externalWsl = {
+    portOwner: EXTERNAL_PID,
+    probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe() : null),
+  };
+  const expectation = (port = PORT) => ({
+    distro: 'Ubuntu',
+    port,
+    recordedAt: '2026-01-01T00:00:00.000Z',
+  });
+
+  it('waits for the expected backend instead of spawning a competitor', async () => {
+    // The port is still free while the owner's unit boots, then the unit binds.
+    let probes = 0;
+    const harness = createHarness({
+      portState: () => (probes++ < 3 ? 'free' : 'occupied'),
+      wsl: externalWsl,
+      external: createMemoryExternalStore(expectation()),
+      attachWaitMs: 100,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+    expect(harness.registry.read()).toBeNull();
+  });
+
+  it('starts its own backend when the expected backend does not appear, and counts the miss', async () => {
+    const external = createMemoryExternalStore(expectation());
+    const harness = createHarness({ portState: 'free', external, attachWaitMs: 30, attachPollMs: 5 });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    // The WebUI has to be served even when the owner's launcher is down.
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(1);
+    expect(lastStatus(harness.statuses).externalBackend).toBe(false);
+    expect(external.read()?.misses).toBe(1);
+  });
+
+  it('drops the expectation after three misses instead of waiting forever', async () => {
+    const external = createMemoryExternalStore({ ...expectation(), misses: 2 });
+    const harness = createHarness({ portState: 'free', external, attachWaitMs: 30, attachPollMs: 5 });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(1);
+    expect(external.read()).toBeNull();
+  });
+
+  it('re-attaches by itself when the external backend comes back', async () => {
+    let backendUp = true;
+    let probesWhileDown = 0;
+    const harness = createHarness({
+      portState: () => {
+        if (backendUp) return 'occupied';
+        probesWhileDown += 1;
+        if (probesWhileDown < 3) return 'free';
+        backendUp = true;
+        return 'occupied';
+      },
+      web: { health: () => (backendUp ? 200 : 401) },
+      wsl: externalWsl,
+      attachWaitMs: 100,
+      attachPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    expect(supervisor.state).toBe('READY');
+
+    backendUp = false;
+    await supervisor.healthTick();
+    await supervisor.healthTick();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.wsl.signals).toHaveLength(0);
+  });
+
+  it('drops an expectation written for other settings', async () => {
+    const external = createMemoryExternalStore(expectation(PORT + 10));
+    const harness = createHarness({ portState: 'free', external });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(1);
+    expect(external.read()).toBeNull();
+  });
+});
+
+describe('cold-start discovery of a backend the owner starts', () => {
+  const EXTERNAL_PID = 4711;
+  const externalWsl = {
+    portOwner: EXTERNAL_PID,
+    probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe() : null),
+  };
+
+  it('attaches to a backend that takes the free port during the grace window', async () => {
+    let probes = 0;
+    const harness = createHarness({
+      portState: () => (probes++ < 4 ? 'free' : 'occupied'),
+      wsl: externalWsl,
+      discoveryGraceMs: 100,
+      discoveryPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(lastStatus(harness.statuses).externalBackend).toBe(true);
+    expect(harness.wsl.starts).toHaveLength(0);
+    expect(harness.external.read()).not.toBeNull();
+  });
+
+  it('starts its own backend when nothing appears during the grace window', async () => {
+    const harness = createHarness({
+      portState: 'free',
+      discoveryGraceMs: 30,
+      discoveryPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(harness.wsl.starts).toHaveLength(1);
+    expect(harness.external.read()).toBeNull();
+  });
+
+  it('reports a listener that appears but is not this profile\'s backend', async () => {
+    let probes = 0;
+    const harness = createHarness({
+      portState: () => (probes++ < 2 ? 'free' : 'occupied'),
+      wsl: {
+        portOwner: 9999,
+        probe: (pid: number) => (pid === 9999 ? backendProbe({ cmdline: '/usr/bin/python3 -m http.server 3080' }) : null),
+      },
+      discoveryGraceMs: 100,
+      discoveryPollMs: 5,
+    });
+    const supervisor = new Supervisor(harness.deps);
+
+    await expect(supervisor.start()).rejects.toThrow(/already in use/);
+    expect(supervisor.state).toBe('ERROR');
+    expect(harness.wsl.starts).toHaveLength(0);
   });
 });
