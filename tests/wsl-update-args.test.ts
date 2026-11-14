@@ -6,21 +6,28 @@
  * safety rules the design promises, invalid values are rejected before anything
  * runs, and the builders never concatenate user input into shell text.
  */
+import { spawnSync } from 'node:child_process';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   INSPECT_SHARED_SCRIPT,
   NPM_PACKAGE,
   NPM_VIEW_SCRIPT,
   PREPARE_BACKUP_SCRIPT,
+  PRUNE_SNAPSHOTS_SCRIPT,
   ROLLBACK_SHARED_SCRIPT,
   UPDATE_SHARED_SCRIPT,
   buildInspectSharedArgs,
   buildNpmViewArgs,
   buildPrepareBackupArgs,
+  buildPruneSnapshotsArgs,
   buildRollbackSharedArgs,
   buildUpdateSharedArgs,
   parseBackupReport,
   parseNpmMarker,
+  parsePruneReport,
 } from '../src/main/wsl/update-args.js';
 import { ArgumentError } from '../src/main/wsl/args.js';
 
@@ -439,5 +446,96 @@ describe('scripts never depend on the retired private runtime', () => {
     // The prefix always comes from the inspection, never from the script itself.
     expect(UPDATE_SHARED_SCRIPT).toContain('--prefix "$prefix"');
     expect(UPDATE_SHARED_SCRIPT).not.toContain('--prefix "$HOME"');
+  });
+});
+
+describe('snapshot pruning', () => {
+  it('keeps the newest snapshots and refuses a malformed count', () => {
+    const tx = '20261114T021103Z-9d42';
+    const argv = buildPruneSnapshotsArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, keep: 2, transaction: tx });
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PRUNE_SNAPSHOTS_SCRIPT]);
+    expect(argv.slice(6)).toEqual([APP_ROOT, '2', tx]);
+    const base = { distro: 'Ubuntu', appRoot: APP_ROOT, keep: 2, transaction: tx };
+    expect(() => buildPruneSnapshotsArgs({ ...base, keep: -1 })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, keep: 1.5 })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, appRoot: 'relative' })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, transaction: '../../x' })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, distro: 'Ubuntu && rm -rf /' })).toThrow(ArgumentError);
+  });
+
+  it('walks only snapshot directories and never follows a symlink', () => {
+    // `.tmp` trees belong to a running attempt and are removed under their lease.
+    expect(PRUNE_SNAPSHOTS_SCRIPT).toContain('! -name "*.tmp"');
+    expect(PRUNE_SNAPSHOTS_SCRIPT).toContain('[ -L "$p" ] && { echo "prune: $p is a symlink, kept" >&2; continue; }');
+    expect(PRUNE_SNAPSHOTS_SCRIPT).toContain('case "$p" in "$upd"/shared-backup-[0-9]*)');
+    expect(PRUNE_SNAPSHOTS_SCRIPT).toContain('sort -rn');
+  });
+
+  it('parses the removed paths and ignores anything else', () => {
+    const text = [
+      'prune: /home/dev/app/update/shared-backup-x is a symlink, kept',
+      '__dsh_wsl_prune__ removed=/home/dev/app/update/shared-backup-20261107T101500Z-1a2b',
+      'some other output',
+    ].join('\n');
+    expect(parsePruneReport(text)).toEqual(['/home/dev/app/update/shared-backup-20261107T101500Z-1a2b']);
+    expect(parsePruneReport('nothing')).toEqual([]);
+    // A relative or hostile path is never echoed back as a removal.
+    expect(parsePruneReport('__dsh_wsl_prune__ removed=../../etc')).toEqual([]);
+  });
+});
+
+// The pruning command is a shell script, so the only honest check of "keeps the
+// newest and leaves everything else alone" is to run it against a real tree.
+const itLinux = it.skipIf(process.platform !== 'linux');
+
+describe('snapshot pruning on a real tree', () => {
+  itLinux('keeps the newest snapshots and never touches foreign entries', () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-prune-'));
+    const upd = join(home, '.cache', 'wsl-web-shell', 'update');
+    mkdirSync(upd, { recursive: true });
+    const make = (name: string, mtime: number): void => {
+      const dir = join(upd, name);
+      mkdirSync(join(dir, 'payload'), { recursive: true });
+      writeFileSync(join(dir, 'meta'), 'version=0.1.0\n');
+      const touched = spawnSync('touch', ['-d', `@${mtime}`, dir]);
+      expect(touched.status).toBe(0);
+    };
+    const names = [
+      'shared-backup-20261101T000000Z-aaaa',
+      'shared-backup-20261102T000000Z-bbbb',
+      'shared-backup-20261103T000000Z-cccc',
+      'shared-backup-20261104T000000Z-dddd',
+    ];
+    names.forEach((name, index) => make(name, 1_800_000_000 + index * 60));
+    // A tree of a running attempt, an unrelated directory and a symlink to a
+    // snapshot must all survive: each of them would be data loss if removed.
+    const running = 'shared-backup-20261104T000000Z-eeee.tmp';
+    mkdirSync(join(upd, running), { recursive: true });
+    mkdirSync(join(upd, 'something-else'), { recursive: true });
+    const link = 'shared-backup-20261105T000000Z-ffff';
+    symlinkSync(join(upd, names[0] ?? ''), join(upd, link));
+
+    // The snapshot of the running transaction is created first and deliberately
+    // given the oldest mtime: a clock correction must not turn it into a victim.
+    const currentTx = '20261100T000000Z-0000';
+    const current = `shared-backup-${currentTx}`;
+    make(current, 1_700_000_000);
+    const run = spawnSync('/bin/sh', ['-c', PRUNE_SNAPSHOTS_SCRIPT, '-', '2', currentTx], {
+      env: { ...process.env, HOME: home },
+      encoding: 'utf8',
+    });
+
+    expect(run.status).toBe(0);
+    expect(existsSync(join(upd, names[0] ?? ''))).toBe(false);
+    expect(existsSync(join(upd, names[1] ?? ''))).toBe(false);
+    expect(existsSync(join(upd, names[2] ?? ''))).toBe(true);
+    expect(existsSync(join(upd, names[3] ?? ''))).toBe(true);
+    expect(existsSync(join(upd, current))).toBe(true);
+    expect(existsSync(join(upd, running))).toBe(true);
+    expect(existsSync(join(upd, 'something-else'))).toBe(true);
+    // The link is checked without following it: its target was just pruned, so it
+    // is dangling now, which is exactly the case `existsSync` reports as absent.
+    expect(lstatSync(join(upd, link)).isSymbolicLink()).toBe(true);
+    expect(parsePruneReport(run.stdout)).toHaveLength(2);
   });
 });

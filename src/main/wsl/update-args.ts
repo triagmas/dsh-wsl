@@ -975,6 +975,95 @@ export function buildCleanSnapshotArgs(request: {
   ];
 }
 
+const SNAPSHOT_PRUNE_MARKER = '__dsh_wsl_prune__';
+
+/**
+ * Remove recovery snapshots beyond the newest few.
+ *
+ * Every update leaves a full copy of the package behind, so without pruning a
+ * host that updates a few times carries gigabytes of dead snapshots: the owner's
+ * machine held 4.3 GB in four of them, two of which belonged to updates that were
+ * refused before anything was touched. Nothing revisits a snapshot once its
+ * transaction is finished, so the newest few are enough.
+ *
+ * Only directories directly below `<app root>/update` whose names match the
+ * snapshot pattern are considered, symlinks are skipped instead of followed, and
+ * the sort is by modification time with the newest first. `.tmp` trees of an
+ * attempt that is still running are never candidates: they are cleaned by
+ * `CLEAN_SNAPSHOT_SCRIPT` under their creation lease.
+ *
+ * Exit codes: 64 malformed argument, 79 the app data root is unusable.
+ *
+ * `$0` = app data root (`-` when isolation is off), `$1` = snapshots to keep.
+ */
+export const PRUNE_SNAPSHOTS_SCRIPT = [
+  'set -u',
+  'app_root="$0"; keep="$1"; tx="$2"',
+  'case "$keep" in ""|*[!0-9]*) echo "prune: rejected keep count" >&2; exit 64 ;; esac',
+  'case "$tx" in ""|*[!0-9A-Za-z-]*) echo "prune: rejected transaction id" >&2; exit 64 ;; esac',
+  BACKUP_BASE_HELPER,
+  'backup_base "$app_root" || exit 79',
+  'marker="$upd/.snapshot-prune-failed"',
+  'rm -f -- "$marker" 2>/dev/null || true',
+  'find "$upd" -mindepth 1 -maxdepth 1 -type d -name "shared-backup-[0-9]*" ! -name "*.tmp" -printf "%T@ %p\\n" 2>/dev/null \\',
+  '| LC_ALL=C sort -rn \\',
+  '| tail -n +"$((keep + 1))" \\',
+  '| while IFS= read -r line; do',
+  'p="${line#* }"',
+  'case "$p" in "$upd"/shared-backup-[0-9]*) ;; *) echo "prune: [$p] is outside $upd" >&2; continue ;; esac',
+  '[ -L "$p" ] && { echo "prune: $p is a symlink, kept" >&2; continue; }',
+  // The snapshot of the running transaction may be the oldest by mtime after a
+  // clock correction, and deleting it would destroy the run\'s own recovery point.
+  'case "$p" in "$upd/shared-backup-$tx") echo "prune: $p is this transaction, kept" >&2; continue ;; esac',
+  'if rm -rf -- "$p" 2>/dev/null && [ ! -e "$p" ]; then',
+  `printf "%s removed=%s\\n" "${SNAPSHOT_PRUNE_MARKER}" "$p"`,
+  'else echo "prune: $p could not be removed" >&2; : > "$marker" 2>/dev/null || true; fi',
+  'done',
+  'if [ -e "$marker" ]; then rm -f -- "$marker" 2>/dev/null || true; exit 80; fi',
+  'exit 0',
+].join('\n');
+
+/**
+ * Build the pruning command for old recovery snapshots.
+ *
+ * `$0` = app data root, `$1` = snapshots to keep, both validated.
+ */
+export function buildPruneSnapshotsArgs(request: {
+  distro: string;
+  appRoot: string;
+  keep: number;
+  transaction: string;
+}): string[] {
+  if (!Number.isInteger(request.keep) || request.keep < 0 || request.keep > 16) {
+    throw new ArgumentError('invalid-keep-count');
+  }
+  return [
+    '-d',
+    assertDistroName(request.distro),
+    '--exec',
+    '/bin/sh',
+    '-c',
+    PRUNE_SNAPSHOTS_SCRIPT,
+    appRootArg(request.appRoot),
+    String(request.keep),
+    assertTransaction(request.transaction),
+  ];
+}
+
+const PRUNE_LINE = new RegExp(`^${SNAPSHOT_PRUNE_MARKER} removed=(.+)$`);
+
+/** Paths the pruning command reported as removed; empty when it removed nothing. */
+export function parsePruneReport(text: string): string[] {
+  const removed: string[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const match = PRUNE_LINE.exec(rawLine.trim());
+    if (match === null) continue;
+    const path = match[1]?.trim() ?? '';
+    if (isValidRuntimeBinary(path)) removed.push(path);
+  }
+  return removed;
+}
+
 /**
  * A creation lease proves that a snapshot `.tmp` tree belongs to the attempt that
  * wants to remove it (review R02). It is 32-64 lowercase hex characters, generated

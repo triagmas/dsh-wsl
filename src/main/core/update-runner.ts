@@ -40,6 +40,7 @@ import {
   createUpdateTerminal,
   UPDATE_REASONS,
   sanitizeBackupReason,
+  SNAPSHOT_RETENTION,
   type SharedUpdatePlan,
   type UpdateJournalPhase,
   type UpdateJournalStore,
@@ -53,13 +54,23 @@ export interface UpdateLifecycle {
   releaseUpdateLock(): void;
   /** Terminal state for an installation that must not be started (failed rollback). */
   blockForRuntime(message: string): void;
+  /**
+   * Why an update must not start now, or `null` when it may. Checked before the
+   * first npm call so a refusal costs nothing.
+   */
+  updateBlocker(): string | null;
   updateInProgress: boolean;
 }
 
 export interface UpdateRunnerDeps {
   wsl: Pick<
     WslGateway,
-    'checkPublishedVersion' | 'inspectSharedDsh' | 'prepareSharedBackup' | 'updateSharedDsh' | 'rollbackSharedDsh'
+    | 'checkPublishedVersion'
+    | 'inspectSharedDsh'
+    | 'prepareSharedBackup'
+    | 'pruneUpdateSnapshots'
+    | 'updateSharedDsh'
+    | 'rollbackSharedDsh'
   >;
   lifecycle: UpdateLifecycle;
   journal: UpdateJournalStore;
@@ -240,13 +251,23 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
 
     async run(plan: SharedUpdatePlan, context: UpdateContext): Promise<UpdateOutcome> {
       if (busy) return { ok: false, state };
-      busy = true;
       terminal.clear();
       state = {
         ...createUpdateState(deps.now()),
         targetVersion: plan.version,
         installedVersion: plan.installedVersion,
       };
+      // Refuse before the first expensive step. An update replaces the files the
+      // running backend executes, and the self-check that used to catch this ran
+      // after a minute of snapshot work, so the owner saw a failure that cost a
+      // gigabyte and told him nothing he could act on. The refusal happens before
+      // `busy` is set: a run that never started must not claim the runner.
+      const blocker = deps.lifecycle.updateBlocker();
+      if (blocker !== null) {
+        deps.log.warn(`update refused before anything was read: ${blocker}`);
+        return { ok: false, state: fail(blocker) };
+      }
+      busy = true;
       publish({ phase: 'checking', message: describeUpdatePhase('checking'), detail: null });
       deps.log.info(`update: checking ${plan.version} on npm (distro=${plan.distro})`);
       const startedAt = deps.now();
@@ -355,6 +376,31 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         const snapshotDir = backup.snapshot.path;
         backupDir = snapshotDir;
         terminal.append(`update: verified recovery snapshot at ${snapshotDir} (${backup.snapshot.files} files)`);
+
+        // Every snapshot is a full copy of the package, and nothing revisits one
+        // once its transaction is over: without pruning the owner's host had
+        // 4.3 GB in four of them. This runs after the new snapshot is verified,
+        // so the run always keeps a usable one even when pruning fails.
+        if (deps.journal.read() === null) {
+          const pruned = await deps.wsl
+            .pruneUpdateSnapshots({
+              distro: verified.distro,
+              appRoot: verified.appRoot,
+              keep: SNAPSHOT_RETENTION,
+              transaction: context.transaction,
+            })
+            .catch((error: unknown) => {
+              deps.log.warn(
+                `update: old recovery snapshots were left in place: ${
+                  error instanceof Error ? error.message : 'unknown error'
+                }`,
+              );
+              return { removed: [] as string[] };
+            });
+          if (pruned.removed.length > 0) {
+            terminal.append(`update: removed ${pruned.removed.length} old recovery snapshot(s)`);
+          }
+        }
 
         // 3. The journal must exist before anything can be installed.
         if (!writeJournal(verified, context, 'updating', startedAt, snapshotDir)) {

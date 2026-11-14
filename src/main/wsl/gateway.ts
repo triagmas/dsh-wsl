@@ -45,6 +45,7 @@ import {
 } from './args.js';
 import {
   buildCleanSnapshotArgs,
+  buildPruneSnapshotsArgs,
   buildInspectSharedArgs,
   buildNpmViewArgs,
   buildPrepareBackupArgs,
@@ -53,6 +54,7 @@ import {
   NPM_MARKER,
   parseBackupReport,
   parseCleanSnapshotReport,
+  parsePruneReport,
   parseNpmMarker,
   type CleanSnapshotReport,
 } from './update-args.js';
@@ -73,7 +75,7 @@ export interface WslGatewayOptions {
    * The defaults are the measured budgets below; a test that must observe the
    * timeout path cannot wait minutes for it.
    */
-  timeouts?: { backupMs?: number; cleanMs?: number; terminationGraceMs?: number };
+  timeouts?: { backupMs?: number; cleanMs?: number; pruneMs?: number; terminationGraceMs?: number };
   /** Mount table the cleanup consults instead of `/proc/self/mountinfo` (tests). */
   mountInfo?: string;
 }
@@ -100,6 +102,14 @@ const BACKUP_TIMEOUT_MS = 300_000;
  * can never dominate the update.
  */
 const CLEAN_TIMEOUT_MS = 60_000;
+/**
+ * Budget for pruning old recovery snapshots.
+ *
+ * Each snapshot is a full package copy (about 1.3 GB on the owner's host), so a
+ * recursive delete of several of them is I/O bound; two minutes is ample and a
+ * timeout only leaves the snapshots for the next run.
+ */
+const PRUNE_TIMEOUT_MS = 120_000;
 
 /**
  * How long to wait for a killed command to report its own exit (review R02).
@@ -133,6 +143,7 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
   const wslExe = options.wslExe ?? WSL_EXE;
   const spawnImpl = options.spawnImpl ?? spawn;
   const backupTimeoutMs = options.timeouts?.backupMs ?? BACKUP_TIMEOUT_MS;
+  const pruneTimeoutMs = options.timeouts?.pruneMs ?? PRUNE_TIMEOUT_MS;
   const cleanTimeoutMs = options.timeouts?.cleanMs ?? CLEAN_TIMEOUT_MS;
   const terminationGraceMs = options.timeouts?.terminationGraceMs ?? TERMINATION_GRACE_MS;
 
@@ -685,6 +696,32 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       }
       options.log.info(`recovery snapshot ready at ${report.path} (${report.files} files, version=${report.version})`);
       return { ok: true, snapshot: { path: report.path, files: report.files } };
+    },
+
+    async pruneUpdateSnapshots(request: {
+      distro: string;
+      appRoot: string;
+      keep: number;
+      transaction: string;
+    }) {
+      let result: CommandResult;
+      try {
+        result = await run(buildPruneSnapshotsArgs(request), pruneTimeoutMs);
+      } catch (error) {
+        options.log.warn(
+          `old recovery snapshots were left in place: ${error instanceof Error ? error.message : 'unknown error'}`,
+        );
+        return { removed: [] as string[] };
+      }
+      const removed = parsePruneReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code !== 0) {
+        options.log.warn(
+          `old recovery snapshots could not all be removed (code=${result.code ?? 'null'}); the update continues`,
+        );
+      } else if (removed.length > 0) {
+        options.log.info(`removed ${removed.length} old recovery snapshot(s)`);
+      }
+      return { removed };
     },
 
     async updateSharedDsh(request: SharedUpdateRunRequest, onLine) {

@@ -516,6 +516,35 @@ describe('external backend attach', () => {
   });
 });
 
+describe('update preflight', () => {
+  const EXTERNAL_PID = 4711;
+
+  it('refuses an update while the backend belongs to the launcher', async () => {
+    const harness = createHarness({
+      portState: 'occupied',
+      wsl: { portOwner: EXTERNAL_PID, probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe() : null) },
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    const blocker = supervisor.updateBlocker();
+    expect(blocker).toContain('started outside this app');
+    // The owner has to be told what to stop; a bare refusal is not actionable.
+    expect(blocker).toContain('systemctl --user stop dsh-web');
+    expect(blocker).toContain('Nothing was changed');
+  });
+
+  it('allows an update while the backend belongs to the app', async () => {
+    const harness = createHarness({ portState: 'free' });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+
+    expect(supervisor.state).toBe('READY');
+    expect(supervisor.updateBlocker()).toBeNull();
+  });
+});
+
 describe('external backend expectation (boot race)', () => {
   const EXTERNAL_PID = 4711;
   const externalWsl = {
