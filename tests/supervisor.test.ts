@@ -656,6 +656,55 @@ describe('update preflight', () => {
     expect(paused.ok).toBe(false);
     expect(paused.message).toContain('could not be stopped');
     expect(supervisor.updateInProgress).toBe(false);
+    // A refusal changes nothing, so the app must not stay stuck in "Stopping".
+    expect(supervisor.state).toBe('READY');
+  });
+
+  it('does not report success when the owner unit does not come back', async () => {
+    // The unit was stopped and started, but the start was refused by the manager.
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    await supervisor.start();
+    await expect(supervisor.pauseForUpdate()).resolves.toMatchObject({ ok: true });
+    expect(supervisor.updateInProgress).toBe(true);
+
+    harness.wsl.controlResult = { ok: false, message: 'systemctl start refused' };
+    const resumed = await supervisor.resumeAfterUpdate();
+
+    // Starting an app-owned backend on the same port would hide the failure and
+    // leave the owner's own unit stopped while telling them the update worked.
+    expect(resumed.ok).toBe(false);
+    expect(resumed.message).toContain('dsh-web.service');
+    expect(harness.wsl.starts).toHaveLength(0);
+  });
+
+  it('stops the unit it started before the previous files are restored', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    await supervisor.start();
+    await supervisor.pauseForUpdate();
+    harness.wsl.controlResult = { ok: true, message: null };
+    await supervisor.resumeAfterUpdate();
+    expect(supervisor.state).toBe('READY');
+
+    const callsBefore = harness.wsl.managedCalls.length;
+    await supervisor.stopForRollback();
+
+    // Overwriting an installation under a running process is the corruption the
+    // coordination exists to prevent, and a rollback writes those files too.
+    expect(harness.wsl.managedCalls.slice(callsBefore).map((call) => call.action)).toEqual(['stop']);
+    await supervisor.stopForRollback();
+    expect(harness.wsl.managedCalls.slice(callsBefore)).toHaveLength(1);
+  });
+
+  it('never starts a unit whose runtime must not be started', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    await supervisor.start();
+    await supervisor.pauseForUpdate();
+    harness.wsl.managedCalls.length = 0;
+
+    supervisor.blockForRuntime('the previous version could not be restored');
+
+    expect(harness.wsl.managedCalls).toHaveLength(0);
+    expect(supervisor.state).toBe('ERROR');
   });
 });
 

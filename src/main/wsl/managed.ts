@@ -25,23 +25,25 @@ export const PROBE_MANAGED_SCRIPT = [
   'pid="$0"',
   'case "$pid" in ""|*[!0-9]*) echo "managed: rejected pid" >&2; exit 64 ;; esac',
   'user=$(id -un 2>/dev/null || echo unknown)',
-  'scope=none; unit="-"',
+  // The kernel writes "0::/system.slice/x.service" (cgroup v2) or
+  // "4:systemd:/system.slice/x.service" (v1). The leading hierarchy fields are
+  // not part of the path, so only the text after the last colon is used.
+  'path=""',
   'if [ -r "/proc/$pid/cgroup" ]; then',
-  'cg=$(head -n 1 "/proc/$pid/cgroup" 2>/dev/null)',
-  'case "$cg" in',
-  '  /system.slice/*) scope=system ;;',
-  '  /user.slice/*) scope=user ;;',
-  'esac',
-  'cand=$(printf "%s" "$cg" | tr "/" "\\n" | grep -E "\\.service$" | tail -n 1 2>/dev/null)',
-  'case "$cand" in ""|*[!A-Za-z0-9_.@:-]*) ;; *) if [ "$scope" != none ]; then unit="$cand"; fi ;; esac',
+  '  line=$(head -n 1 "/proc/$pid/cgroup" 2>/dev/null || true)',
+  '  path="${line##*:}"',
   'fi',
-  'can=0',
-  'if [ "$scope" = system ]; then',
-  '  sudo -n -l "/usr/bin/systemctl stop $unit" >/dev/null 2>&1 && can=1',
-  'elif [ "$scope" = user ]; then',
-  '  systemctl --user show "$unit" --property=Id >/dev/null 2>&1 && can=1',
+  'unit="-"',
+  'cand=$(printf "%s" "$path" | tr "/" "\\n" | grep -E "^[A-Za-z0-9_.@:-]+\\.service$" | tail -n 1 2>/dev/null || true)',
+  'case "$cand" in ""|*[!A-Za-z0-9_.@:-]*) ;; *) unit="$cand" ;; esac',
+  // Both answers are reported; the caller picks the one that matches the scope it
+  // derived from the same path, so the shell never has to classify anything.
+  'can_sys=0; can_user=0',
+  'if [ "$unit" != "-" ]; then',
+  '  sudo -n -l "/usr/bin/systemctl stop $unit" >/dev/null 2>&1 && can_sys=1',
+  '  systemctl --user show "$unit" --property=Id >/dev/null 2>&1 && can_user=1',
   'fi',
-  `printf "%s scope=%s unit=%s can=%s user=%s\\n" "${MANAGED_MARKER}" "$scope" "$unit" "$can" "$user"`,
+  `printf "%s path=%s unit=%s can_sys=%s can_user=%s user=%s\\n" "${MANAGED_MARKER}" "$path" "$unit" "$can_sys" "$can_user" "$user"`,
   'exit 0',
 ].join('\n');
 
@@ -108,26 +110,54 @@ export function buildControlManagedArgs(request: {
 }
 
 /** Parse the probe report; unrecognised output means "no manager". */
+/**
+ * Reads a single cgroup line and says which manager owns the process.
+ *
+ * The record is `<hierarchy>:<controllers>:<path>`; only the path matters, and it
+ * is the text after the *last* colon, so both the v2 form `0::/system.slice/x`
+ * and the v1 form `4:systemd:/system.slice/x` land on `/system.slice/x`.
+ */
+export function classifyCgroup(text: string): { scope: 'system' | 'user' | 'none'; unit: string | null } {
+  const path = text.slice(text.lastIndexOf(':') + 1).trim();
+  // A cgroup path is kernel-written and never contains "..", so one that does is
+  // not a path this app is willing to name a unit from.
+  let scope: 'system' | 'user' | 'none' = 'none';
+  if (path.includes('..')) return { scope: 'none', unit: null };
+  if (path.startsWith('/system.slice/')) scope = 'system';
+  else if (path.startsWith('/user.slice/')) scope = 'user';
+  const segments = path.split('/').filter((segment) => segment.length > 0);
+  const candidate = segments.length === 0 ? null : (segments[segments.length - 1] ?? null);
+  const unit = candidate !== null && UNIT_PATTERN.test(candidate) && candidate.endsWith('.service') ? candidate : null;
+  return { scope, unit: scope === 'none' ? null : unit };
+}
+
 export function parseManagedReport(text: string): ManagedBackend {
-  const empty: ManagedBackend = { scope: 'none', unit: null, canControl: false, user: 'user' };
+  const fallback: ManagedBackend = { scope: 'none', unit: null, canControl: false, user: 'user' };
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line.startsWith(`${MANAGED_MARKER} `)) continue;
+    if (!line.startsWith(MANAGED_MARKER)) continue;
     const fields = new Map<string, string>();
-    for (const part of line.slice(MANAGED_MARKER.length + 1).split(' ')) {
-      const at = part.indexOf('=');
-      if (at > 0) fields.set(part.slice(0, at), part.slice(at + 1));
+    for (const token of line.slice(MANAGED_MARKER.length).trim().split(/\s+/)) {
+      const at = token.indexOf('=');
+      // A field without "=" means the reply is not the one this script writes
+      // (it may carry extra words such as a user name with a space in it).
+      if (at <= 0) return fallback;
+      fields.set(token.slice(0, at), token.slice(at + 1));
     }
-    const scope = fields.get('scope');
-    const rawUser = fields.get('user') ?? '';
-    const user = /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(rawUser) ? rawUser : 'user';
+    const user = fields.get('user');
+    const reportedUnit = fields.get('unit');
+    if (user === undefined || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(user)) return fallback;
+    const { scope } = classifyCgroup(`0::${fields.get('path') ?? ''}`);
     if (scope === 'none') return { scope: 'none', unit: null, canControl: false, user };
-    if (scope !== 'system' && scope !== 'user') return empty;
-    const unit = fields.get('unit') ?? '';
-    if (!UNIT_PATTERN.test(unit)) return empty;
-    return { scope, unit, canControl: fields.get('can') === '1', user };
+    // The unit is taken from the path the shell reported, not from `unit=`, so a
+    // backend cannot hand the caller a name that does not belong to that path.
+    const fromPath = classifyCgroup(`0::${fields.get('path') ?? ''}`).unit;
+    if (fromPath === null) return { scope: 'none', unit: null, canControl: false, user };
+    if (reportedUnit !== fromPath) return { scope: 'none', unit: null, canControl: false, user };
+    const canControl = scope === 'system' ? fields.get('can_sys') === '1' : fields.get('can_user') === '1';
+    return { scope, unit: fromPath, canControl, user };
   }
-  return empty;
+  return fallback;
 }
 
 /** The one narrow rule the app needs for a system unit; shown to the owner. */

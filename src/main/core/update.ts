@@ -289,6 +289,12 @@ export interface SharedUpdatePlanInput {
   installation: DshInstallation;
   /** True when the user pinned a custom executable in Settings. */
   customExecutable: boolean;
+  /**
+   * The backend the app is attached to and can stop through its own manager, if
+   * any. Its own process is not "another session": it is the one this update is
+   * about to stop, so it does not block the plan.
+   */
+  stoppablePid?: number | null;
 }
 
 export interface SharedUpdatePlan {
@@ -300,6 +306,11 @@ export interface SharedUpdatePlan {
   dshPath: string;
   /** `readlink -f` of that executable: the file npm really owns. */
   realPath: string;
+  /**
+   * The attached backend this plan is allowed to stop, `null` when none. Carried
+   * through the plan so the runner's re-check agrees with the first decision.
+   */
+  stoppablePid: number | null;
   /** npm global prefix, verified by `npm prefix -g` inside the script. */
   prefix: string;
   packageDir: string;
@@ -427,8 +438,16 @@ export function planSharedUpdate(input: SharedUpdatePlanInput): SharedUpdatePlan
   if (!installation.writable) {
     return { ok: false, reason: UPDATE_REASONS.notWritable, detail: installation.prefix };
   }
-  if (installation.foreignProcesses > 0) {
-    return { ok: false, reason: UPDATE_REASONS.foreignProcess, detail: `${installation.foreignProcesses}` };
+  // Every process running from this installation blocks the update, except the
+  // managed backend the app verified it can stop. A list, not a count: with only
+  // a number, "one other session" and "my own attached backend" look identical.
+  const stoppable = input.stoppablePid ?? null;
+  const blocking = installation.foreignPids.filter((pid) => pid !== stoppable);
+  if (blocking.length > 0 || installation.foreignProcesses > installation.foreignPids.length) {
+    // A count larger than the list means the scan hit its own limit: refuse
+    // rather than install while an unlisted process still holds the files.
+    const detail = `${Math.max(blocking.length, installation.foreignProcesses - installation.foreignPids.length)}`;
+    return { ok: false, reason: UPDATE_REASONS.foreignProcess, detail };
   }
   // The product promise: the app runs, and updates, the executable a terminal
   // runs. A login shell that resolves another file makes that impossible.
@@ -445,6 +464,7 @@ export function planSharedUpdate(input: SharedUpdatePlanInput): SharedUpdatePlan
   return {
     ok: true,
     plan: {
+      stoppablePid: input.stoppablePid ?? null,
       distro: input.distro,
       appRoot: input.appRoot,
       version: input.targetVersion,

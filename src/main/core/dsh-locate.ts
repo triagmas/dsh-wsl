@@ -40,6 +40,12 @@ export interface DshInstallation {
   /** Number of processes running from this installation that the app does not own. */
   foreignProcesses: number;
   /**
+   * Their pids. A count cannot separate "another session the owner is using"
+   * from "the managed backend that is about to be stopped", so the plan needs the
+   * list to know whether the only holder is the one it may stop itself.
+   */
+  foreignPids: number[];
+  /**
    * Real path a **login shell** resolves for `dsh`, `null` when the distribution
    * has no login shell or it resolves nothing.
    *
@@ -133,10 +139,23 @@ export function parseSharedDshReport(text: string): SharedDshReport {
       npmPath,
       source: asSource(fields.get('source') ?? ''),
       foreignProcesses: asCount(fields.get('foreign') ?? '0'),
+      foreignPids: asPids(fields.get('foreign_pids') ?? ''),
       loginShellRealPath,
       loginShellVersion,
     },
   };
+}
+
+/** A comma separated pid list; anything that is not a plain pid is dropped. */
+function asPids(value: string): number[] {
+  const pids: number[] = [];
+  for (const part of value.split(',')) {
+    const trimmed = part.trim();
+    if (!/^[0-9]{1,10}$/.test(trimmed)) continue;
+    const pid = Number(trimmed);
+    if (Number.isSafeInteger(pid) && pid > 0 && !pids.includes(pid)) pids.push(pid);
+  }
+  return pids;
 }
 
 /**

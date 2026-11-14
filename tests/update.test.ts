@@ -226,10 +226,48 @@ describe('shared installation update plan (issue #17)', () => {
   });
 
   it('refuses when another DSH process uses the installation', () => {
-    expect(planResult({ installation: installation({ foreignProcesses: 2 }) })).toMatchObject({
-      ok: false,
-      reason: UPDATE_REASONS.foreignProcess,
+    expect(
+      planResult({ installation: installation({ foreignProcesses: 2, foreignPids: [194, 500] }) }),
+    ).toMatchObject({ ok: false, reason: UPDATE_REASONS.foreignProcess });
+  });
+
+  it('allows the attached backend the app can stop itself', () => {
+    // An attached backend holds the installation too. Refusing would make the
+    // update impossible exactly where it matters, so the one process the app
+    // verified it can stop is not counted as "another session".
+    const result = planResult({
+      installation: installation({ foreignProcesses: 1, foreignPids: [194] }),
+      stoppablePid: 194,
     });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.plan.stoppablePid).toBe(194);
+  });
+
+  it('still refuses when a second process holds the installation', () => {
+    expect(
+      planResult({
+        installation: installation({ foreignProcesses: 2, foreignPids: [194, 500] }),
+        stoppablePid: 194,
+      }),
+    ).toMatchObject({ ok: false, reason: UPDATE_REASONS.foreignProcess, detail: '1' });
+  });
+
+  it('refuses when the count is larger than the pid list', () => {
+    // A truncated or missing list must never be read as "nobody else is running".
+    expect(
+      planResult({ installation: installation({ foreignProcesses: 3, foreignPids: [194] }), stoppablePid: 194 }),
+    ).toMatchObject({ ok: false, reason: UPDATE_REASONS.foreignProcess });
+    expect(
+      planResult({ installation: installation({ foreignProcesses: 1, foreignPids: [] }) }),
+    ).toMatchObject({ ok: false, reason: UPDATE_REASONS.foreignProcess });
+  });
+
+  it('refuses a backend nobody can stop, even when it is the only holder', () => {
+    // No verified manager (hand-started backend): the pid is known, but the app
+    // has no right to stop it, so it is a foreign process like any other.
+    expect(
+      planResult({ installation: installation({ foreignProcesses: 1, foreignPids: [194] }), stoppablePid: null }),
+    ).toMatchObject({ ok: false, reason: UPDATE_REASONS.foreignProcess });
   });
 
   it('refuses when npm is missing', () => {
@@ -622,6 +660,9 @@ function runnerHarness(
       order.push('resume');
       return { ok: options.resumeOk !== false, message: options.resumeOk === false ? 'backend did not start' : null };
     },
+    stopForRollback: async () => {
+      order.push('stop-for-rollback');
+    },
     releaseUpdateLock: () => {
       order.push('release');
     },
@@ -767,7 +808,8 @@ describe('update runner transaction (issue #17)', () => {
     expect(outcome.state.phase).toBe('rolled-back');
     expect(h.wsl.rollbackRuns[0]?.version).toBe('0.2.1-rc.5');
     expect(h.journal.current()).toBeNull();
-    expect(h.order).toEqual(['pause', 'resume']);
+    // The unit this update started is stopped before the previous files are restored.
+    expect(h.order).toEqual(['pause', 'stop-for-rollback', 'resume']);
   });
 
   it('blocks further starts when the rollback itself failed', async () => {

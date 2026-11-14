@@ -17,6 +17,7 @@ import {
   buildInstallRuleArgs,
   buildProbeManagedArgs,
   buildRootRuleScript,
+  classifyCgroup,
   parseInstallRuleReport,
   parseManagedReport,
   sudoersLines,
@@ -25,23 +26,56 @@ import {
 const marker = (fields: string): string => `__dsh_wsl_managed__ ${fields}`;
 
 describe('managed backend probe', () => {
-  it('reports the unit behind a system-scope pid', () => {
-    expect(parseManagedReport(marker('scope=system unit=dsh-web.service can=1 user=triag'))).toEqual({
+  it('reads the unit out of a real cgroup v2 record', () => {
+    // What the kernel actually writes: the hierarchy fields come before the
+    // path, so matching on "/system.slice" alone would never fire.
+    expect(classifyCgroup('0::/system.slice/dsh-web.service')).toEqual({
       scope: 'system',
       unit: 'dsh-web.service',
-      canControl: true,
-      user: 'triag',
     });
+    expect(classifyCgroup('0::/user.slice/user-1000.slice/user@1000.service/app.slice/dsh-web.service')).toEqual({
+      scope: 'user',
+      unit: 'dsh-web.service',
+    });
+    // cgroup v1 names the controllers instead of leaving the field empty.
+    expect(classifyCgroup('4:systemd:/system.slice/dsh-web.service')).toEqual({
+      scope: 'system',
+      unit: 'dsh-web.service',
+    });
+    expect(classifyCgroup('0::/system.slice/system-dsh.slice/dsh-web-dev.service')).toEqual({
+      scope: 'system',
+      unit: 'dsh-web-dev.service',
+    });
+    for (const text of [
+      '0::/init.scope',
+      '0::/',
+      '0::/system.slice',
+      '0::/system.slice/not-a-unit',
+      '0::/system.slice/../../etc/shadow.service',
+      'garbage',
+      '',
+    ]) {
+      expect(classifyCgroup(text).unit).toBeNull();
+    }
+  });
+
+  it('reports the unit behind a system-scope pid', () => {
+    expect(
+      parseManagedReport(marker('path=/system.slice/dsh-web.service unit=dsh-web.service can_sys=1 can_user=0 user=triag')),
+    ).toEqual({ scope: 'system', unit: 'dsh-web.service', canControl: true, user: 'triag' });
+    // A system unit sudo does not cover: identified, but not controllable.
+    expect(
+      parseManagedReport(marker('path=/system.slice/dsh-web.service unit=dsh-web.service can_sys=0 can_user=0 user=triag')),
+    ).toEqual({ scope: 'system', unit: 'dsh-web.service', canControl: false, user: 'triag' });
   });
 
   it('reports a user-scope unit and a hand-started process', () => {
-    expect(parseManagedReport(marker('scope=user unit=dsh-web.service can=1 user=triag'))).toEqual({
-      scope: 'user',
-      unit: 'dsh-web.service',
-      canControl: true,
-      user: 'triag',
-    });
-    expect(parseManagedReport(marker('scope=none unit=- can=0 user=triag'))).toEqual({
+    expect(
+      parseManagedReport(
+        marker('path=/user.slice/user-1000.slice/user@1000.service/app.slice/dsh-web.service unit=dsh-web.service can_sys=0 can_user=1 user=triag'),
+      ),
+    ).toEqual({ scope: 'user', unit: 'dsh-web.service', canControl: true, user: 'triag' });
+    expect(parseManagedReport(marker('path=/init.scope unit=- can_sys=0 can_user=0 user=triag'))).toEqual({
       scope: 'none',
       unit: null,
       canControl: false,
@@ -53,12 +87,22 @@ describe('managed backend probe', () => {
     for (const text of [
       '',
       'systemctl: command not found',
-      marker('scope=system unit=../../evil can=1 user=triag'),
-      marker('scope=root unit=dsh-web.service can=1 user=triag'),
-      marker('scope=system can=1 user=triag'),
+      marker('path=/system.slice/../../etc/shadow.service unit=../../evil can_sys=1 can_user=0 user=triag'),
+      marker('path=/system.slice/dsh-web.service unit=other.service can_sys=1 can_user=0 user=triag'),
+      marker('path=/system.slice/dsh-web.service unit=dsh-web.service can_sys=1 can_user=0 user=bad user'),
+      marker('path=/system.slice/dsh-web.service can_sys=1 can_user=0 user=triag'),
     ]) {
-      expect(parseManagedReport(text)).toEqual({ scope: 'none', unit: null, canControl: false, user: 'user' });
+      const report = parseManagedReport(text);
+      expect({ scope: report.scope, unit: report.unit, canControl: report.canControl }).toEqual({
+        scope: 'none',
+        unit: null,
+        canControl: false,
+      });
     }
+    // The quoting user is still reported when the reply itself was well formed;
+    // a reply without a usable user name is not trusted at all.
+    expect(parseManagedReport(marker('path=/init.scope unit=- can_sys=0 can_user=0 user=triag')).user).toBe('triag');
+    expect(parseManagedReport(marker('path=/system.slice/dsh-web.service user=bad user')).user).toBe('user');
   });
 
   it('validates its inputs before they reach wsl.exe', () => {

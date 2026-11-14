@@ -55,6 +55,7 @@ function installation(overrides: Partial<DshInstallation> = {}): DshInstallation
     writable: true,
     npmPath: '/usr/bin/npm',
     source: 'login-shell',
+    foreignPids: [],
     foreignProcesses: 0,
     loginShellRealPath: `${PKG}/bin/dsh.js`,
     loginShellVersion: '0.2.1-rc.5',
@@ -78,6 +79,7 @@ describe('provenance report parsing', () => {
       npmPath: '/usr/bin/npm',
       source: 'login-shell',
       foreignProcesses: 0,
+      foreignPids: [],
       loginShellRealPath: `${PKG}/bin/dsh.js`,
       loginShellVersion: '0.2.1-rc.5',
     });
