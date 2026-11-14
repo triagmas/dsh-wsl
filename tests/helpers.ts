@@ -295,6 +295,8 @@ export interface HarnessOptions {
   attachPollMs?: number;
   discoveryGraceMs?: number;
   discoveryPollMs?: number;
+  /** Liveness of a keepalive session; tests decide whether it survived. */
+  keepaliveAlive?: (pid: number) => boolean;
 }
 
 export function createHarness(options: HarnessOptions = {}) {
@@ -337,6 +339,7 @@ export function createHarness(options: HarnessOptions = {}) {
       attachPollMs: options.attachPollMs ?? 5,
       discoveryGraceMs: options.discoveryGraceMs ?? 0,
       discoveryPollMs: options.discoveryPollMs ?? 5,
+      ...(options.keepaliveAlive === undefined ? {} : { keepaliveAlive: options.keepaliveAlive }),
     },
   };
 }

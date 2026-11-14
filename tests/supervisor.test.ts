@@ -524,6 +524,40 @@ describe('external backend expectation (boot race)', () => {
     expect(harness.wsl.keepalives).toEqual(['Ubuntu']);
   });
 
+  it('re-arms the distribution keepalive when whatever held WSL open is gone', async () => {
+    const EXTERNAL_PID = 4711;
+    let keeperAlive = true;
+    const harness = createHarness({
+      portState: (port: number) => (port === PORT ? 'occupied' : 'free'),
+      wsl: {
+        portOwner: (port: number) => (port === PORT ? EXTERNAL_PID : null),
+        probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe({ port: PORT }) : null),
+      },
+      external: createMemoryExternalStore(expectation()),
+      attachWaitMs: 30,
+      attachPollMs: 5,
+      keepaliveAlive: () => keeperAlive,
+    });
+    const supervisor = new Supervisor(harness.deps);
+    await supervisor.start();
+    expect(harness.wsl.keepalives).toEqual(['Ubuntu']);
+
+    // A healthy tick with a live session must not spawn a second one.
+    await supervisor.healthTick();
+    expect(harness.wsl.keepalives).toEqual(['Ubuntu']);
+
+    // The session died: the distribution now has about ten seconds before WSL2
+    // powers it off and takes the owner's backend with it.
+    keeperAlive = false;
+    await supervisor.healthTick();
+    expect(harness.wsl.keepalives).toEqual(['Ubuntu', 'Ubuntu']);
+
+    // The new session holds, so the next tick is quiet again.
+    keeperAlive = true;
+    await supervisor.healthTick();
+    expect(harness.wsl.keepalives).toEqual(['Ubuntu', 'Ubuntu']);
+  });
+
   it('keeps serving beside the reserved port when the launcher rejects this profile', async () => {
     const EXTERNAL_PID = 4711;
     let launcherUp = false;
