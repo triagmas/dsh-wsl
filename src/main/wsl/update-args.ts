@@ -100,8 +100,11 @@ const VERSION_HELPER = [
  * nothing is running). The scan excludes itself.
  */
 const FOREIGN_HELPER = [
-  'foreign_count() {',
-  'target="$1"; own="$2"; n=0',
+  // Which pids run from that installation. The count alone cannot tell "another
+  // session I must not touch" from "the managed backend I am about to stop", and
+  // the update needs that distinction to be allowed at all.
+  'foreign_list() {',
+  'target="$1"; own="$2"; out=""',
   'for d in /proc/[0-9]*; do',
   'pid="${d#/proc/}"',
   '[ "$pid" = "$$" ] && continue',
@@ -109,8 +112,13 @@ const FOREIGN_HELPER = [
   '[ -r "$d/cmdline" ] || continue',
   'cmd="$(tr "\\000" " " < "$d/cmdline" 2>/dev/null || true)"',
   `case "$cmd" in *"${SELF_MARKER}"*) continue ;; esac`,
-  'case "$cmd" in *"$target"*) n=$((n+1)) ;; esac',
+  'case "$cmd" in *"$target"*) out="$out${out:+,}$pid" ;; esac',
   'done',
+  'printf "%s" "$out"',
+  '}',
+  'foreign_count() {',
+  'target="$1"; own="$2"; n=0',
+  'for pid in $(printf "%s" "$(foreign_list "$target" "$own")" | tr "," " "); do n=$((n+1)); done',
   'printf "%s" "$n"',
   '}',
 ].join('\n');
@@ -442,6 +450,7 @@ export const INSPECT_SHARED_SCRIPT = [
   `printf "%s package=%s\\n" "${INSPECT_MARKER}" "$pkg"`,
   `printf "%s writable=%s\\n" "${INSPECT_MARKER}" "$writable"`,
   `printf "%s foreign=%s\\n" "${INSPECT_MARKER}" "$(foreign_count "$real" "$own")"`,
+  `printf "%s foreign_pids=%s\\n" "${INSPECT_MARKER}" "$(foreign_list "$real" "$own")"`,
   'exit 0',
 ].join('\n');
 

@@ -360,6 +360,7 @@ async function bootstrap(): Promise<void> {
       appRoot: config.runtimeRoot,
       installation: report.installation,
       customExecutable: config.dshPath !== null,
+      stoppablePid: supervisor.stoppableBackendPid(),
     });
   }
 

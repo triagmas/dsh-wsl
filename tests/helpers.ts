@@ -35,6 +35,7 @@ export const DEFAULT_INSTALLATION: DshInstallation = {
   npmPath: '/usr/bin/npm',
   source: 'login-shell',
   foreignProcesses: 0,
+  foreignPids: [],
   loginShellRealPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
   loginShellVersion: '0.2.1-rc.5',
 };

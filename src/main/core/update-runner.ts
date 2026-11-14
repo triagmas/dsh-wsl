@@ -51,6 +51,8 @@ import {
 export interface UpdateLifecycle {
   pauseForUpdate(): Promise<UpdateTransition>;
   resumeAfterUpdate(): Promise<UpdateTransition>;
+  /** Stop a unit this update started, before the previous files are restored. */
+  stopForRollback(): Promise<void>;
   releaseUpdateLock(): void;
   /** Terminal state for an installation that must not be started (failed rollback). */
   blockForRuntime(message: string): void;
@@ -192,6 +194,10 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
     where: string,
     snapshotDir: string,
   ): Promise<UpdateOutcome> => {
+    // A backend the update started has to be stopped before the previous files
+    // are written back: restoring under a running process is the same corruption
+    // this coordination exists to prevent.
+    await deps.lifecycle.stopForRollback();
     const restored = await deps.wsl
       .rollbackSharedDsh(
         {
@@ -322,6 +328,7 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
           appRoot: plan.appRoot,
           installation: inspection.installation,
           customExecutable: context.customExecutable,
+          stoppablePid: plan.stoppablePid,
         });
         if (!rechecked.ok) {
           return {

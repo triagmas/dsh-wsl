@@ -369,6 +369,10 @@ export class Supervisor {
   private stoppedManaged: { scope: 'system' | 'user'; unit: string } | null = null;
   /** Manager seen by the last probe; drives the one-password hint. */
   private lastManaged: ManagedBackend | null = null;
+  /** Unit this update touched, kept until its outcome is known. */
+  private managedUnit: { scope: 'system' | 'user'; unit: string } | null = null;
+  /** True while that unit runs because this update started it. */
+  private managedStarted = false;
   /**
    * The profile expects this port to be served by a backend the owner started
    * (a previous attach succeeded). While true the app waits for that backend
@@ -620,6 +624,20 @@ export class Supervisor {
     };
   }
 
+  /**
+   * The attached backend the app may stop by itself, or `null`.
+   *
+   * Only a backend that a manager owns and that the app is allowed to control
+   * counts: it is the one process the update is allowed to find using the
+   * installation, because stopping it is the first step of that update.
+   */
+  stoppableBackendPid(): number | null {
+    const managed = this.lastManaged;
+    if (!this.attached || this.attachedPid === null || managed === null) return null;
+    if (managed.scope === 'none' || !managed.canControl) return null;
+    return this.attachedPid;
+  }
+
   /** Install that rule with the password the owner typed, then re-probe. */
   async installManagedRule(password: string): Promise<{ ok: boolean; message: string | null }> {
     const rule = this.pendingRule();
@@ -650,9 +668,9 @@ export class Supervisor {
    * Best effort by design: the WebUI must come back either way, and `bringUp`
    * already falls back to an app-owned backend when the launcher does not return.
    */
-  private async startStoppedManaged(): Promise<void> {
+  private async startStoppedManaged(): Promise<{ ok: boolean; message: string | null }> {
     const stopped = this.stoppedManaged;
-    if (stopped === null) return;
+    if (stopped === null) return { ok: true, message: null };
     this.stoppedManaged = null;
     try {
       const started = await this.deps.wsl.controlManagedBackend({
@@ -662,15 +680,43 @@ export class Supervisor {
         action: 'start',
       });
       if (started.ok) {
+        this.managedStarted = true;
         this.deps.log.info(`update: started ${stopped.unit} (${stopped.scope}) again`);
-      } else {
-        this.deps.log.warn(
-          `update: ${stopped.unit} did not start (${started.message ?? 'unknown error'}); the app serves the WebUI itself`,
-        );
+        return { ok: true, message: null };
       }
+      const message = started.message ?? 'the manager reported a failure';
+      this.deps.log.warn(`update: ${stopped.unit} did not start (${message})`);
+      return { ok: false, message: `${stopped.unit} did not start (${message})` };
     } catch (error) {
-      this.deps.log.warn(`update: ${stopped.unit} could not be started: ${describe(error)}`);
+      const message = describe(error);
+      this.deps.log.warn(`update: ${stopped.unit} could not be started: ${message}`);
+      return { ok: false, message: `${stopped.unit} could not be started: ${message}` };
     }
+  }
+
+  /**
+   * Stop the unit this update started, before the previous files are restored.
+   *
+   * Overwriting an installation under a running process is what the whole
+   * coordination exists to avoid, and a rollback writes those files too.
+   */
+  async stopForRollback(): Promise<void> {
+    const unit = this.managedUnit;
+    if (unit === null || !this.managedStarted) return;
+    this.managedStarted = false;
+    try {
+      const stopped = await this.deps.wsl.controlManagedBackend({
+        distro: this.distro(),
+        scope: unit.scope,
+        unit: unit.unit,
+        action: 'stop',
+      });
+      if (!stopped.ok) this.deps.log.warn(`update: ${unit.unit} could not be stopped for the rollback (${stopped.message ?? 'unknown error'})`);
+    } catch (error) {
+      this.deps.log.warn(`update: ${unit.unit} could not be stopped for the rollback: ${describe(error)}`);
+    }
+    // It is stopped again, so the resume path has to start it once more.
+    this.stoppedManaged = unit;
   }
 
   pauseForUpdate(): Promise<UpdateTransition> {
@@ -680,6 +726,7 @@ export class Supervisor {
         // The backend belongs to the owner's launcher, and an update replaces the
         // files it executes: ask the launcher to stop it, exactly as the owner
         // would, then hold the update lock so recovery cannot start a competitor.
+        const previousState = this.lifecycle.state;
         const managed = await this.discoverManaged();
         if (managed === null || managed.scope === 'none' || managed.unit === null || !managed.canControl) {
           return {
@@ -701,6 +748,9 @@ export class Supervisor {
           .catch((error: unknown) => ({ ok: false as const, message: describe(error) }));
         if (!stopped.ok) {
           this.updateLocked = false;
+          // Nothing changed, so the app must go back to being ready instead of
+          // sitting in "Stopping DeepSeek Harness" forever.
+          this.setState(previousState, null);
           this.deps.log.error(`update: ${managed.unit} could not be stopped (${stopped.message ?? 'unknown error'})`);
           return {
             ok: false,
@@ -710,6 +760,8 @@ export class Supervisor {
           };
         }
         this.stoppedManaged = { scope: managed.scope, unit: managed.unit };
+        this.managedUnit = { scope: managed.scope, unit: managed.unit };
+        this.managedStarted = false;
         // The process is gone: the next bring-up must attach to the unit's new
         // process instead of believing it already has one.
         this.attached = false;
@@ -762,9 +814,18 @@ export class Supervisor {
       this.attempt = 0;
       try {
         // A unit the app stopped comes back first: `bringUp` then attaches to its
-        // new process (the external expectation is already recorded), or serves
-        // the WebUI itself when the launcher stays away.
-        await this.startStoppedManaged();
+        // new process (the external expectation is already recorded).
+        //
+        // If it does not come back, the update is not a success: starting an
+        // app-owned backend on the same port would hide the failure and leave the
+        // owner's own unit stopped.
+        const started = await this.startStoppedManaged();
+        if (!started.ok) {
+          return {
+            ok: false,
+            message: `${started.message ?? 'the backend did not start'}. The DeepSeek Harness that serves the WebUI is not running.`,
+          };
+        }
         // The lock stays held until the start finished, so a late exit event from
         // the backend that was just stopped cannot start a recovery mid-update.
         await this.bringUp();
@@ -787,7 +848,12 @@ export class Supervisor {
    * hide the problem, so the app explains it instead.
    */
   blockForRuntime(message: string): void {
-    this.releaseUpdateLock();
+    // Deliberately *not* releaseUpdateLock(): that starts the stopped unit, and
+    // this path exists precisely because its runtime must not be started.
+    this.updateLocked = false;
+    this.stoppedManaged = null;
+    this.managedUnit = null;
+    this.managedStarted = false;
     this.owned = false;
     this.fail(
       new ShellError(
@@ -1714,6 +1780,9 @@ export class Supervisor {
       this.externalExpected = true;
       this.recordExternalExpectation();
       this.deps.log.info(`attached to the running backend (pid=${pid}); it stays outside the app lifecycle`);
+      // Learn which manager owns it right away: the update window asks whether
+      // that backend may be stopped long before the owner presses Update.
+      void this.discoverManaged();
       return 'attached';
     } catch (error) {
       this.deps.log.warn(`attach probe failed: ${describe(error)}`);
