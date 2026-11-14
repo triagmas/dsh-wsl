@@ -35,17 +35,16 @@ credentials of the official Windows DeepSeek Harness are never touched. Because 
 your normal `~/.dsh` data as well.
 
 > **Release status.** The current published prerelease is
-> [`v0.1.0-beta.2`](https://github.com/triagmas/dsh-wsl/releases/tag/v0.1.0-beta.2) —
-> built from `main@a9e9446` by Windows CI run
-> [`42474816421`](https://github.com/triagmas/dsh-wsl/actions/runs/42474816421). It ships
+> [`v0.1.0-beta.13`](https://github.com/triagmas/dsh-wsl/releases/tag/v0.1.0-beta.13) —
+> built from `main@9b006fd` by Windows CI run
+> [`43605920413`](https://github.com/triagmas/dsh-wsl/actions/runs/43605920413). It ships
 > both variants from that one commit:
-> [`DSH-WSL-0.1.0-x64-Portable.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.2/DSH-WSL-0.1.0-x64-Portable.exe),
-> [`DSH-WSL-0.1.0-x64-Setup.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.2/DSH-WSL-0.1.0-x64-Setup.exe)
-> and [`SHA256SUMS.txt`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.2/SHA256SUMS.txt).
-> The older
-> [`v0.1.0-beta.1`](https://github.com/triagmas/dsh-wsl/releases/tag/v0.1.0-beta.1)
-> predates the rename and contains a single portable EXE under the old
-> `WSL-Web-Shell-…` name. There is no stable release yet — both are prereleases.
+> [`DSH-WSL-0.1.0-beta.13-x64-Portable.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.13/DSH-WSL-0.1.0-beta.13-x64-Portable.exe),
+> [`DSH-WSL-0.1.0-beta.13-x64-Setup.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.13/DSH-WSL-0.1.0-beta.13-x64-Setup.exe)
+> and [`SHA256SUMS.txt`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.13/SHA256SUMS.txt).
+> This is the first prerelease whose file names carry the beta number; the earlier
+> `DSH-WSL-0.1.0-x64-…` assets belong to `v0.1.0-beta.2` … `v0.1.0-beta.12`. There is no
+> stable release yet — every tag is a prerelease.
 
 ## What you get
 
