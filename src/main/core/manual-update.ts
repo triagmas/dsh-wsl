@@ -171,5 +171,10 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
     };
   }
 
-  return { installed, state: 'pending', commands: [install], description: null };
+  return {
+    installed,
+    state: 'pending',
+    commands: [install],
+    description: 'Run this in a WSL terminal, then start the backend again.',
+  };
 }

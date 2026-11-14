@@ -137,7 +137,7 @@ describe('manual update commands', () => {
       unit: null,
     });
     expect(plan.commands).toEqual([`npm install -g ${DSH_PACKAGE}@0.2.2`]);
-    expect(plan.description).toBeNull();
+    expect(plan.description).toContain('start the backend again');
   });
 
   it('drops a unit name that does not pass the guard', () => {

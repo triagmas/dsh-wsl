@@ -249,10 +249,11 @@ async function bootstrap(): Promise<void> {
    * whether those commands include stopping and starting a unit, and only a
    * read-only probe supplies the unit name.
    */
-  async function updateProbe(): Promise<UpdateProbe> {
-    // A fresh (but cached by the service) lookup keeps the target current after
-    // the owner installed a version while the app was open.
-    await versions.refreshIfStale().catch(() => undefined);
+  async function updateProbe(force = false): Promise<UpdateProbe> {
+    // "Check again" is an explicit request, so it must not wait out the 18-hour
+    // cache: the owner pressed it because they expect a version published since
+    // the last lookup to appear.
+    await (force ? versions.refresh() : versions.refreshIfStale()).catch(() => undefined);
     const status = supervisor.getStatus();
     const runtime = supervisor.resolvedRuntime();
     const report = await inspectInstallation();
@@ -480,7 +481,7 @@ async function bootstrap(): Promise<void> {
   // Both channels inspect again: the window must never show a stale verdict
   // after the owner ran a command in a WSL terminal.
   guard('update:probe', async () => await updateProbe());
-  guard('update:recheck', async () => await updateProbe());
+  guard('update:recheck', async () => await updateProbe(true));
   guard('update:close', () => {
     windows.closeUpdateConfirm();
   });
