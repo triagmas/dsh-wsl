@@ -39,6 +39,7 @@ const base: Record<string, string> = {
   package: PKG,
   writable: 'yes',
   foreign: '0',
+  foreignpids: '',
   loginreal: `${PKG}/bin/dsh.js`,
   loginversion: '0.2.1-rc.5',
 };
@@ -83,6 +84,22 @@ describe('provenance report parsing', () => {
       loginShellRealPath: `${PKG}/bin/dsh.js`,
       loginShellVersion: '0.2.1-rc.5',
     });
+  });
+
+  it('keeps the pid list that proves the backend may be stopped', () => {
+    // The key charset and the value charset are validated before anything is
+    // used; a pid list that does not survive that check makes every coordinated
+    // update refuse, so this asserts the round trip, not just the parser.
+    const parsed = parseSharedDshReport(
+      report({ ...base, foreign: '2', foreignpids: '194,500' }, []),
+    );
+    expect(parsed.installation?.foreignPids).toEqual([194, 500]);
+    expect(parsed.installation?.foreignProcesses).toBe(2);
+    // Junk inside a list is dropped, not turned into a pid.
+    expect(
+      parseSharedDshReport(report({ ...base, foreign: '1', foreignpids: '194,abc,0,-3,194' }, []))
+        .installation?.foreignPids,
+    ).toEqual([194]);
   });
 
   it('reports a missing installation without inventing a path', () => {

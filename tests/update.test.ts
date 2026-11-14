@@ -642,7 +642,12 @@ interface RunnerHarness {
 }
 
 function runnerHarness(
-  options: { pauseOk?: boolean; resumeOk?: boolean; blocker?: string | (() => string | null) } = {},
+  options: {
+    pauseOk?: boolean;
+    resumeOk?: boolean;
+    rollbackStopOk?: boolean;
+    blocker?: string | (() => string | null);
+  } = {},
 ): RunnerHarness {
   const order: string[] = [];
   const published: string[] = [];
@@ -662,6 +667,7 @@ function runnerHarness(
     },
     stopForRollback: async () => {
       order.push('stop-for-rollback');
+      return { ok: options.rollbackStopOk !== false, message: null };
     },
     releaseUpdateLock: () => {
       order.push('release');
@@ -810,6 +816,19 @@ describe('update runner transaction (issue #17)', () => {
     expect(h.journal.current()).toBeNull();
     // The unit this update started is stopped before the previous files are restored.
     expect(h.order).toEqual(['pause', 'stop-for-rollback', 'resume']);
+  });
+
+  it('abandons the rollback instead of writing under a running unit', async () => {
+    const h = runnerHarness({ rollbackStopOk: false });
+    h.wsl.updateCode = 71;
+    const outcome = await h.runner.run(acceptedPlan(), context);
+
+    expect(outcome.ok).toBe(false);
+    // Nothing is written: the previous files would be replaced under a process
+    // that is still executing them.
+    expect(h.wsl.rollbackRuns).toHaveLength(0);
+    expect(h.journal.current()).not.toBeNull();
+    expect(h.order.some((entry) => entry.startsWith('blocked:'))).toBe(true);
   });
 
   it('blocks further starts when the rollback itself failed', async () => {

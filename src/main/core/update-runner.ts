@@ -51,8 +51,12 @@ import {
 export interface UpdateLifecycle {
   pauseForUpdate(): Promise<UpdateTransition>;
   resumeAfterUpdate(): Promise<UpdateTransition>;
-  /** Stop a unit this update started, before the previous files are restored. */
-  stopForRollback(): Promise<void>;
+  /**
+   * Stop a unit this update started, before the previous files are restored. A
+   * refusal is reported so the caller can abandon the rollback instead of
+   * overwriting files a live process is executing.
+   */
+  stopForRollback(): Promise<{ ok: boolean; message: string | null }>;
   releaseUpdateLock(): void;
   /** Terminal state for an installation that must not be started (failed rollback). */
   blockForRuntime(message: string): void;
@@ -197,7 +201,16 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
     // A backend the update started has to be stopped before the previous files
     // are written back: restoring under a running process is the same corruption
     // this coordination exists to prevent.
-    await deps.lifecycle.stopForRollback();
+    const stopped = await deps.lifecycle.stopForRollback();
+    if (!stopped.ok) {
+      const message =
+        `${reason} The DeepSeek Harness that serves the WebUI could not be stopped ` +
+        `(${stopped.message ?? 'unknown reason'}), so the previous version was not restored: writing over a ` +
+        'running process would corrupt it.';
+      deps.log.error(`update: rollback abandoned after ${where}; the unit would not stop`);
+      deps.lifecycle.blockForRuntime(message);
+      return { ok: false, state: fail(message, 'failed') };
+    }
     const restored = await deps.wsl
       .rollbackSharedDsh(
         {

@@ -671,7 +671,6 @@ export class Supervisor {
   private async startStoppedManaged(): Promise<{ ok: boolean; message: string | null }> {
     const stopped = this.stoppedManaged;
     if (stopped === null) return { ok: true, message: null };
-    this.stoppedManaged = null;
     try {
       const started = await this.deps.wsl.controlManagedBackend({
         distro: this.distro(),
@@ -680,6 +679,9 @@ export class Supervisor {
         action: 'start',
       });
       if (started.ok) {
+        // The unit is running, so there is nothing left to start: forgetting it
+        // only here keeps a failed start retryable.
+        this.stoppedManaged = null;
         this.managedStarted = true;
         this.deps.log.info(`update: started ${stopped.unit} (${stopped.scope}) again`);
         return { ok: true, message: null };
@@ -700,10 +702,9 @@ export class Supervisor {
    * Overwriting an installation under a running process is what the whole
    * coordination exists to avoid, and a rollback writes those files too.
    */
-  async stopForRollback(): Promise<void> {
+  async stopForRollback(): Promise<{ ok: boolean; message: string | null }> {
     const unit = this.managedUnit;
-    if (unit === null || !this.managedStarted) return;
-    this.managedStarted = false;
+    if (unit === null || !this.managedStarted) return { ok: true, message: null };
     try {
       const stopped = await this.deps.wsl.controlManagedBackend({
         distro: this.distro(),
@@ -711,12 +712,22 @@ export class Supervisor {
         unit: unit.unit,
         action: 'stop',
       });
-      if (!stopped.ok) this.deps.log.warn(`update: ${unit.unit} could not be stopped for the rollback (${stopped.message ?? 'unknown error'})`);
+      if (!stopped.ok) {
+        // Writing the previous files under a running process corrupts them, so a
+        // refused stop must stop the rollback, not be logged and ignored.
+        const message = stopped.message ?? 'the manager refused to stop it';
+        this.deps.log.error(`update: ${unit.unit} could not be stopped for the rollback (${message})`);
+        return { ok: false, message: `${unit.unit} could not be stopped (${message})` };
+      }
     } catch (error) {
-      this.deps.log.warn(`update: ${unit.unit} could not be stopped for the rollback: ${describe(error)}`);
+      const message = describe(error);
+      this.deps.log.error(`update: ${unit.unit} could not be stopped for the rollback: ${message}`);
+      return { ok: false, message: `${unit.unit} could not be stopped (${message})` };
     }
+    this.managedStarted = false;
     // It is stopped again, so the resume path has to start it once more.
     this.stoppedManaged = unit;
+    return { ok: true, message: null };
   }
 
   pauseForUpdate(): Promise<UpdateTransition> {
