@@ -32,10 +32,10 @@ The plan is built by the pure `buildManualUpdatePlan()` in
 
 | Situation | Commands |
 | --- | --- |
-| the owner's systemd **system** unit runs the attached backend | `sudo systemctl stop <unit>`, `<manager> install -g @deepseek-ai/dsh@<version>`, `sudo systemctl start <unit>` |
+| the owner's systemd **system** unit runs the attached backend (the window asks to close the app first, because a running app treats the stop as a lost backend and starts its own) | `sudo systemctl stop <unit>`, `<manager> install -g @deepseek-ai/dsh@<version>`, `sudo systemctl start <unit>` |
 | a **user** unit runs it | `systemctl --user stop <unit>`, install, `systemctl --user start <unit>` |
 | the attached backend was started by hand | install only, plus "stop the backend by hand before running this command" |
-| the backend belongs to DSH WSL | `kill <pid>` then install — quitting the app deliberately leaves that backend running |
+| the backend belongs to DSH WSL | `kill <pid>; sleep 2` then install — quitting the app deliberately leaves that backend running |
 | no backend is running | install only |
 | the manager is pnpm | `pnpm add -g @deepseek-ai/dsh@<version>` |
 | the manager, installed version or target is unknown | no command, only an explanation |

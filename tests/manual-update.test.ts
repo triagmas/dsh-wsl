@@ -128,7 +128,7 @@ describe('manual update commands', () => {
       unit: null,
       ownedPid: 194,
     });
-    expect(plan.commands).toEqual(['kill 194', `"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`]);
+    expect(plan.commands).toEqual(['kill 194; sleep 2', `"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`]);
     expect(plan.description).toContain('194');
     expect(plan.description).not.toContain('Quit');
   });

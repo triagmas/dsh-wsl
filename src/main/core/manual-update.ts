@@ -169,7 +169,10 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
     // Telling the owner to quit would leave the installation in use while npm
     // replaces the files it executes.
     const pid = typeof input.ownedPid === 'number' && SAFE_PID.test(String(input.ownedPid)) ? input.ownedPid : null;
-    const stop = pid === null ? [] : [`kill ${pid}`];
+    // The wait is part of the line so "Copy all" cannot start npm before the
+    // process that runs those files is gone. If it ignores SIGTERM the owner has
+    // to stop it himself; the description says so.
+    const stop = pid === null ? [] : [`kill ${pid}; sleep 2`];
     return {
       installed,
       state: 'pending',
@@ -177,7 +180,8 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
       description:
         pid === null
           ? 'The backend this app started is still using the installation. Stop it in a WSL terminal first, then run the command.'
-          : `The backend this app started (pid ${pid}) keeps running after you quit the app. The first command stops it; run both in a WSL terminal.`,
+          : `The backend this app started (pid ${pid}) keeps running after you quit the app, so the first line stops it and waits two seconds. ` +
+            'If it is still running after that, stop it yourself before installing.',
     };
   }
 
@@ -201,8 +205,12 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
         install,
         `${prefix} start ${input.unit.name}`,
       ],
+      // The app is told to be closed first: while it runs it treats the unit
+      // going away as a lost backend and starts its own, which then runs from the
+      // installation npm is replacing.
       description:
-        `These commands stop ${input.unit.name}, install the exact version, and start it again. Run them in a WSL terminal.` +
+        `Close DSH WSL first (Tray → Quit); quitting does not stop ${input.unit.name}. Then run these commands in a WSL terminal: ` +
+        'they stop it, install the exact version, and start it again.' +
         (input.installation.writable ? '' : ' The global prefix is not writable by your user, so the install needs root.'),
     };
   }
