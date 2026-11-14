@@ -5,6 +5,7 @@
  * unit-testable without Electron, WSL or a real DeepSeek Harness installation.
  */
 import type { AppConfig, LifecycleState, ShellStatus } from '../../shared/types.js';
+import { sudoersLines, type ManagedBackend } from '../wsl/managed.js';
 import { LOOPBACK_HOST } from '../../shared/types.js';
 import { parseStartupLine, buildOrigin } from '../backend/urls.js';
 import type { ProcessProbe } from '../wsl/output.js';
@@ -223,6 +224,15 @@ export interface WslGateway {
    * when the snapshot cannot be proven; the update must not start then.
    */
   prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupAttempt>;
+  /** Which process manager owns a backend pid, and whether the app may use it. */
+  probeManagedBackend(request: { distro: string; pid: number }): Promise<ManagedBackend>;
+  /** Stop or start that unit through its own manager. */
+  controlManagedBackend(request: {
+    distro: string;
+    scope: 'system' | 'user';
+    unit: string;
+    action: 'stop' | 'start';
+  }): Promise<{ ok: boolean; message: string | null }>;
   /** Remove recovery snapshots beyond the newest few. Never blocks an update. */
   pruneUpdateSnapshots(request: {
     distro: string;
@@ -346,6 +356,10 @@ export class Supervisor {
    * example a systemd unit). Such a process is never signalled or restarted.
    */
   private attached = false;
+  /** Pid of the attached backend: needed to find the unit that owns it. */
+  private attachedPid: number | null = null;
+  /** Unit the app stopped for the current update; started again afterwards. */
+  private stoppedManaged: { scope: 'system' | 'user'; unit: string } | null = null;
   /**
    * The profile expects this port to be served by a backend the owner started
    * (a previous attach succeeded). While true the app waits for that backend
@@ -536,24 +550,120 @@ export class Supervisor {
   /**
    * Why an update must not start right now, or `null` when it may.
    *
-   * An attached backend runs the very installation an update replaces, so the
-   * refusal has to come before the snapshot: asking first costs nothing, while
-   * discovering it afterwards spends a minute and a gigabyte on a dead end.
+   * The backend that serves the WebUI runs the installation an update replaces,
+   * so it has to stop first — but the app must never pretend that is impossible.
+   * It asks the process manager that owns the backend, and only refuses when it
+   * genuinely has no way to stop it: no unit at all, or a unit it is not allowed
+   * to touch. The answer names the exact line that removes the obstacle.
+   *
+   * The check runs before the npm query and before the recovery snapshot, so an
+   * obstacle is reported in the first instant instead of after a minute of work.
    */
-  updateBlocker(): string | null {
+  async updateBlocker(): Promise<string | null> {
     if (!this.attached) return null;
-    return (
-      'The backend serving the WebUI was started outside this app, and an update replaces the files it is running. ' +
-      'Stop that backend first (for example `systemctl --user stop dsh-web`), then start the update again: the app ' +
-      'brings the WebUI back after the installation is replaced. Nothing was changed.'
-    );
+    const managed = await this.discoverManaged();
+    if (managed === null || managed.scope === 'none' || managed.unit === null) {
+      return (
+        'The DeepSeek Harness that serves the WebUI was started by hand, so the app has no way to stop it, and an ' +
+        'update replaces the files that process is running. Stop it inside WSL, then start the update again — the ' +
+        'app brings the WebUI back once the installation is replaced. Nothing was changed.'
+      );
+    }
+    if (!managed.canControl) {
+      const rule = sudoersLines({ user: managed.user, unit: managed.unit })[0] ?? '';
+      return (
+        `The DeepSeek Harness that serves the WebUI runs as the systemd unit ${managed.unit}, and the app is not ` +
+        `allowed to stop it. Add this line to /etc/sudoers.d/dsh-update (mode 0440, owner root) and retry: ` +
+        `"${rule}" — Nothing was changed.`
+      );
+    }
+    return null;
+  }
+
+  /** Which manager owns the attached backend, or `null` when it is unknown. */
+  private async discoverManaged(): Promise<ManagedBackend | null> {
+    const pid = this.attachedPid;
+    if (!this.attached || pid === null) return null;
+    try {
+      return await this.deps.wsl.probeManagedBackend({ distro: this.distro(), pid });
+    } catch (error) {
+      this.deps.log.warn(`could not identify the manager of the attached backend: ${describe(error)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Start the unit the app stopped for an update.
+   *
+   * Best effort by design: the WebUI must come back either way, and `bringUp`
+   * already falls back to an app-owned backend when the launcher does not return.
+   */
+  private async startStoppedManaged(): Promise<void> {
+    const stopped = this.stoppedManaged;
+    if (stopped === null) return;
+    this.stoppedManaged = null;
+    try {
+      const started = await this.deps.wsl.controlManagedBackend({
+        distro: this.distro(),
+        scope: stopped.scope,
+        unit: stopped.unit,
+        action: 'start',
+      });
+      if (started.ok) {
+        this.deps.log.info(`update: started ${stopped.unit} (${stopped.scope}) again`);
+      } else {
+        this.deps.log.warn(
+          `update: ${stopped.unit} did not start (${started.message ?? 'unknown error'}); the app serves the WebUI itself`,
+        );
+      }
+    } catch (error) {
+      this.deps.log.warn(`update: ${stopped.unit} could not be started: ${describe(error)}`);
+    }
   }
 
   pauseForUpdate(): Promise<UpdateTransition> {
     return this.serial(async () => {
       if (this.quitting) return { ok: false, message: 'The app is quitting.' };
       if (this.attached) {
-        return { ok: false, message: 'The DSH backend runs outside this app; stop it before updating.' };
+        // The backend belongs to the owner's launcher, and an update replaces the
+        // files it executes: ask the launcher to stop it, exactly as the owner
+        // would, then hold the update lock so recovery cannot start a competitor.
+        const managed = await this.discoverManaged();
+        if (managed === null || managed.scope === 'none' || managed.unit === null || !managed.canControl) {
+          return {
+            ok: false,
+            message:
+              'The DeepSeek Harness that serves the WebUI cannot be stopped by this app, so nothing was changed. ' +
+              'Stop it inside WSL yourself, then retry the update.',
+          };
+        }
+        this.updateLocked = true;
+        this.setState('RECOVERING', 'Stopping DeepSeek Harness for the update');
+        const stopped = await this.deps.wsl
+          .controlManagedBackend({
+            distro: this.distro(),
+            scope: managed.scope,
+            unit: managed.unit,
+            action: 'stop',
+          })
+          .catch((error: unknown) => ({ ok: false as const, message: describe(error) }));
+        if (!stopped.ok) {
+          this.updateLocked = false;
+          this.deps.log.error(`update: ${managed.unit} could not be stopped (${stopped.message ?? 'unknown error'})`);
+          return {
+            ok: false,
+            message:
+              `The unit ${managed.unit} could not be stopped (${stopped.message ?? 'unknown error'}), so nothing ` +
+              'was installed and nothing was changed.',
+          };
+        }
+        this.stoppedManaged = { scope: managed.scope, unit: managed.unit };
+        // The process is gone: the next bring-up must attach to the unit's new
+        // process instead of believing it already has one.
+        this.attached = false;
+        this.attachedPid = null;
+        this.deps.log.info(`update: stopped ${managed.unit} (${managed.scope}) for the update`);
+        return { ok: true, message: null };
       }
       this.updateLocked = true;
       if (!this.owned && this.serverPid === null && this.server === null) {
@@ -599,6 +709,10 @@ export class Supervisor {
       }
       this.attempt = 0;
       try {
+        // A unit the app stopped comes back first: `bringUp` then attaches to its
+        // new process (the external expectation is already recorded), or serves
+        // the WebUI itself when the launcher stays away.
+        await this.startStoppedManaged();
         // The lock stays held until the start finished, so a late exit event from
         // the backend that was just stopped cannot start a recovery mid-update.
         await this.bringUp();
@@ -632,9 +746,10 @@ export class Supervisor {
     );
   }
 
-  /** Release the update lock without starting anything (rollback path). */
+  /** Release the update lock; a unit stopped for the update is started again. */
   releaseUpdateLock(): void {
     this.updateLocked = false;
+    if (this.stoppedManaged !== null) void this.startStoppedManaged();
   }
 
   get updateInProgress(): boolean {
@@ -727,6 +842,7 @@ export class Supervisor {
       // when its launcher brings it back, and only starts an app-owned one when
       // it really is gone (see bringUp and the external expectation).
       this.attached = false;
+      this.attachedPid = null;
       this.deps.log.warn(`attached backend lost (${reason}); recovery re-attaches or starts an app-owned backend`);
     }
     if (this.startInFlight) {
@@ -802,6 +918,7 @@ export class Supervisor {
       this.activePort = config.port;
       this.activeDistro = config.distro;
       this.attached = false;
+      this.attachedPid = null;
       this.externalExpected = this.expectExternalBackend();
       this.setState('CHECKING', null);
       this.failures = 0;
@@ -1538,6 +1655,7 @@ export class Supervisor {
         return 'no-session';
       }
       this.attached = true;
+      this.attachedPid = pid;
       this.owned = false;
       this.serverPid = null;
       this.serverStartTime = null;

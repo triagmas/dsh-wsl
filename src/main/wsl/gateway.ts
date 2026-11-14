@@ -58,6 +58,7 @@ import {
   parseNpmMarker,
   type CleanSnapshotReport,
 } from './update-args.js';
+import { buildControlManagedArgs, buildProbeManagedArgs, parseManagedReport, type ManagedBackend } from './managed.js';
 
 export interface CommandResult {
   code: number | null;
@@ -110,6 +111,8 @@ const CLEAN_TIMEOUT_MS = 60_000;
  * timeout only leaves the snapshots for the next run.
  */
 const PRUNE_TIMEOUT_MS = 120_000;
+/** Budget for reading a pid's cgroup and for `systemctl stop|start` of one unit. */
+const MANAGED_TIMEOUT_MS = 30_000;
 
 /**
  * How long to wait for a killed command to report its own exit (review R02).
@@ -605,6 +608,50 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         };
       }
       return { found: reported === request.version, npmPath, reported, message: null };
+    },
+
+    async probeManagedBackend(request: { distro: string; pid: number }): Promise<ManagedBackend> {
+      const result = await run(buildProbeManagedArgs(request), MANAGED_TIMEOUT_MS);
+      const managed = parseManagedReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code !== 0) {
+        options.log.warn(`the backend manager could not be identified (code=${result.code ?? 'null'})`);
+        // Not identifying the manager is not the same as "no manager": treat it as
+        // one more obstacle the owner has to remove by hand (`scope: 'none'`).
+        return managed;
+      }
+      if (managed.scope === 'none') {
+        options.log.info('the attached backend was not started by a systemd unit');
+      } else {
+        options.log.info(
+          `the attached backend belongs to ${managed.unit} (${managed.scope} scope, ` +
+            `control=${managed.canControl ? 'allowed' : 'not allowed'})`,
+        );
+      }
+      return managed;
+    },
+
+    async controlManagedBackend(request: {
+      distro: string;
+      scope: 'system' | 'user';
+      unit: string;
+      action: 'stop' | 'start';
+    }): Promise<{ ok: boolean; message: string | null }> {
+      const result = await run(buildControlManagedArgs(request), MANAGED_TIMEOUT_MS);
+      const output = `${result.stdout}\n${result.stderr}`;
+      if (result.code === 0 && output.includes(`${request.action}`) && output.includes('ok=1')) {
+        options.log.info(`${request.action}ed ${request.unit} (${request.scope}) for the update`);
+        return { ok: true, message: null };
+      }
+      const detail = output
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith('managed:'))
+        .join(' ')
+        .slice(0, 300);
+      options.log.warn(
+        `could not ${request.action} ${request.unit} (${request.scope}, code=${result.code ?? 'null'})${detail === '' ? '' : `: ${detail}`}`,
+      );
+      return { ok: false, message: detail === '' ? null : detail };
     },
 
     async inspectSharedDsh(request: InspectSharedRequest) {

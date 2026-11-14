@@ -612,7 +612,8 @@ function runnerHarness(
   const wsl = new FakeWsl();
   const store = memoryJournal(null);
   const lifecycle: UpdateLifecycle = {
-    updateBlocker: () => (typeof options.blocker === 'function' ? options.blocker() : (options.blocker ?? null)),
+    updateBlocker: async () =>
+      typeof options.blocker === 'function' ? options.blocker() : (options.blocker ?? null),
     pauseForUpdate: async () => {
       order.push('pause');
       return { ok: options.pauseOk !== false, message: options.pauseOk === false ? 'port still busy' : null };

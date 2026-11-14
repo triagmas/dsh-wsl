@@ -56,9 +56,9 @@ export interface UpdateLifecycle {
   blockForRuntime(message: string): void;
   /**
    * Why an update must not start now, or `null` when it may. Checked before the
-   * first npm call so a refusal costs nothing.
+   * first npm call so an obstacle costs nothing.
    */
-  updateBlocker(): string | null;
+  updateBlocker(): Promise<string | null>;
   updateInProgress: boolean;
 }
 
@@ -251,6 +251,9 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
 
     async run(plan: SharedUpdatePlan, context: UpdateContext): Promise<UpdateOutcome> {
       if (busy) return { ok: false, state };
+      // Claim the runner synchronously: the obstacle check below awaits, and a
+      // second request arriving meanwhile must not believe the runner is free.
+      busy = true;
       terminal.clear();
       state = {
         ...createUpdateState(deps.now()),
@@ -260,14 +263,15 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
       // Refuse before the first expensive step. An update replaces the files the
       // running backend executes, and the self-check that used to catch this ran
       // after a minute of snapshot work, so the owner saw a failure that cost a
-      // gigabyte and told him nothing he could act on. The refusal happens before
-      // `busy` is set: a run that never started must not claim the runner.
-      const blocker = deps.lifecycle.updateBlocker();
+      // gigabyte and told him nothing he could act on.
+      const blocker = await deps.lifecycle.updateBlocker();
       if (blocker !== null) {
+        // The claim is released again: a run that never started must not block the
+        // next attempt once the owner removes the obstacle.
+        busy = false;
         deps.log.warn(`update refused before anything was read: ${blocker}`);
         return { ok: false, state: fail(blocker) };
       }
-      busy = true;
       publish({ phase: 'checking', message: describeUpdatePhase('checking'), detail: null });
       deps.log.info(`update: checking ${plan.version} on npm (distro=${plan.distro})`);
       const startedAt = deps.now();
