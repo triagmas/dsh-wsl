@@ -121,6 +121,54 @@ code {
   color: inherit;
 }
 
+.rule {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--accent, #7dd3fc) 45%, transparent);
+  background: color-mix(in srgb, var(--accent, #7dd3fc) 10%, transparent);
+}
+
+.rule-lead,
+.rule-line,
+.rule-error {
+  margin: 0;
+}
+
+.rule-line code {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--fg-strong);
+}
+
+.rule-field {
+  display: grid;
+  gap: 6px;
+}
+
+.rule-field input {
+  font: inherit;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg-strong);
+}
+
+.rule-field input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent, #7dd3fc) 60%, transparent);
+  outline-offset: 1px;
+}
+
+.rule-error {
+  color: #fca5a5;
+}
+
+.rule-actions {
+  margin-top: 0;
+}
+
 .actions {
   margin-top: auto;
   display: flex;

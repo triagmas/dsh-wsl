@@ -58,6 +58,14 @@ import {
   parseNpmMarker,
   type CleanSnapshotReport,
 } from './update-args.js';
+import {
+  buildControlManagedArgs,
+  buildInstallRuleArgs,
+  buildProbeManagedArgs,
+  parseInstallRuleReport,
+  parseManagedReport,
+  type ManagedBackend,
+} from './managed.js';
 
 export interface CommandResult {
   code: number | null;
@@ -110,6 +118,8 @@ const CLEAN_TIMEOUT_MS = 60_000;
  * timeout only leaves the snapshots for the next run.
  */
 const PRUNE_TIMEOUT_MS = 120_000;
+/** Budget for reading a pid's cgroup and for `systemctl stop|start` of one unit. */
+const MANAGED_TIMEOUT_MS = 30_000;
 
 /**
  * How long to wait for a killed command to report its own exit (review R02).
@@ -147,12 +157,17 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
   const cleanTimeoutMs = options.timeouts?.cleanMs ?? CLEAN_TIMEOUT_MS;
   const terminationGraceMs = options.timeouts?.terminationGraceMs ?? TERMINATION_GRACE_MS;
 
-  const run = (args: string[], timeoutMs: number): Promise<CommandResult> =>
+  const run = (args: string[], timeoutMs: number, input?: string): Promise<CommandResult> =>
     new Promise((resolve, reject) => {
       let child: ChildProcessWithoutNullStreams;
       try {
-        // stdio[0] is 'ignore', so stdin is null; stdout/stderr are piped.
-        child = spawnImpl(wslExe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }) as unknown as ChildProcessWithoutNullStreams;
+        // stdin is piped only when a caller has something to write (a password
+        // never belongs in argv, where every process on the machine can read it);
+        // stdout/stderr are always piped.
+        child = spawnImpl(wslExe, args, {
+          windowsHide: true,
+          stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        }) as unknown as ChildProcessWithoutNullStreams;
       } catch (error) {
         reject(error);
         return;
@@ -185,6 +200,12 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         }, terminationGraceMs);
       }, timeoutMs);
 
+      if (input !== undefined) {
+        // The child may exit before reading everything; a broken pipe here is not
+        // an error of its own, the exit code tells the story.
+        child.stdin.on('error', () => undefined);
+        child.stdin.end(input);
+      }
       child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
       child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
       child.once('error', (error: NodeJS.ErrnoException) => {
@@ -605,6 +626,80 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         };
       }
       return { found: reported === request.version, npmPath, reported, message: null };
+    },
+
+    async probeManagedBackend(request: { distro: string; pid: number }): Promise<ManagedBackend> {
+      const result = await run(buildProbeManagedArgs(request), MANAGED_TIMEOUT_MS);
+      const managed = parseManagedReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code !== 0) {
+        options.log.warn(`the backend manager could not be identified (code=${result.code ?? 'null'})`);
+        // Not identifying the manager is not the same as "no manager": treat it as
+        // one more obstacle the owner has to remove by hand (`scope: 'none'`).
+        return managed;
+      }
+      if (managed.scope === 'none') {
+        options.log.info('the attached backend was not started by a systemd unit');
+      } else {
+        options.log.info(
+          `the attached backend belongs to ${managed.unit} (${managed.scope} scope, ` +
+            `control=${managed.canControl ? 'allowed' : 'not allowed'})`,
+        );
+      }
+      return managed;
+    },
+
+    async controlManagedBackend(request: {
+      distro: string;
+      scope: 'system' | 'user';
+      unit: string;
+      action: 'stop' | 'start';
+    }): Promise<{ ok: boolean; message: string | null }> {
+      const result = await run(buildControlManagedArgs(request), MANAGED_TIMEOUT_MS);
+      const output = `${result.stdout}\n${result.stderr}`;
+      if (result.code === 0 && output.includes(`${request.action}`) && output.includes('ok=1')) {
+        options.log.info(`${request.action}ed ${request.unit} (${request.scope}) for the update`);
+        return { ok: true, message: null };
+      }
+      const detail = output
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith('managed:'))
+        .join(' ')
+        .slice(0, 300);
+      options.log.warn(
+        `could not ${request.action} ${request.unit} (${request.scope}, code=${result.code ?? 'null'})${detail === '' ? '' : `: ${detail}`}`,
+      );
+      return { ok: false, message: detail === '' ? null : detail };
+    },
+
+    async installManagedRule(request: {
+      distro: string;
+      user: string;
+      unit: string;
+      password: string;
+    }): Promise<{ ok: boolean; message: string | null }> {
+      if (typeof request.password !== 'string' || request.password.length === 0) {
+        return { ok: false, message: 'no password was given' };
+      }
+      // Exactly one newline-terminated line: `sudo -S` reads a single line.
+      const input = `${request.password.replace(/\r?\n$/, '')}\n`;
+      let result: CommandResult;
+      try {
+        result = await run(buildInstallRuleArgs(request), MANAGED_TIMEOUT_MS, input);
+      } finally {
+        // Nothing to wipe in the string, but never keep it reachable from here.
+        request.password = '';
+      }
+      const report = parseInstallRuleReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code === 0 && report.ok) {
+        options.log.info(`installed the sudo rule for ${request.unit}; further updates need no password`);
+        return { ok: true, message: null };
+      }
+      options.log.warn(`the sudo rule for ${request.unit} was not installed (code=${result.code ?? 'null'})`);
+      return {
+        ok: false,
+        message: report.message ?? 'the password was rejected or sudo refused the rule',
+      };
     },
 
     async inspectSharedDsh(request: InspectSharedRequest) {

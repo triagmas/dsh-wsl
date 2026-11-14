@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { Supervisor } from '../src/main/core/supervisor.js';
 import { createMemoryExternalStore } from '../src/main/core/external.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
-import { backendProbe, createHarness, lastStatus, BACKEND_PID, BACKEND_START_TIME, PORT } from './helpers.js';
+import { backendProbe, createHarness, lastStatus, BACKEND_PID, BACKEND_START_TIME, PORT, FakeWsl } from './helpers.js';
+import type { ManagedBackend } from '../src/main/wsl/managed.js';
 import type { OwnedServerRecord } from '../src/main/core/ownership.js';
 
 const record: OwnedServerRecord = {
@@ -459,7 +460,7 @@ describe('external backend attach', () => {
     const transition = await supervisor.pauseForUpdate();
 
     expect(transition.ok).toBe(false);
-    expect(transition.message).toContain('runs outside this app');
+    expect(transition.message).toContain('cannot be stopped by this app');
     expect(harness.wsl.signals).toHaveLength(0);
   });
 
@@ -518,20 +519,49 @@ describe('external backend attach', () => {
 
 describe('update preflight', () => {
   const EXTERNAL_PID = 4711;
-
-  it('refuses an update while the backend belongs to the launcher', async () => {
+  const attached = (managed: Partial<ManagedBackend>) => {
     const harness = createHarness({
       portState: 'occupied',
       wsl: { portOwner: EXTERNAL_PID, probe: (pid: number) => (pid === EXTERNAL_PID ? backendProbe() : null) },
     });
-    const supervisor = new Supervisor(harness.deps);
+    (harness.deps.wsl as FakeWsl).managed = {
+      scope: 'none',
+      unit: null,
+      canControl: false,
+      user: 'triag',
+      ...managed,
+    };
+    return { harness, supervisor: new Supervisor(harness.deps) };
+  };
+
+  it('allows an update when the launcher unit can be stopped with the narrow rule', async () => {
+    const { supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    await supervisor.start();
+    expect(supervisor.state).toBe('READY');
+
+    // Stopping the owner's unit is the app's job during an update, not an excuse
+    // to refuse: the whole point of the wrapper is to update the installation.
+    await expect(supervisor.updateBlocker()).resolves.toBeNull();
+  });
+
+  it('names the exact sudoers line while the app may not stop the unit', async () => {
+    const { supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: false });
     await supervisor.start();
 
-    expect(supervisor.state).toBe('READY');
-    const blocker = supervisor.updateBlocker();
-    expect(blocker).toContain('started outside this app');
-    // The owner has to be told what to stop; a bare refusal is not actionable.
-    expect(blocker).toContain('systemctl --user stop dsh-web');
+    const blocker = await supervisor.updateBlocker();
+    expect(blocker).toContain('dsh-web.service');
+    expect(blocker).toContain('/usr/bin/systemctl stop dsh-web.service');
+    expect(blocker).toContain('/usr/bin/systemctl start dsh-web.service');
+    expect(blocker).toContain('triag ALL=(root) NOPASSWD:');
+    expect(blocker).toContain('Nothing was changed');
+  });
+
+  it('refuses when the backend was started by hand', async () => {
+    const { supervisor } = attached({});
+    await supervisor.start();
+
+    const blocker = await supervisor.updateBlocker();
+    expect(blocker).toContain('started by hand');
     expect(blocker).toContain('Nothing was changed');
   });
 
@@ -541,7 +571,91 @@ describe('update preflight', () => {
     await supervisor.start();
 
     expect(supervisor.state).toBe('READY');
-    expect(supervisor.updateBlocker()).toBeNull();
+    await expect(supervisor.updateBlocker()).resolves.toBeNull();
+  });
+
+  it('stops the launcher unit for the update and starts it again', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    await supervisor.start();
+
+    await expect(supervisor.pauseForUpdate()).resolves.toEqual({ ok: true, message: null });
+    expect(harness.wsl.managedCalls).toEqual([
+      { scope: 'system', unit: 'dsh-web.service', action: 'stop' },
+    ]);
+    // Nothing the app does not own is ever signalled directly.
+    expect(harness.wsl.signals).toHaveLength(0);
+
+    await supervisor.releaseUpdateLock();
+    expect(harness.wsl.managedCalls).toEqual([
+      { scope: 'system', unit: 'dsh-web.service', action: 'stop' },
+      { scope: 'system', unit: 'dsh-web.service', action: 'start' },
+    ]);
+  });
+
+  it('offers the one password instead of a dead end', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: false });
+    await supervisor.start();
+    await supervisor.updateBlocker();
+
+    const rule = supervisor.pendingRule();
+    expect(rule).toEqual({
+      unit: 'dsh-web.service',
+      user: 'triag',
+      scope: 'system',
+      line: 'triag ALL=(root) NOPASSWD: /usr/bin/systemctl stop dsh-web.service, /usr/bin/systemctl start dsh-web.service',
+    });
+
+    // The password goes to the gateway once, and the probe afterwards decides
+    // whether the update may proceed — the write alone is not proof.
+    harness.wsl.afterRule = { scope: 'system', unit: 'dsh-web.service', canControl: true, user: 'triag' };
+    await expect(supervisor.installManagedRule('hunter2')).resolves.toEqual({ ok: true, message: null });
+    expect(harness.wsl.installedRules).toEqual([
+      { user: 'triag', unit: 'dsh-web.service', password: 'hunter2' },
+    ]);
+    await expect(supervisor.updateBlocker()).resolves.toBeNull();
+  });
+
+  it('reports a rule that did not take effect', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: false });
+    await supervisor.start();
+    await supervisor.updateBlocker();
+
+    harness.wsl.ruleResult = { ok: true, message: null };
+    harness.wsl.afterRule = null;
+    const result = await supervisor.installManagedRule('wrong');
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('sudo still refuses');
+  });
+
+  it('has nothing to install when the unit is already controllable', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    await supervisor.start();
+    await supervisor.updateBlocker();
+
+    expect(supervisor.pendingRule()).toBeNull();
+    await expect(supervisor.installManagedRule('unused')).resolves.toEqual({ ok: true, message: null });
+    expect(harness.wsl.installedRules).toHaveLength(0);
+  });
+
+  it('leaves the unit alone when the stop is not allowed', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: false });
+    await supervisor.start();
+
+    const paused = await supervisor.pauseForUpdate();
+    expect(paused.ok).toBe(false);
+    expect(paused.message).toContain('cannot be stopped by this app');
+    expect(harness.wsl.managedCalls).toHaveLength(0);
+  });
+
+  it('reports a failed stop instead of installing over a running backend', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    harness.wsl.controlResult = { ok: false, message: 'managed: systemctl stop dsh-web.service was refused' };
+    await supervisor.start();
+
+    const paused = await supervisor.pauseForUpdate();
+    expect(paused.ok).toBe(false);
+    expect(paused.message).toContain('could not be stopped');
+    expect(supervisor.updateInProgress).toBe(false);
   });
 });
 

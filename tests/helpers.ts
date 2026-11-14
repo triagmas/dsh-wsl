@@ -13,6 +13,7 @@ import type {
   WslGateway,
 } from '../src/main/core/supervisor.js';
 import type { ProcessProbe } from '../src/main/wsl/output.js';
+import type { ManagedBackend } from '../src/main/wsl/managed.js';
 import type { SharedInstallObservation } from '../src/main/core/update.js';
 import type { DshInstallation, SharedDshReport } from '../src/main/core/dsh-locate.js';
 import type { WebClient } from '../src/main/core/supervisor.js';
@@ -205,6 +206,44 @@ export class FakeWsl implements WslGateway {
       ok: true,
       snapshot: { path: `${root}/update/shared-backup-${request.transaction}`, files: this.backupFiles },
     };
+  }
+
+  /** What the app believes owns a backend pid; tests override it per case. */
+  managed: ManagedBackend = { scope: 'none', unit: null, canControl: false, user: 'triag' };
+  readonly managedCalls: { scope: 'system' | 'user'; unit: string; action: 'stop' | 'start' }[] = [];
+  controlResult: { ok: boolean; message: string | null } = { ok: true, message: null };
+
+  async probeManagedBackend(request: { distro: string; pid: number }): Promise<ManagedBackend> {
+    this.probedManagedPids.push(request.pid);
+    return this.managed;
+  }
+
+  async controlManagedBackend(request: {
+    distro: string;
+    scope: 'system' | 'user';
+    unit: string;
+    action: 'stop' | 'start';
+  }): Promise<{ ok: boolean; message: string | null }> {
+    this.managedCalls.push({ scope: request.scope, unit: request.unit, action: request.action });
+    return this.controlResult;
+  }
+
+  readonly probedManagedPids: number[] = [];
+  readonly installedRules: { user: string; unit: string; password: string }[] = [];
+  /** What the fake `sudo -S` answers; the real one only writes when it is right. */
+  ruleResult: { ok: boolean; message: string | null } = { ok: true, message: null };
+  /** The manager a successful rule install reveals. */
+  afterRule: ManagedBackend | null = null;
+
+  async installManagedRule(request: {
+    distro: string;
+    user: string;
+    unit: string;
+    password: string;
+  }): Promise<{ ok: boolean; message: string | null }> {
+    this.installedRules.push({ user: request.user, unit: request.unit, password: request.password });
+    if (this.ruleResult.ok && this.afterRule !== null) this.managed = this.afterRule;
+    return this.ruleResult;
   }
 
   readonly prunedSnapshots: { distro: string; appRoot: string; keep: number; transaction: string }[] = [];

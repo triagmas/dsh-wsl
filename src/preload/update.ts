@@ -19,6 +19,17 @@ const api = {
   onState(listener: (state: UpdateState) => void): void {
     ipcRenderer.on('update:state', (_event, state: UpdateState) => listener(state));
   },
+  /**
+   * Installs the one narrow sudo rule with the password the owner typed. The
+   * password goes straight into an IPC argument, is used for a single `sudo -S`
+   * call in the main process, and is never stored or logged.
+   */
+  installRule(password: string): Promise<{ ok: boolean; message: string | null }> {
+    return ipcRenderer.invoke('update:install-rule', password) as Promise<{
+      ok: boolean;
+      message: string | null;
+    }>;
+  },
   /** Closes the window that sent it (confirmation or finished progress). */
   close(): Promise<void> {
     return ipcRenderer.invoke('update:close') as Promise<void>;
