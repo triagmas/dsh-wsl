@@ -5,7 +5,7 @@
  * agents root, or the distro-wide PATH. Instead every launch root is derived
  * from one validated directory (`~/.local/share/wsl-web-shell` by default) that
  * holds `DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files, the test workspace and
- * the app's own update journal directory.
+ * a scratch `update` directory kept for profile compatibility.
  *
  * Since issue #17 this is **data** isolation only: the executable is the one the
  * WSL distribution already installs, and no private runtime lives here.

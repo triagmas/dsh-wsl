@@ -84,7 +84,7 @@ export const SCRIPT_ARGV0 = 'wsl-web-shell';
 
 /**
  * Create the isolated **data** environment (`DSH_HOME`, agents home, caches,
- * temp, workspace and the app-owned update journal directory) before the
+ * temp, workspace and the compatibility `update` scratch directory) before the
  * backend starts. No package is installed and no executable is copied here: the
  * backend runs the distribution's own `dsh` (issue #17).
  *

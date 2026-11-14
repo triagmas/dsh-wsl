@@ -6,7 +6,7 @@
  */
 import { app, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron';
 import { join } from 'node:path';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { applyConfigPatch, requiresRestart } from './core/config.js';
 import {
   CLEAN_SHUTDOWN_MARKER,
@@ -16,23 +16,9 @@ import {
   summarizePreviousSession,
 } from './core/diagnostics.js';
 import { createLatestVersionService } from './backend/github-versions.js';
-import { createUpdateRunner } from './core/update-runner.js';
-import { createJournalStore, recoverInterruptedUpdate } from './core/update-recovery.js';
 import { describeInstallScope, type SharedDshReport } from './core/dsh-locate.js';
-import { describeRelaunchFailure, resolveRelaunchTarget } from './core/relaunch.js';
+import { buildManualUpdatePlan } from './core/manual-update.js';
 import { APP_DISPLAY_NAME, APP_ID, PROFILE_DIRECTORY } from './core/branding.js';
-import {
-  UPDATE_REASONS,
-  createTransactionId,
-  describeUpdatePhase,
-  describeUpdateReason,
-  isUpdateCritical,
-  manualUpdateCommand,
-  planSharedUpdate,
-  shouldRefuseQuit,
-  type QuitTrigger,
-  type SharedUpdatePlan,
-} from './core/update.js';
 import { createLogger } from './core/logger.js';
 import { isNewer } from './core/versions.js';
 import { parsePopoverAnchor } from './core/footer.js';
@@ -52,7 +38,6 @@ import type {
   ConfigPatch,
   ShellStatus,
   UpdateProbe,
-  UpdateStartResult,
   VersionSnapshot,
 } from '../shared/types.js';
 
@@ -60,91 +45,19 @@ import type {
  * Identity and profile (issue #14).
  *
  * The product is now called "DSH WSL", but the profile directory keeps its
- * established name: it holds `config.json`, logs, the owned-server registry, the
- * versions cache and the update journal. Changing it would silently orphan the
- * user's settings, port choice and interrupted-update state, so the path is pinned
- * here, before anything reads `userData`.
+ * established name: it holds `config.json`, logs, the owned-server registry and
+ * the versions cache. Changing it would silently orphan the user's settings and
+ * port choice, so the path is pinned here, before anything reads `userData`.
  */
 app.setName(APP_DISPLAY_NAME);
 app.setPath('userData', join(app.getPath('appData'), PROFILE_DIRECTORY));
-
-/**
- * Packaged relaunch self-test (issue #12).
- *
- * The only way to prove that an update restarts the *portable* EXE — and not the
- * temporary extraction copy — is to run the packaged build itself:
- *
- *   DSH-WSL-0.1.0-x64-Portable.exe --relaunch-probe=<dir>
- *   DSH-WSL-0.1.0-x64-Setup.exe (installed) --relaunch-probe=<dir>
- *
- * The parent records where it runs, decides the relaunch target with the same
- * `resolveRelaunchTarget()` the update uses, relaunches it through `app.relaunch`
- * with `--relaunch-child`, and exits. The child records the executable it was
- * started from. The Windows CI job compares both records for the portable and the
- * installed package; nothing here runs during a normal start.
- */
-const RELAUNCH_PROBE_PREFIX = '--relaunch-probe=';
-const RELAUNCH_CHILD_FLAG = '--relaunch-child';
-
-async function runRelaunchProbe(directory: string): Promise<void> {
-  const phase = process.argv.includes(RELAUNCH_CHILD_FLAG) ? 'child' : 'parent';
-  const record = {
-    phase,
-    execPath: process.execPath,
-    portable: process.env.PORTABLE_EXECUTABLE_FILE ?? null,
-    packaged: app.isPackaged,
-    resourcesPath: process.resourcesPath,
-    pid: process.pid,
-  };
-  const write = (name: string, payload: unknown): void => {
-    try {
-      mkdirSync(directory, { recursive: true });
-      writeFileSync(join(directory, name), `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-    } catch {
-      // A probe that cannot write its own marker fails the CI comparison.
-    }
-  };
-  write(`${phase}.json`, record);
-  if (phase === 'child') {
-    app.exit(0);
-    return;
-  }
-  const decision = resolveRelaunchTarget(
-    {
-      portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE ?? null,
-      execPath: process.execPath,
-      platform: process.platform,
-      packaged: app.isPackaged,
-      resourcesPath: process.resourcesPath,
-    },
-    (path) => {
-      try {
-        return existsSync(path);
-      } catch {
-        return false;
-      }
-    },
-  );
-  write('decision.json', decision);
-  if (!decision.ok) {
-    app.exit(3);
-    return;
-  }
-  app.relaunch({
-    execPath: decision.target.execPath,
-    args: [`${RELAUNCH_PROBE_PREFIX}${directory}`, RELAUNCH_CHILD_FLAG],
-  });
-  app.exit(0);
-}
-
-const relaunchProbeArg = process.argv.find((argument) => argument.startsWith(RELAUNCH_PROBE_PREFIX));
 
 /**
  * Profile self-test (issue #14).
  *
  * Proves on a packaged build — portable and installed — that the rename did not
  * move the profile: the recorded `userData` must still point at
- * `%APPDATA%\wsl-web-shell`, where the user's config, logs and update journal live.
+ * `%APPDATA%\wsl-web-shell`, where the user's config and logs live.
  *
  *   DSH WSL.exe --profile-probe=<file.json>
  */
@@ -175,10 +88,6 @@ if (profileProbeArg !== undefined) {
   } catch {
     app.exit(1);
   }
-} else if (relaunchProbeArg !== undefined) {
-  // Runs before the single-instance lock: the parent and the relaunched child
-  // would otherwise fight over it.
-  void runRelaunchProbe(relaunchProbeArg.slice(RELAUNCH_PROBE_PREFIX.length)).catch(() => app.exit(1));
 } else if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -264,7 +173,7 @@ async function bootstrap(): Promise<void> {
     },
     onSessionEnd: () => {
       log.info('system session end: quitting gracefully');
-      quit('session-end');
+      quit();
     },
     onVisibilityChanged: (visible: boolean) => {
       if (visible) everShown = true;
@@ -305,35 +214,27 @@ async function bootstrap(): Promise<void> {
   let healthTimer: NodeJS.Timeout | null = null;
   let quitting = false;
 
-  const updateJournal = createJournalStore(join(userData, 'update-journal.json'), log);
-
-  /** Cache of the last provenance inspection, so the probe stays synchronous. */
-  let installationCache: { key: string; report: SharedDshReport } | null = null;
-
   /**
-   * Inspect the installation the launcher uses and remember the result.
+   * Read-only inspection of the installation the launcher uses.
    *
-   * Runs read-only shell commands inside the distribution, so it is only called
-   * when the update window opens, when the popover asks, and right before an
-   * update starts. Never on the launch path.
+   * Runs only when the update window opens or asks to check again, never on the
+   * launch path. It is deliberately not cached: after the owner runs the manual
+   * command, a cached report would keep claiming the old version until the app
+   * restarts.
    */
   async function inspectInstallation(): Promise<SharedDshReport | null> {
     const runtime = supervisor.resolvedRuntime();
     const status = supervisor.getStatus();
     const dshPath = runtime?.dshPath ?? status.dshPath;
     if (dshPath === null) return null;
-    const key = `${config.distro}|${dshPath}|${status.dshVersion ?? ''}`;
-    if (installationCache !== null && installationCache.key === key) return installationCache.report;
     try {
-      const report = await wsl.inspectSharedDsh({
+      return await wsl.inspectSharedDsh({
         distro: config.distro,
         appRoot: config.runtimeRoot,
         dshPath,
         nodePath: runtime?.nodePath ?? null,
         ownPid: supervisor.ownedPid(),
       });
-      installationCache = { key, report };
-      return report;
     } catch (error) {
       log.warn(`update: inspecting the installation failed: ${error instanceof Error ? error.message : 'unknown'}`);
       return null;
@@ -341,129 +242,56 @@ async function bootstrap(): Promise<void> {
   }
 
   /**
-   * What the confirmation window may do (issues #12 and #17).
+   * What the update window shows.
    *
-   * The plan is computed here, from live configuration and the installation the
-   * launcher really resolved, so a stale renderer can never talk the app into
-   * updating something the safety checks did not see.
+   * DSH WSL does not update anything: it reports the installed and the published
+   * version and the exact commands the owner runs. The backend kind decides
+   * whether those commands include stopping and starting a unit, and only a
+   * read-only probe supplies the unit name.
    */
-  function resolveUpdatePlan() {
-    const target = versions.snapshot().latest?.version ?? null;
-    if (target === null) return { ok: false as const, reason: UPDATE_REASONS.unknownTarget, detail: null };
-    const report = installationCache?.report ?? null;
-    if (report === null || report.installation === null || !report.found) {
-      return { ok: false as const, reason: UPDATE_REASONS.missingInstallation, detail: null };
-    }
-    return planSharedUpdate({
-      distro: config.distro,
-      targetVersion: target,
-      appRoot: config.runtimeRoot,
-      installation: report.installation,
-      customExecutable: config.dshPath !== null,
-      stoppablePid: supervisor.stoppableBackendPid(),
-    });
-  }
-
-  function updateProbe(): UpdateProbe {
+  async function updateProbe(force = false): Promise<UpdateProbe> {
+    // "Check again" is an explicit request, so it must not wait out the 18-hour
+    // cache: the owner pressed it because they expect a version published since
+    // the last lookup to appear.
+    await (force ? versions.refresh() : versions.refreshIfStale()).catch(() => undefined);
     const status = supervisor.getStatus();
-    const result = resolveUpdatePlan();
-    const installation = installationCache?.report.installation ?? null;
-    const base = {
-      installed: installation?.version ?? status.dshVersion,
-      target: versions.snapshot().latest?.version ?? null,
-      distro: config.distro,
-      dshPath: installation?.path ?? status.dshPath,
-      installScope: installation === null ? 'unknown' : describeInstallScope(installation.prefix),
-      installManager: installation?.manager ?? 'unknown',
-      sharedWithTerminal: true,
-      running: updateRunner.running(),
-    };
-    if (!result.ok) {
-      const manual =
-        installation === null || base.target === null ? null : manualUpdateCommand(
-          { npmPath: installation.npmPath, prefix: installation.prefix },
-          base.target,
-        );
-      return {
-        ...base,
-        eligible: false,
-        reason: result.reason,
-        description: describeUpdateReason(result.reason),
-        manualCommand: manual,
-      };
+    const runtime = supervisor.resolvedRuntime();
+    const report = await inspectInstallation();
+    const installation = report?.installation ?? null;
+    const target = versions.snapshot().latest?.version ?? null;
+
+    let backend: 'owned' | 'attached' | 'none' = 'none';
+    let unit: { scope: 'system' | 'user'; name: string } | null = null;
+    if (status.ownedServer) {
+      backend = 'owned';
+    } else if (status.externalBackend) {
+      backend = 'attached';
+      const managed = await supervisor.discoverAttachedUnit();
+      if (managed !== null && managed.scope !== 'none' && managed.unit !== null) {
+        unit = { scope: managed.scope, name: managed.unit };
+      }
     }
+
+    const plan = buildManualUpdatePlan({
+      installation,
+      target,
+      targetError: versions.snapshot().error,
+      backend,
+      unit,
+      ownedPid: backend === 'owned' ? supervisor.ownedBackendPid() : null,
+    });
     return {
-      ...base,
-      installed: result.plan.installedVersion,
-      target: result.plan.version,
-      dshPath: result.plan.dshPath,
-      installScope: result.plan.scope,
-      eligible: !updateRunner.running(),
-      reason: null,
-      description: null,
-      manualCommand: null,
+      installed: plan.installed,
+      target,
+      distro: config.distro,
+      dshPath: installation?.path ?? runtime?.dshPath ?? status.dshPath,
+      installManager: installation?.manager ?? 'unknown',
+      installScope: installation === null ? 'unknown' : describeInstallScope(installation.prefix),
+      commands: plan.commands,
+      description: plan.description,
+      state: plan.state,
     };
   }
-
-  /**
-   * Restart the application after a successful update.
-   *
-   * The graceful path is the same as Quit (owned backend stopped, windows
-   * destroyed, clean-shutdown marker written); only the final step differs:
-   * relaunch the packaged executable instead of exiting.
-   *
-   * The portable build runs from a temporary extraction directory, so
-   * `process.execPath` is not the file the user started; the installed build runs
-   * from its installation directory and is restarted from `process.execPath`. When
-   * neither target can be proven, the app must not pretend to restart itself: the
-   * terminal window says what to do instead and stays open.
-   */
-  const relaunchApp = (): void => {
-    const decision = resolveRelaunchTarget(
-      {
-        portableExecutableFile: process.env.PORTABLE_EXECUTABLE_FILE ?? null,
-        execPath: process.execPath,
-        platform: process.platform,
-        packaged: app.isPackaged,
-        resourcesPath: process.resourcesPath,
-      },
-      (path) => {
-        try {
-          return existsSync(path);
-        } catch {
-          return false;
-        }
-      },
-    );
-    if (!decision.ok) {
-      log.warn(`update: automatic relaunch is not possible (${decision.reason})`);
-      windows.publishUpdate({
-        ...updateRunner.snapshot(),
-        phase: 'done',
-        detail: describeRelaunchFailure(decision.reason),
-      });
-      return;
-    }
-
-    log.info(`update: relaunching ${decision.target.execPath} (${decision.target.mode})`);
-    quitting = true;
-    if (healthTimer !== null) clearTimeout(healthTimer);
-    healthTimer = null;
-    windows.setQuitting();
-    tray?.destroy();
-    tray = null;
-    void supervisor
-      .shutdown()
-      .catch((error: unknown) => {
-        log.error(`shutdown before relaunch failed: ${error instanceof Error ? error.message : 'unknown'}`);
-      })
-      .finally(() => {
-        log.info(CLEAN_SHUTDOWN_MARKER);
-        windows.destroyAll();
-        app.relaunch({ execPath: decision.target.execPath, args: [] });
-        app.exit(0);
-      });
-  };
 
   const supervisor: Supervisor = new Supervisor({
     config: () => config,
@@ -489,16 +317,6 @@ async function bootstrap(): Promise<void> {
       onStatusChange(status);
     },
   });
-
-  const updateRunner = createUpdateRunner({
-    wsl,
-    lifecycle: supervisor,
-    journal: updateJournal,
-    log,
-    publish: (state) => windows.publishUpdate(state),
-    now: () => new Date().toISOString(),
-  });
-
 
   const onStatusChange = (status: ShellStatus): void => {
     switch (status.state) {
@@ -555,32 +373,7 @@ async function bootstrap(): Promise<void> {
     healthTimer.unref?.();
   };
 
-  const quit = (trigger: QuitTrigger = 'user'): void => {
-    if (quitting) return;
-    const updatePhase = updateRunner.snapshot().phase;
-    const updateRunning = updateRunner.running();
-    if (shouldRefuseQuit(trigger, updatePhase, updateRunning)) {
-      // The runtime is being replaced or restarted right now: quitting here would
-      // leave the isolated root half-swapped and force a repair on the next start.
-      log.warn(`quit refused: the update is ${updatePhase}`);
-      windows.openUpdateProgress();
-      windows.publishUpdate({
-        ...updateRunner.snapshot(),
-        detail: 'The update is preparing or replacing the runtime right now. The app quits as soon as this step finishes.',
-      });
-      return;
-    }
-    if (trigger === 'session-end' && updateRunning && isUpdateCritical(updatePhase)) {
-      // Windows may terminate the process at any moment now, so there is no time
-      // to finish or roll back the update. Do not block the logoff: leave the
-      // backend as it is and keep the journal for the recovery the next start
-      // performs.
-      log.warn(`session end during update ${updatePhase}; exiting best effort, journal kept for recovery`);
-    } else if (updateRunning) {
-      // Only the read-only npm version check reaches here: nothing has been
-      // written to the installation, so quitting is safe.
-      log.info(`quit during update check (${updatePhase}); nothing has been changed`);
-    }
+  const quit = (): void => {
     quitting = true;
     log.info('quit requested');
     if (healthTimer !== null) clearTimeout(healthTimer);
@@ -687,91 +480,17 @@ async function bootstrap(): Promise<void> {
     windows.closeSettingsPopover();
   });
 
-  // --- one-click update (issue #12) --------------------------------------
+  // --- manual update window (issue #12 follow-up) -----------------------
   guard('footer:open-update', () => {
     windows.closeSettingsPopover();
     windows.openUpdateConfirm();
   });
-  guard('update:probe', async () => {
-    // The window must show what is really installed, so the provenance is
-    // re-inspected before the plan is built.
-    await inspectInstallation();
-    return updateProbe();
-  });
-  guard('update:state', () => updateRunner.snapshot());
-  guard('update:install-rule', async (_event, password: unknown) => {
-    if (typeof password !== 'string' || password.length === 0) {
-      return { ok: false, message: 'no password was given' };
-    }
-    // Never log the value, and drop the reference as soon as sudo has it.
-    const result = await supervisor.installManagedRule(password);
-    if (result.ok) log.info('the narrow sudo rule is installed; updates no longer ask for a password');
-    else log.warn(`the sudo rule was not installed: ${result.message ?? 'unknown'}`);
-    return result;
-  });
-
+  // Both channels inspect again: the window must never show a stale verdict
+  // after the owner ran a command in a WSL terminal.
+  guard('update:probe', async () => await updateProbe());
+  guard('update:recheck', async () => await updateProbe(true));
   guard('update:close', () => {
-    if (updateRunner.running()) {
-      // The terminal stays until the run finished; only the confirmation window
-      // may be dismissed while nothing is running.
-      windows.closeUpdateConfirm();
-      return;
-    }
-    windows.closeUpdateWindows();
-  });
-  guard('update:start', async (): Promise<UpdateStartResult> => {
-    if (updateRunner.running()) {
-      return { started: false, reason: 'busy', description: 'An update is already running.' };
-    }
-    // The backend that serves the WebUI runs the installation this update would
-    // replace, so it has to be stoppable first. Asking here — before the window
-    // promises anything and before a plan is built — keeps the answer cheap and
-    // turns "cannot" into "give me one password" instead of a dead end.
-    const blocker = await supervisor.updateBlocker();
-    if (blocker !== null) {
-      const rule = supervisor.pendingRule();
-      return { started: false, reason: rule === null ? 'blocked' : 'rule-needed', description: blocker, rule };
-    }
-    const result = resolveUpdatePlan();
-    if (!result.ok) {
-      return { started: false, reason: result.reason, description: describeUpdateReason(result.reason) };
-    }
-    const plan: SharedUpdatePlan = result.plan;
-    const transaction = createTransactionId(new Date());
-    log.info(
-      `update requested: ${plan.installedVersion} -> ${plan.version} ` +
-        `(tx=${transaction}, dsh=${plan.dshPath}, prefix=${plan.prefix})`,
-    );
-    // The confirmation has done its job: the terminal window takes over.
     windows.closeUpdateConfirm();
-    windows.openUpdateProgress();
-    windows.publishUpdate({
-      ...updateRunner.snapshot(),
-      phase: 'checking',
-      message: describeUpdatePhase('checking'),
-      targetVersion: plan.version,
-      installedVersion: plan.installedVersion,
-    });
-    void updateRunner
-      .run(plan, {
-        distro: plan.distro,
-        nodePath: supervisor.resolvedRuntime()?.nodePath ?? null,
-        transaction,
-        customExecutable: config.dshPath !== null,
-        ownPid: supervisor.ownedPid(),
-      })
-      .then((outcome) => {
-        if (!outcome.ok) {
-          log.warn(`update did not complete: ${outcome.state.detail ?? 'unknown'}`);
-          return;
-        }
-        // Let the terminal show the last line, then restart the portable app.
-        setTimeout(() => relaunchApp(), 1_200).unref?.();
-      })
-      .catch((error: unknown) => {
-        log.error(`update runner failed: ${error instanceof Error ? error.message : 'unknown'}`);
-      });
-    return { started: true, reason: null, description: null };
   });
 
   guard('settings:open-window', () => {
@@ -879,25 +598,7 @@ async function bootstrap(): Promise<void> {
       .then(() => windows.publishVersions(versionSnapshot()))
       .catch(() => undefined);
     try {
-      // An update that was interrupted between the two renames is repaired first:
-      // `finalize` keeps the new runtime, `rollback` restores the previous one.
-      const recovery = await recoverInterruptedUpdate({
-        wsl,
-        journal: updateJournal,
-        resume: () => supervisor.resumeAfterUpdate(),
-        log,
-      });
-      if (recovery.handled) {
-        log.info(`update recovery: ${recovery.action ?? 'none'}${recovery.message === null ? '' : ` — ${recovery.message}`}`);
-      }
-      if (recovery.action === 'blocked') {
-        // Never start a backend on top of a runtime whose state is unknown.
-        supervisor.blockForRuntime(
-          recovery.message ?? 'The DeepSeek Harness installation is in an unknown state.',
-        );
-      } else if (recovery.action === null) {
-        await supervisor.start();
-      }
+      await supervisor.start();
     } catch (error) {
       log.error(
         `startup failed: ${error instanceof ShellError ? `${error.code}: ${error.message}` : String(error)}`,

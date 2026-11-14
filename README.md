@@ -52,12 +52,9 @@ your normal `~/.dsh` data as well.
 **Your own WSL, your own data.** Agents, models, tools and project files stay inside
 your Linux distribution. DSH WSL never silently changes WSL, Node.js or a globally
 installed `dsh`, and it never touches the official Windows DeepSeek Harness installation
-or your projects. The one thing it changes is **your shared DeepSeek Harness
-installation in WSL**, and only when you confirm Update in the app: it then runs
-`npm install -g --prefix <prefix> @deepseek-ai/dsh@<version>` into the prefix that
-installation already uses (with a pre-check of the path, provenance, manager,
-permissions, login shell and running processes, a verified local snapshot, and an
-automatic offline restore of the previous version if anything fails).
+or your projects. It does not update anything either: when a newer release exists it
+shows the installed and available version and the exact commands to run in your WSL
+terminal.
 
 **A window that behaves like an app.**
 
@@ -77,23 +74,18 @@ WebUI itself is never modified.
 |---|---|
 | ![Footer bar](docs/media/footer-bar.png) | ![Settings popover](docs/media/footer-settings.png) |
 
-**One-click DeepSeek Harness update.** When a newer published release exists, the bar
-offers it. Confirming updates **your existing shared installation in WSL** — the same
-`dsh` a terminal runs — by installing the exact version into the npm prefix that
-installation already uses. Before anything changes, DSH WSL proves the installation is
-npm-managed, lives inside the reported prefix, is writable, is not used by another `dsh`
-process and is resolved by a login shell, and it takes a verified local snapshot first.
-Only the app's own web backend is stopped, and only for the swap; only a backend that
-really served the new version marks the update successful. Anything unsafe — pnpm or a
-distro package, a prefix that needs `sudo`, a session already using that CLI, a
-divergent login shell, an unverifiable snapshot — is refused with an explanation and,
-where useful, the exact `npm install -g --prefix …` command to run yourself. A refusal
-changes nothing; a failed install restores the previous version offline.
+**A manual, honest update.** When a newer published release exists, the bar offers it.
+The window names the installed and available version, the distribution and the
+executable, and shows the commands you run yourself. Only the commands change: nothing
+is stopped, installed or written by the app. A systemd unit behind an attached backend
+is named read-only, with `sudo systemctl stop/start` for a system unit and
+`systemctl --user` for a user unit; a hand-started or app-owned backend gets the install
+line and an instruction to stop it first. pnpm gets `pnpm add -g`. When the manager,
+version or target cannot be established, no command is invented — the window says why.
+Each line has its own **Copy** button and there is **Copy all**; **Check again** runs
+the read-only inspection once more.
 
-> This updater is covered by unit and isolated-fixture tests only. It has **not** been
-> run against a real global WSL installation yet, so treat it as a prerelease feature.
-
-![Update confirmation](docs/media/update-confirm.png)
+![Manual update window](docs/media/update-confirm.png)
 
 ## Portable or Setup
 
@@ -130,20 +122,20 @@ Details, installer behaviour and CI checks: [docs/packaging.md](docs/packaging.m
    locating your `dsh`, backend start, token exchange.
 3. The official WebUI appears as soon as the backend is ready. Change the
    distribution, port or isolation mode from the gear if needed.
-4. When a new DeepSeek Harness release is published, use the pill in the status bar;
-   after a confirmation that names the executable and the npm prefix, DSH WSL updates
-   **that shared WSL installation**, verifies the new version and restarts itself — or
-   refuses safely and explains why.
+4. When a new DeepSeek Harness release is published, use the pill in the status bar.
+   The window names the executable, the npm prefix and the versions; copy the commands
+   and run them in a WSL terminal, then press **Check again**. DSH WSL itself changes
+   nothing.
 
 ## Documentation
 
 | | |
 |---|---|
-| [Packaging: Portable and Setup](docs/packaging.md) | artifacts, installer, CI, relaunch targets |
+| [Packaging: Portable and Setup](docs/packaging.md) | artifacts, installer, CI |
 | [Architecture](docs/architecture.md) | process model, supervisor, window composition |
 | [Specification](docs/spec.md) | state machine, tray lifecycle, security rules |
 | [Footer bar and settings](docs/footer.md) | the app-owned chrome |
-| [Shared-install update](docs/update.md) | guards, snapshot, journal, rollback |
+| [Manual update](docs/update.md) | versions, commands, read-only inspection |
 | [Upstream contract](docs/upstream-dsh-web.md) | how `dsh web` is started and verified |
 | [Diagnostics and support](docs/diagnostics.md) | logs, profile, failure states |
 | [Development](docs/development.md) | commands, tests, layout |
@@ -153,7 +145,7 @@ Details, installer behaviour and CI checks: [docs/packaging.md](docs/packaging.m
 
 CI runs typecheck, lint, unit tests (source-invariant and Electron-free logic), render
 smoke tests of the app-owned surfaces, a real-screen paint probe and the Windows
-packaging job that installs, relaunches and uninstalls both variants. Real acceptance
+packaging job that installs, launches and uninstalls both variants. Real acceptance
 runs on a live Windows 11 + Ubuntu WSL2 machine are recorded in
 [docs/evidence/r02.md](docs/evidence/r02.md), [docs/evidence/r09.md](docs/evidence/r09.md)
 and [docs/evidence/r091.md](docs/evidence/r091.md). Source-level green checks are never

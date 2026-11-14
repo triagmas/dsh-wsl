@@ -25,7 +25,7 @@ const api = {
   toggleSettings(anchor: FooterAnchor): Promise<void> {
     return ipcRenderer.invoke('footer:toggle-settings', anchor) as Promise<void>;
   },
-  /** Opens the update confirmation window (issue #12). */
+  /** Opens the manual update window (issue #12). */
   openUpdate(): Promise<void> {
     return ipcRenderer.invoke('footer:open-update') as Promise<void>;
   },

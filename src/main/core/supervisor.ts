@@ -5,7 +5,7 @@
  * unit-testable without Electron, WSL or a real DeepSeek Harness installation.
  */
 import type { AppConfig, LifecycleState, ShellStatus } from '../../shared/types.js';
-import { sudoersLines, type ManagedBackend } from '../wsl/managed.js';
+import type { ManagedBackend } from '../wsl/managed.js';
 import { LOOPBACK_HOST } from '../../shared/types.js';
 import { parseStartupLine, buildOrigin } from '../backend/urls.js';
 import type { ProcessProbe } from '../wsl/output.js';
@@ -76,91 +76,6 @@ export interface ResolvedRuntime {
   legacyRuntimePresent?: boolean;
 }
 
-/** Result of the read-only "does this exact version exist on npm" check. */
-export interface NpmVersionCheck {
-  found: boolean;
-  /** npm binary used for the query, `null` when none was found. */
-  npmPath: string | null;
-  /** Version string npm reported, `null` when the query produced nothing. */
-  reported: string | null;
-  /** Short, safe explanation when `found` is false. */
-  message: string | null;
-}
-
-/** One streaming update step of the shared installation. */
-export interface SharedUpdateRunRequest {
-  distro: string;
-  /** App data root inside the distribution (`-` when isolation is off). */
-  appRoot: string;
-  /** npm global prefix reported by the inspection. */
-  prefix: string;
-  /** Package directory of the installation. */
-  packageDir: string;
-  /** Executable the launcher uses. */
-  dshPath: string;
-  /** Approved `readlink -f` of that executable: npm must keep it in place. */
-  realPath: string;
-  npmPath: string;
-  nodePath: string | null;
-  /** Transaction id shared by the update, the rollback and the journal. */
-  transaction: string;
-  version: string;
-  installedVersion: string;
-  /** PID of the app-owned backend, excluded from the foreign-process scan. */
-  ownPid: number | null;
-  /** Verified offline recovery snapshot, created before the installation changed. */
-  snapshotDir: string;
-}
-
-export interface SharedRollbackRequest {
-  distro: string;
-  appRoot: string;
-  prefix: string;
-  packageDir: string;
-  dshPath: string;
-  realPath: string;
-  npmPath: string;
-  nodePath: string | null;
-  snapshotDir: string;
-}
-
-/** Read-only inputs for preparing the verification snapshot. */
-export interface PrepareBackupRequest {
-  distro: string;
-  appRoot: string;
-  prefix: string;
-  packageDir: string;
-  dshPath: string;
-  realPath: string;
-  installedVersion: string;
-  transaction: string;
-  /**
-   * Resolved Node runtime the backend uses (`null` when unknown).
-   *
-   * The npm launcher is a `#!/usr/bin/env node` shim, so the backup script needs
-   * this directory on PATH; without it the version probe returns nothing and the
-   * snapshot is refused with code 81 (issue #27).
-   */
-  nodePath: string | null;
-}
-
-/** Result of the snapshot step: where the verified copy lives. */
-export interface BackupSnapshot {
-  /** Absolute snapshot directory inside the app data root. */
-  path: string;
-  /** Number of files the snapshot contains. */
-  files: number;
-}
-
-/**
- * Outcome of the snapshot attempt. A failure keeps the exit code and the last
- * line of subprocess output so the UI can show the real reason instead of the
- * generic "check free space" advice.
- */
-export type BackupAttempt =
-  | { ok: true; snapshot: BackupSnapshot }
-  | { ok: false; code: number | null; detail: string };
-
 export interface InspectSharedRequest {
   distro: string;
   appRoot: string;
@@ -170,24 +85,12 @@ export interface InspectSharedRequest {
   ownPid: number | null;
 }
 
-export interface UpdateRunResult {
-  code: number | null;
-  /** Last non-empty output lines, used for the failure detail. */
-  tail: string;
-}
-
 export interface WslGateway {
   listDistros(): Promise<string[]>;
   /** Any `wsl.exe` invocation starts a stopped distribution. */
   ensureDistro(distro: string): Promise<void>;
   /** Resolve the distribution's own `dsh` and `node` (read-only). */
   resolveRuntime(distro: string, override: string | null, isolationRoot: string | null): Promise<ResolvedRuntime>;
-  /**
-   * Read-only Node.js discovery for crash recovery, before a backend exists.
-   * Unlike resolveRuntime(), this must also work if npm removed the DSH shim
-   * during an interrupted install; it cannot depend on dsh being runnable.
-   */
-  resolveRecoveryNode(distro: string): Promise<string | null>;
   /** Create the isolated data directories below the validated root. */
   prepareIsolation(distro: string, root: string): Promise<void>;
   startServer(request: StartServerRequest): ServerHandle;
@@ -209,60 +112,16 @@ export interface WslGateway {
   ensureKeepalive(distro: string, nodePath: string | null): Promise<number | null>;
   /** `dsh --version` of the selected executable; `null` when it cannot be read. */
   dshVersion(distro: string, dshPath: string, nodePath: string | null): Promise<string | null>;
-  signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
-  /** Read-only npm lookup for the exact version the update would install. */
-  checkPublishedVersion(request: {
-    distro: string;
-    appRoot: string;
-    version: string;
-    nodePath: string | null;
-  }): Promise<NpmVersionCheck>;
-  /** Read-only provenance report of the installation the launcher uses. */
+  /** Read-only provenance of the installation the launcher runs (issue #17). */
   inspectSharedDsh(request: InspectSharedRequest): Promise<SharedDshReport>;
   /**
-   * Create and verify the offline recovery snapshot. Throws or returns `null`
-   * when the snapshot cannot be proven; the update must not start then.
+   * Read-only discovery of the systemd unit behind an attached backend.
+   *
+   * Only the manual update window uses it, to name the unit in an instruction;
+   * the app never stops or starts that unit itself.
    */
-  prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupAttempt>;
-  /** Which process manager owns a backend pid, and whether the app may use it. */
   probeManagedBackend(request: { distro: string; pid: number }): Promise<ManagedBackend>;
-  /** Stop or start that unit through its own manager. */
-  controlManagedBackend(request: {
-    distro: string;
-    scope: 'system' | 'user';
-    unit: string;
-    action: 'stop' | 'start';
-  }): Promise<{ ok: boolean; message: string | null }>;
-  /** Install the one sudo rule that lets the app control a system unit. */
-  installManagedRule(request: {
-    distro: string;
-    user: string;
-    unit: string;
-    password: string;
-  }): Promise<{ ok: boolean; message: string | null }>;
-  /** Remove recovery snapshots beyond the newest few. Never blocks an update. */
-  pruneUpdateSnapshots(request: {
-    distro: string;
-    appRoot: string;
-    keep: number;
-    /** Snapshot of the running transaction, never a pruning candidate. */
-    transaction: string;
-  }): Promise<{ removed: string[] }>;
-  /** Update the shared installation, streaming npm output. */
-  updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
-  /** Reinstall the previous exact version (failure path and journal recovery). */
-  rollbackSharedDsh(
-    request: SharedRollbackRequest,
-    version: string,
-    transaction: string,
-    onLine: (line: string) => void,
-  ): Promise<UpdateRunResult>;
-}
-
-/** Result of pausing or resuming the supervisor around an update. */
-export interface UpdateTransition {
-  ok: boolean;
-  message: string | null;
+  signal(distro: string, pid: number, signal: 'TERM' | 'KILL'): Promise<void>;
 }
 
 export interface WebClient {
@@ -365,14 +224,6 @@ export class Supervisor {
   private attached = false;
   /** Pid of the attached backend: needed to find the unit that owns it. */
   private attachedPid: number | null = null;
-  /** Unit the app stopped for the current update; started again afterwards. */
-  private stoppedManaged: { scope: 'system' | 'user'; unit: string } | null = null;
-  /** Manager seen by the last probe; drives the one-password hint. */
-  private lastManaged: ManagedBackend | null = null;
-  /** Unit this update touched, kept until its outcome is known. */
-  private managedUnit: { scope: 'system' | 'user'; unit: string } | null = null;
-  /** True while that unit runs because this update started it. */
-  private managedStarted = false;
   /**
    * The profile expects this port to be served by a backend the owner started
    * (a previous attach succeeded). While true the app waits for that backend
@@ -409,11 +260,6 @@ export class Supervisor {
   private dshVersion: string | null = null;
   /** Runtime actually launched; `null` until a start resolved one (issue #12). */
   private runtime: ResolvedRuntime | null = null;
-  /**
-   * True while an update owns the backend lifecycle: automatic recovery, health
-   * checks and manual restarts are paused so nothing races the runtime swap.
-   */
-  private updateLocked = false;
 
   constructor(private readonly deps: SupervisorDeps) {
     this.status = this.buildStatus('CHECKING', null);
@@ -426,9 +272,9 @@ export class Supervisor {
   /**
    * PID of the app-owned backend, `null` when nothing is owned.
    *
-   * The updater excludes exactly this process from the "another DSH process uses
-   * this installation" check, so the app never has to stop anything it does not
-   * own and never mistakes its own backend for a foreign one.
+   * The read-only inspection excludes exactly this process from the "another DSH
+   * process uses this installation" check, so the app never mistakes its own
+   * backend for a foreign one.
    */
   ownedPid(): number | null {
     return this.owned ? this.serverPid : null;
@@ -440,11 +286,21 @@ export class Supervisor {
 
   /**
    * Runtime the launcher resolved (`dsh` plus the Node.js that runs it),
-   * `null` until a start succeeded. The updater needs the same Node.js binary
-   * so a staged install can be verified exactly like the backend is started.
+   * `null` until a start succeeded. The inspection needs the same Node.js binary
+   * so the version probe runs exactly like the backend is started.
    */
   resolvedRuntime(): ResolvedRuntime | null {
     return this.runtime;
+  }
+
+  /**
+   * Pid of the backend this app started, for the manual update instructions.
+   *
+   * The update window says how to stop it, so it must name the real process: the
+   * app deliberately leaves that backend running when the owner quits.
+   */
+  ownedBackendPid(): number | null {
+    return this.owned ? this.serverPid : null;
   }
 
   get state(): LifecycleState {
@@ -513,7 +369,7 @@ export class Supervisor {
   /** First launch or manual retry: serialized, never parallel. */
   start(): Promise<void> {
     return this.serial(async () => {
-      if (this.quitting || this.refuseDuringUpdate('start')) return;
+      if (this.quitting) return;
       // Repeated launches must never spawn a second server for the same port.
       if (this.owned && (this.lifecycle.state === 'READY' || this.lifecycle.state === 'HIDDEN_IN_TRAY' || this.lifecycle.state === 'CONNECTING')) {
         return;
@@ -526,7 +382,7 @@ export class Supervisor {
   /** Tray "Restart WebUI": restarts the app-owned backend, or takes the port back. */
   restart(): Promise<void> {
     return this.serial(async () => {
-      if (this.quitting || this.refuseDuringUpdate('restart')) return;
+      if (this.quitting) return;
       if (this.attached) {
         this.setDetail('The backend runs outside this app; restart it with its own service.');
         return;
@@ -552,344 +408,32 @@ export class Supervisor {
   /** Retry from a terminal error state. */
   retry(): Promise<void> {
     return this.serial(async () => {
-      if (this.quitting || this.refuseDuringUpdate('retry')) return;
+      if (this.quitting) return;
       if (this.lifecycle.state === 'ERROR') this.setState('CHECKING', null);
       this.attempt = 0;
       await this.bringUp();
     });
   }
 
-  /** Pause auto-recovery and stop the app-owned backend before the swap. */
   /**
-   * Why an update must not start right now, or `null` when it may.
+   * Read-only unit of the backend the app is attached to.
    *
-   * The backend that serves the WebUI runs the installation an update replaces,
-   * so it has to stop first — but the app must never pretend that is impossible.
-   * It asks the process manager that owns the backend, and only refuses when it
-   * genuinely has no way to stop it: no unit at all, or a unit it is not allowed
-   * to touch. The answer names the exact line that removes the obstacle.
-   *
-   * The check runs before the npm query and before the recovery snapshot, so an
-   * obstacle is reported in the first instant instead of after a minute of work.
+   * The manual update window names that unit in the commands it shows, so the
+   * discovery has to be real and has to happen when the window opens. Nothing
+   * here stops, starts or signals the unit; `null` means the backend is
+   * app-owned, not running, or the probe failed.
    */
-  async updateBlocker(): Promise<string | null> {
-    if (!this.attached) return null;
-    const managed = await this.discoverManaged();
-    if (managed === null || managed.scope === 'none' || managed.unit === null) {
-      return (
-        'The DeepSeek Harness that serves the WebUI was started by hand, so the app has no way to stop it, and an ' +
-        'update replaces the files that process is running. Stop it inside WSL, then start the update again — the ' +
-        'app brings the WebUI back once the installation is replaced. Nothing was changed.'
-      );
-    }
-    if (!managed.canControl) {
-      const rule = sudoersLines({ user: managed.user, unit: managed.unit })[0] ?? '';
-      return (
-        `The DeepSeek Harness that serves the WebUI runs as the systemd unit ${managed.unit}, and the app is not ` +
-        `allowed to stop it. Add this line to /etc/sudoers.d/dsh-update (mode 0440, owner root) and retry: ` +
-        `"${rule}" — Nothing was changed.`
-      );
-    }
-    return null;
-  }
-
-  /** Which manager owns the attached backend, or `null` when it is unknown. */
-  private async discoverManaged(): Promise<ManagedBackend | null> {
+  async discoverAttachedUnit(): Promise<ManagedBackend | null> {
     const pid = this.attachedPid;
     if (!this.attached || pid === null) return null;
     try {
-      const managed = await this.deps.wsl.probeManagedBackend({ distro: this.distro(), pid });
-      this.lastManaged = managed;
-      return managed;
+      return await this.deps.wsl.probeManagedBackend({ distro: this.distro(), pid });
     } catch (error) {
-      this.deps.log.warn(`could not identify the manager of the attached backend: ${describe(error)}`);
+      this.deps.log.warn(`could not identify the unit of the attached backend: ${describe(error)}`);
       return null;
     }
   }
 
-  /**
-   * The rule the app would need to control the attached backend, or `null` when
-   * it needs none. The confirmation window uses it to ask for the password once
-   * instead of sending the owner to a terminal.
-   */
-  pendingRule(): { unit: string; user: string; scope: 'system' | 'user'; line: string } | null {
-    const managed = this.lastManaged;
-    if (!this.attached || managed === null || managed.scope !== 'system' || managed.unit === null) return null;
-    if (managed.canControl) return null;
-    return {
-      unit: managed.unit,
-      user: managed.user,
-      scope: managed.scope,
-      line: sudoersLines({ user: managed.user, unit: managed.unit })[0] ?? '',
-    };
-  }
-
-  /**
-   * The attached backend the app may stop by itself, or `null`.
-   *
-   * Only a backend that a manager owns and that the app is allowed to control
-   * counts: it is the one process the update is allowed to find using the
-   * installation, because stopping it is the first step of that update.
-   */
-  stoppableBackendPid(): number | null {
-    const managed = this.lastManaged;
-    if (!this.attached || this.attachedPid === null || managed === null) return null;
-    if (managed.scope === 'none' || !managed.canControl) return null;
-    return this.attachedPid;
-  }
-
-  /** Install that rule with the password the owner typed, then re-probe. */
-  async installManagedRule(password: string): Promise<{ ok: boolean; message: string | null }> {
-    const rule = this.pendingRule();
-    if (rule === null) return { ok: true, message: null };
-    const result = await this.deps.wsl
-      .installManagedRule({
-        distro: this.distro(),
-        user: rule.user,
-        unit: rule.unit,
-        password,
-      })
-      .catch((error: unknown) => ({ ok: false, message: describe(error) }));
-    if (!result.ok) return result;
-    // Prove it works instead of trusting the write: the probe re-checks `sudo -n`.
-    const verified = await this.discoverManaged();
-    if (verified === null || !verified.canControl) {
-      return {
-        ok: false,
-        message: 'the rule was written but sudo still refuses it; check /etc/sudoers.d/dsh-update inside WSL',
-      };
-    }
-    return { ok: true, message: null };
-  }
-
-  /**
-   * Start the unit the app stopped for an update.
-   *
-   * Best effort by design: the WebUI must come back either way, and `bringUp`
-   * already falls back to an app-owned backend when the launcher does not return.
-   */
-  private async startStoppedManaged(): Promise<{ ok: boolean; message: string | null }> {
-    const stopped = this.stoppedManaged;
-    if (stopped === null) return { ok: true, message: null };
-    try {
-      const started = await this.deps.wsl.controlManagedBackend({
-        distro: this.distro(),
-        scope: stopped.scope,
-        unit: stopped.unit,
-        action: 'start',
-      });
-      if (started.ok) {
-        // The unit is running, so there is nothing left to start: forgetting it
-        // only here keeps a failed start retryable.
-        this.stoppedManaged = null;
-        this.managedStarted = true;
-        this.deps.log.info(`update: started ${stopped.unit} (${stopped.scope}) again`);
-        return { ok: true, message: null };
-      }
-      const message = started.message ?? 'the manager reported a failure';
-      this.deps.log.warn(`update: ${stopped.unit} did not start (${message})`);
-      return { ok: false, message: `${stopped.unit} did not start (${message})` };
-    } catch (error) {
-      const message = describe(error);
-      this.deps.log.warn(`update: ${stopped.unit} could not be started: ${message}`);
-      return { ok: false, message: `${stopped.unit} could not be started: ${message}` };
-    }
-  }
-
-  /**
-   * Stop the unit this update started, before the previous files are restored.
-   *
-   * Overwriting an installation under a running process is what the whole
-   * coordination exists to avoid, and a rollback writes those files too.
-   */
-  async stopForRollback(): Promise<{ ok: boolean; message: string | null }> {
-    const unit = this.managedUnit;
-    if (unit === null || !this.managedStarted) return { ok: true, message: null };
-    try {
-      const stopped = await this.deps.wsl.controlManagedBackend({
-        distro: this.distro(),
-        scope: unit.scope,
-        unit: unit.unit,
-        action: 'stop',
-      });
-      if (!stopped.ok) {
-        // Writing the previous files under a running process corrupts them, so a
-        // refused stop must stop the rollback, not be logged and ignored.
-        const message = stopped.message ?? 'the manager refused to stop it';
-        this.deps.log.error(`update: ${unit.unit} could not be stopped for the rollback (${message})`);
-        return { ok: false, message: `${unit.unit} could not be stopped (${message})` };
-      }
-    } catch (error) {
-      const message = describe(error);
-      this.deps.log.error(`update: ${unit.unit} could not be stopped for the rollback: ${message}`);
-      return { ok: false, message: `${unit.unit} could not be stopped (${message})` };
-    }
-    this.managedStarted = false;
-    // It is stopped again, so the resume path has to start it once more.
-    this.stoppedManaged = unit;
-    return { ok: true, message: null };
-  }
-
-  pauseForUpdate(): Promise<UpdateTransition> {
-    return this.serial(async () => {
-      if (this.quitting) return { ok: false, message: 'The app is quitting.' };
-      if (this.attached) {
-        // The backend belongs to the owner's launcher, and an update replaces the
-        // files it executes: ask the launcher to stop it, exactly as the owner
-        // would, then hold the update lock so recovery cannot start a competitor.
-        const previousState = this.lifecycle.state;
-        const managed = await this.discoverManaged();
-        if (managed === null || managed.scope === 'none' || managed.unit === null || !managed.canControl) {
-          return {
-            ok: false,
-            message:
-              'The DeepSeek Harness that serves the WebUI cannot be stopped by this app, so nothing was changed. ' +
-              'Stop it inside WSL yourself, then retry the update.',
-          };
-        }
-        this.updateLocked = true;
-        this.setState('RECOVERING', 'Stopping DeepSeek Harness for the update');
-        const stopped = await this.deps.wsl
-          .controlManagedBackend({
-            distro: this.distro(),
-            scope: managed.scope,
-            unit: managed.unit,
-            action: 'stop',
-          })
-          .catch((error: unknown) => ({ ok: false as const, message: describe(error) }));
-        if (!stopped.ok) {
-          this.updateLocked = false;
-          // Nothing changed, so the app must go back to being ready instead of
-          // sitting in "Stopping DeepSeek Harness" forever.
-          this.setState(previousState, null);
-          this.deps.log.error(`update: ${managed.unit} could not be stopped (${stopped.message ?? 'unknown error'})`);
-          return {
-            ok: false,
-            message:
-              `The unit ${managed.unit} could not be stopped (${stopped.message ?? 'unknown error'}), so nothing ` +
-              'was installed and nothing was changed.',
-          };
-        }
-        this.stoppedManaged = { scope: managed.scope, unit: managed.unit };
-        this.managedUnit = { scope: managed.scope, unit: managed.unit };
-        this.managedStarted = false;
-        // The process is gone: the next bring-up must attach to the unit's new
-        // process instead of believing it already has one.
-        this.attached = false;
-        this.attachedPid = null;
-        this.deps.log.info(`update: stopped ${managed.unit} (${managed.scope}) for the update`);
-        return { ok: true, message: null };
-      }
-      this.updateLocked = true;
-      if (!this.owned && this.serverPid === null && this.server === null) {
-        this.deps.log.info('update: no app-owned backend is running');
-        return { ok: true, message: null };
-      }
-      this.setState('RECOVERING', 'Stopping DeepSeek Harness for the update');
-      try {
-        await this.stopOwnedServer();
-        this.deps.log.info('update: app-owned backend stopped');
-        return { ok: true, message: null };
-      } catch (error) {
-        // The process state is now unknown. Release the lock so the app cannot get
-        // stuck in a silent soft-lock, and say so in the UI: a retry has to decide
-        // what to do with a backend that may still be alive.
-        const detail = describe(error);
-        this.deps.log.error(`update: stopping the backend failed (${detail})`);
-        this.releaseUpdateLock();
-        this.fail(
-          new ShellError(
-            'backend-lost',
-            'The app-owned backend could not be stopped for the update, so nothing was replaced.',
-            `Check the WSL distribution and retry. ${detail}`,
-          ),
-        );
-        return { ok: false, message: `The app-owned backend could not be stopped: ${detail}` };
-      }
-    });
-  }
-
-  /**
-   * Start the backend again from the (new or restored) runtime.
-   *
-   * This is a full start: distribution check, runtime resolution, token exchange
-   * and the authenticated request — so "the update succeeded" is only reported
-   * when the new version really serves the WebUI.
-   */
-  resumeAfterUpdate(): Promise<UpdateTransition> {
-    return this.serial(async () => {
-      if (this.quitting) {
-        this.updateLocked = false;
-        return { ok: false, message: 'The app is quitting.' };
-      }
-      this.attempt = 0;
-      try {
-        // A unit the app stopped comes back first: `bringUp` then attaches to its
-        // new process (the external expectation is already recorded).
-        //
-        // If it does not come back, the update is not a success: starting an
-        // app-owned backend on the same port would hide the failure and leave the
-        // owner's own unit stopped.
-        const started = await this.startStoppedManaged();
-        if (!started.ok) {
-          return {
-            ok: false,
-            message: `${started.message ?? 'the backend did not start'}. The DeepSeek Harness that serves the WebUI is not running.`,
-          };
-        }
-        // The lock stays held until the start finished, so a late exit event from
-        // the backend that was just stopped cannot start a recovery mid-update.
-        await this.bringUp();
-        this.deps.log.info('update: backend started from the active runtime');
-        return { ok: true, message: null };
-      } catch (error) {
-        this.deps.log.error(`update: starting the backend failed (${describe(error)})`);
-        return { ok: false, message: describe(error) };
-      } finally {
-        this.updateLocked = false;
-      }
-    });
-  }
-
-  /**
-   * Terminal state for a runtime the app must not start.
-   *
-   * Used when an interrupted update left the isolated root in a state the
-   * recovery could not repair: starting a backend from a half-swapped tree would
-   * hide the problem, so the app explains it instead.
-   */
-  blockForRuntime(message: string): void {
-    // Deliberately *not* releaseUpdateLock(): that starts the stopped unit, and
-    // this path exists precisely because its runtime must not be started.
-    this.updateLocked = false;
-    this.stoppedManaged = null;
-    this.managedUnit = null;
-    this.managedStarted = false;
-    this.owned = false;
-    this.fail(
-      new ShellError(
-        'runtime-blocked',
-        'The DeepSeek Harness runtime could not be restored after an interrupted update.',
-        message,
-      ),
-    );
-  }
-
-  /** Release the update lock; a unit stopped for the update is started again. */
-  releaseUpdateLock(): void {
-    this.updateLocked = false;
-    if (this.stoppedManaged !== null) void this.startStoppedManaged();
-  }
-
-  get updateInProgress(): boolean {
-    return this.updateLocked;
-  }
-
-  private refuseDuringUpdate(action: string): boolean {
-    if (!this.updateLocked) return false;
-    this.deps.log.info(`${action} ignored: an update is in progress`);
-    return true;
-  }
 
   markHidden(hidden: boolean): void {
     this.windowHidden = hidden;
@@ -903,7 +447,6 @@ export class Supervisor {
 
   /** Health tick driven by the main process (visible ~10 s, hidden ~25 s). */
   async healthTick(): Promise<void> {
-    if (this.updateLocked) return;
     const state = this.lifecycle.state;
     if (state !== 'READY' && state !== 'HIDDEN_IN_TRAY') return;
     const origin = buildOrigin(this.port());
@@ -935,11 +478,6 @@ export class Supervisor {
       );
       return;
     }
-    if (this.updateLocked) {
-      // The update stops the backend on purpose; recovery must not race it.
-      this.deps.log.debug(`backend exit ignored during the update (code=${exit.code ?? 'null'})`);
-      return;
-    }
     if (this.startInFlight) {
       // The start that owns this process reports the failure itself, once, with
       // the backend's own output. A second reporter here would duplicate the
@@ -964,7 +502,7 @@ export class Supervisor {
    * a failing health tick for the same process) produce one loop (issue #24).
    */
   private async handleLoss(reason: string): Promise<void> {
-    if (this.recoveryRunning || this.recoveryScheduled || this.quitting || this.updateLocked) return;
+    if (this.recoveryRunning || this.recoveryScheduled || this.quitting) return;
     if (this.attached) {
       // The backend belongs to its own launcher, so the app must not signal or
       // stop it. Normal recovery is safe here: it re-attaches to that backend
@@ -982,7 +520,7 @@ export class Supervisor {
     try {
       await this.serial(async () => {
         this.recoveryScheduled = false;
-        if (this.quitting || this.updateLocked || this.startInFlight) return;
+        if (this.quitting || this.startInFlight) return;
         if (!RECOVERABLE_STATES.includes(this.lifecycle.state)) {
           this.deps.log.debug(`recovery not needed (${reason}): state is ${this.lifecycle.state}`);
           return;
@@ -1561,7 +1099,7 @@ export class Supervisor {
    * backend keeps serving.
    */
   private async maybeHandBack(): Promise<void> {
-    if (this.quitting || this.updateLocked || this.attached || !this.owned) return;
+    if (this.quitting || this.attached || !this.owned) return;
     if (!this.externalExpected || this.handBackRunning) return;
     const config = this.deps.config();
     if (this.port() === config.port) return;
@@ -1579,7 +1117,7 @@ export class Supervisor {
         `the backend started outside this app is serving port ${config.port} again; handing the port back`,
       );
       await this.serial(async () => {
-        if (this.quitting || this.updateLocked || this.attached) return;
+        if (this.quitting || this.attached) return;
         this.attempt = 0;
         this.setState('RECOVERING', 'Connecting to the backend started outside this app');
         await this.stopOwnedServer();
@@ -1793,7 +1331,6 @@ export class Supervisor {
       this.deps.log.info(`attached to the running backend (pid=${pid}); it stays outside the app lifecycle`);
       // Learn which manager owns it right away: the update window asks whether
       // that backend may be stopped long before the owner presses Update.
-      void this.discoverManaged();
       return 'attached';
     } catch (error) {
       this.deps.log.warn(`attach probe failed: ${describe(error)}`);

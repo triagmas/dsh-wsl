@@ -1,33 +1,31 @@
 /**
- * The unit that runs the backend the app attached to.
+ * Read-only discovery of the unit that runs the backend the app attached to.
  *
- * An update replaces the installation that the serving process executes, so the
- * process has to be stopped first and started again afterwards. The app never
- * signals a process it did not start, so it asks the process manager instead:
- * that is exactly what the owner would do by hand, with the same permission.
- *
- * Two scopes are possible. A user unit needs no privilege because the app runs as
- * the same user inside the distribution. A system unit needs root, which the app
- * must never hold: it uses one narrow, passwordless `sudo` rule for `systemctl
- * stop|start` of that single unit, and refuses with the exact line to add while
- * the rule is missing.
+ * The window that explains a manual update names that unit in the commands the
+ * owner runs, so the app must report the real one instead of a placeholder. It
+ * only reads `/proc/<pid>/cgroup`: no sudo, no `systemctl`, no signal. A process
+ * the app did not start is never stopped or started by the app, and a unit that
+ * was not discovered here cannot enter an instruction.
  */
 import { ArgumentError, assertDistroName } from './args.js';
+import { isValidUnitName } from '../core/manual-update.js';
 
-const UNIT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.@:-]*$/;
-
-/** Marker echoed by both scripts; parsed, never trusted as prose. */
+/** Marker echoed by the probe; parsed, never trusted as prose. */
 export const MANAGED_MARKER = '__dsh_wsl_managed__';
 
-/** Reports which manager owns a pid and whether the app may use it. */
+/**
+ * Reports which manager owns a pid and which unit started it.
+ *
+ * The kernel writes "0::/system.slice/x.service" (cgroup v2) or
+ * "4:systemd:/system.slice/x.service" (v1), so only the text after the last colon
+ * is a path. No privileged command is used: the probe must stay read-only even
+ * when it runs against a unit the app could never control.
+ */
 export const PROBE_MANAGED_SCRIPT = [
   'set -u',
   'pid="$0"',
   'case "$pid" in ""|*[!0-9]*) echo "managed: rejected pid" >&2; exit 64 ;; esac',
   'user=$(id -un 2>/dev/null || echo unknown)',
-  // The kernel writes "0::/system.slice/x.service" (cgroup v2) or
-  // "4:systemd:/system.slice/x.service" (v1). The leading hierarchy fields are
-  // not part of the path, so only the text after the last colon is used.
   'path=""',
   'if [ -r "/proc/$pid/cgroup" ]; then',
   '  line=$(head -n 1 "/proc/$pid/cgroup" 2>/dev/null || true)',
@@ -36,51 +34,18 @@ export const PROBE_MANAGED_SCRIPT = [
   'unit="-"',
   'cand=$(printf "%s" "$path" | tr "/" "\\n" | grep -E "^[A-Za-z0-9_.@:-]+\\.service$" | tail -n 1 2>/dev/null || true)',
   'case "$cand" in ""|*[!A-Za-z0-9_.@:-]*) ;; *) unit="$cand" ;; esac',
-  // Both answers are reported; the caller picks the one that matches the scope it
-  // derived from the same path, so the shell never has to classify anything.
-  'can_sys=0; can_user=0',
-  'if [ "$unit" != "-" ]; then',
-  '  sudo -n -l "/usr/bin/systemctl stop $unit" >/dev/null 2>&1 && can_sys=1',
-  '  systemctl --user show "$unit" --property=Id >/dev/null 2>&1 && can_user=1',
-  'fi',
-  `printf "%s path=%s unit=%s can_sys=%s can_user=%s user=%s\\n" "${MANAGED_MARKER}" "$path" "$unit" "$can_sys" "$can_user" "$user"`,
+  `printf "%s path=%s unit=%s user=%s\\n" "${MANAGED_MARKER}" "$path" "$unit" "$user"`,
   'exit 0',
 ].join('\n');
 
-/** Stops or starts one unit the probe reported as controllable. */
-export const CONTROL_MANAGED_SCRIPT = [
-  'set -u',
-  'scope="$0"; unit="$1"; action="$2"',
-  'case "$action" in stop|start) ;; *) echo "managed: rejected action" >&2; exit 64 ;; esac',
-  'case "$unit" in ""|*[!A-Za-z0-9_.@:-]*) echo "managed: rejected unit" >&2; exit 64 ;; esac',
-  'case "$scope" in',
-  '  system) sudo -n /usr/bin/systemctl "$action" "$unit" ;;',
-  '  user) systemctl --user "$action" "$unit" ;;',
-  '  *) echo "managed: rejected scope" >&2; exit 64 ;;',
-  'esac',
-  'rc=$?',
-  'if [ "$rc" -ne 0 ]; then',
-  '  case "$rc" in 1) echo "managed: systemctl $action $unit was refused (missing sudo rule for this unit, or the unit does not exist)" ;; *) echo "managed: systemctl $action $unit failed (rc=$rc)" ;; esac',
-  '  exit "$rc"',
-  'fi',
-  `printf "%s action=%s unit=%s ok=1\\n" "${MANAGED_MARKER}" "$action" "$unit"`,
-  'exit 0',
-].join('\n');
-
+/** Which manager owns the attached backend. */
 export interface ManagedBackend {
-  /** Which manager owns the serving process. */
+  /** Which systemd scope started the serving process. */
   scope: 'system' | 'user' | 'none';
   /** Unit name, or `null` when the process was not started by one. */
   unit: string | null;
-  /** True when the app may stop and start that unit without a password. */
-  canControl: boolean;
-  /** Linux user the backend runs as; named in the sudoers hint. */
+  /** Linux user the backend runs as. */
   user: string;
-}
-
-export function assertUnitName(unit: string): string {
-  if (typeof unit !== 'string' || !UNIT_PATTERN.test(unit)) throw new ArgumentError('invalid-unit-name');
-  return unit;
 }
 
 export function buildProbeManagedArgs(request: { distro: string; pid: number }): string[] {
@@ -88,28 +53,6 @@ export function buildProbeManagedArgs(request: { distro: string; pid: number }):
   return ['-d', assertDistroName(request.distro), '--exec', '/bin/sh', '-c', PROBE_MANAGED_SCRIPT, String(request.pid)];
 }
 
-export function buildControlManagedArgs(request: {
-  distro: string;
-  scope: 'system' | 'user';
-  unit: string;
-  action: 'stop' | 'start';
-}): string[] {
-  if (request.scope !== 'system' && request.scope !== 'user') throw new ArgumentError('invalid-scope');
-  if (request.action !== 'stop' && request.action !== 'start') throw new ArgumentError('invalid-action');
-  return [
-    '-d',
-    assertDistroName(request.distro),
-    '--exec',
-    '/bin/sh',
-    '-c',
-    CONTROL_MANAGED_SCRIPT,
-    request.scope,
-    assertUnitName(request.unit),
-    request.action,
-  ];
-}
-
-/** Parse the probe report; unrecognised output means "no manager". */
 /**
  * Reads a single cgroup line and says which manager owns the process.
  *
@@ -127,12 +70,12 @@ export function classifyCgroup(text: string): { scope: 'system' | 'user' | 'none
   else if (path.startsWith('/user.slice/')) scope = 'user';
   const segments = path.split('/').filter((segment) => segment.length > 0);
   const candidate = segments.length === 0 ? null : (segments[segments.length - 1] ?? null);
-  const unit = candidate !== null && UNIT_PATTERN.test(candidate) && candidate.endsWith('.service') ? candidate : null;
+  const unit = candidate !== null && isValidUnitName(candidate) ? candidate : null;
   return { scope, unit: scope === 'none' ? null : unit };
 }
 
 export function parseManagedReport(text: string): ManagedBackend {
-  const fallback: ManagedBackend = { scope: 'none', unit: null, canControl: false, user: 'user' };
+  const fallback: ManagedBackend = { scope: 'none', unit: null, user: 'user' };
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line.startsWith(MANAGED_MARKER)) continue;
@@ -147,89 +90,12 @@ export function parseManagedReport(text: string): ManagedBackend {
     const user = fields.get('user');
     const reportedUnit = fields.get('unit');
     if (user === undefined || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(user)) return fallback;
-    const { scope } = classifyCgroup(`0::${fields.get('path') ?? ''}`);
-    if (scope === 'none') return { scope: 'none', unit: null, canControl: false, user };
+    const { scope, unit: fromPath } = classifyCgroup(`0::${fields.get('path') ?? ''}`);
+    if (scope === 'none' || fromPath === null) return { scope: 'none', unit: null, user };
     // The unit is taken from the path the shell reported, not from `unit=`, so a
     // backend cannot hand the caller a name that does not belong to that path.
-    const fromPath = classifyCgroup(`0::${fields.get('path') ?? ''}`).unit;
-    if (fromPath === null) return { scope: 'none', unit: null, canControl: false, user };
-    if (reportedUnit !== fromPath) return { scope: 'none', unit: null, canControl: false, user };
-    const canControl = scope === 'system' ? fields.get('can_sys') === '1' : fields.get('can_user') === '1';
-    return { scope, unit: fromPath, canControl, user };
+    if (reportedUnit !== fromPath) return { scope: 'none', unit: null, user };
+    return { scope, unit: fromPath, user };
   }
   return fallback;
-}
-
-/** The one narrow rule the app needs for a system unit; shown to the owner. */
-export function sudoersLines(request: { user: string; unit: string }): string[] {
-  const user = /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(request.user) ? request.user : '<your WSL user>';
-  const unit = assertUnitName(request.unit);
-  return [
-    `${user} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}, /usr/bin/systemctl start ${unit}`,
-  ];
-}
-
-/**
- * Installs the one sudo rule that lets the app stop and start a system unit.
- *
- * The password is asked once, inside the app, and only travels over the stdin
- * pipe of the WSL command: never in an argument list (every process on the
- * machine can read those), never in a log line, never written to disk. `sudo -S`
- * reads the first line; the root script then writes the drop-in, checks it with
- * `visudo -c` and removes it again when the syntax is rejected, so a mistake can
- * never leave a broken sudoers file behind.
- */
-export const INSTALL_RULE_SCRIPT = [
-  'set -u',
-  'IFS= read -r dsh_pass || { echo "rule: no password on stdin" >&2; exit 64; }',
-  'if [ -z "$dsh_pass" ]; then echo "rule: empty password" >&2; exit 64; fi',
-  // $0 carries the already validated root script; the password stays on stdin.
-  'printf "%s\\n" "$dsh_pass" | sudo -S -p "" /bin/sh -c "$0"',
-  'rc=$?',
-  'dsh_pass=""',
-  'exit "$rc"',
-].join('\n');
-
-/** The root half: writes the drop-in, validates it, and reports one marker line. */
-export function buildRootRuleScript(request: { user: string; unit: string }): string {
-  const user = assertUserName(request.user);
-  const unit = assertUnitName(request.unit);
-  const rule = `${user} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}, /usr/bin/systemctl start ${unit}`;
-  return [
-    'set -eu',
-    `printf '%s\\n' '${rule}' > /etc/sudoers.d/dsh-update`,
-    'chmod 0440 /etc/sudoers.d/dsh-update',
-    'if ! { visudo -c || /usr/sbin/visudo -c; } >/dev/null 2>&1; then',
-    '  rm -f /etc/sudoers.d/dsh-update',
-    '  echo "rule: the sudoers syntax check failed, the file was removed" >&2',
-    '  exit 2',
-    'fi',
-    `printf '%s\\n' "${MANAGED_MARKER} ok=1 unit=${unit}"`,
-    'exit 0',
-  ].join('\n');
-}
-
-export function assertUserName(user: string): string {
-  if (typeof user !== 'string' || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(user)) {
-    throw new ArgumentError('invalid-user-name');
-  }
-  return user;
-}
-
-export function buildInstallRuleArgs(request: { distro: string; user: string; unit: string }): string[] {
-  const root = buildRootRuleScript({ user: request.user, unit: request.unit });
-  return ['-d', assertDistroName(request.distro), '--exec', '/bin/sh', '-c', INSTALL_RULE_SCRIPT, root];
-}
-
-export function parseInstallRuleReport(text: string): { ok: boolean; message: string | null } {
-  for (const rawLine of text.split(/\r?\n/)) {
-    if (rawLine.trim().startsWith(`${MANAGED_MARKER} ok=1`)) return { ok: true, message: null };
-  }
-  const detail = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .join(' ')
-    .slice(0, 300);
-  return { ok: false, message: detail === '' ? null : detail };
 }

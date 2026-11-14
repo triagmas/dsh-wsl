@@ -1,23 +1,17 @@
 /** Real `wsl.exe` gateway used by the Electron main process. */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import type {
   WslGateway,
   ServerHandle,
   StartServerRequest,
   ExitInfo,
-  UpdateRunResult,
-  SharedUpdateRunRequest,
-  SharedRollbackRequest,
   InspectSharedRequest,
-  PrepareBackupRequest,
 } from '../core/supervisor.js';
 import { parseSharedDshReport } from '../core/dsh-locate.js';
 import { ShellError } from '../core/supervisor.js';
 import type { Logger } from '../core/logger.js';
 import type { ProcessProbe } from './output.js';
 import { parseDshVersion } from '../core/versions.js';
-import { backupFailureDetail } from '../core/update.js';
 import { describeError } from '../core/diagnostics.js';
 import {
   decodeWslOutput,
@@ -43,29 +37,8 @@ import {
   buildSignalArgs,
   buildStartServerArgs,
 } from './args.js';
-import {
-  buildCleanSnapshotArgs,
-  buildPruneSnapshotsArgs,
-  buildInspectSharedArgs,
-  buildNpmViewArgs,
-  buildPrepareBackupArgs,
-  buildRollbackSharedArgs,
-  buildUpdateSharedArgs,
-  NPM_MARKER,
-  parseBackupReport,
-  parseCleanSnapshotReport,
-  parsePruneReport,
-  parseNpmMarker,
-  type CleanSnapshotReport,
-} from './update-args.js';
-import {
-  buildControlManagedArgs,
-  buildInstallRuleArgs,
-  buildProbeManagedArgs,
-  parseInstallRuleReport,
-  parseManagedReport,
-  type ManagedBackend,
-} from './managed.js';
+import { buildInspectArgs } from './inspect.js';
+import { buildProbeManagedArgs, parseManagedReport, type ManagedBackend } from './managed.js';
 
 export interface CommandResult {
   code: number | null;
@@ -78,95 +51,35 @@ export interface WslGatewayOptions {
   wslExe?: string;
   spawnImpl?: typeof spawn;
   /**
-   * Overrides for the two snapshot-stage budgets, used by tests only.
-   *
-   * The defaults are the measured budgets below; a test that must observe the
-   * timeout path cannot wait minutes for it.
+   * How long a killed WSL command gets to report its own exit; tests lower it so
+   * the timeout path does not wait the production grace period.
    */
-  timeouts?: { backupMs?: number; cleanMs?: number; pruneMs?: number; terminationGraceMs?: number };
-  /** Mount table the cleanup consults instead of `/proc/self/mountinfo` (tests). */
-  mountInfo?: string;
+  timeouts?: { terminationGraceMs?: number };
 }
 
-/**
- * Budget for one verified recovery snapshot (issue #31).
- *
- * Measured on the owner's host against the 838 MB / 61 833-file DSH package:
- * `cp -a` 3.7–4.0 s warm and 90 s with a cold page cache under load; the content
- * manifest 1.25 s per pass after the batching fix (134 s before it); the closing
- * verification one more manifest pass. Worst observed end-to-end is therefore
- * ~95 s with a cold cache, and a typical run is under 10 s. 300 s is three times
- * the worst measurement, so a slow disk does not fail a healthy snapshot, while
- * the phase markers written by the script still identify whatever was running if
- * the budget is ever exhausted.
- */
-const BACKUP_TIMEOUT_MS = 300_000;
-
-/**
- * Budget for removing an interrupted snapshot.
- *
- * Measured: removing an 844 MB / 61 833-file snapshot tree took 0.97 s. 60 s is
- * a sixty-fold margin and stays well below the backup budget, so a stuck removal
- * can never dominate the update.
- */
-const CLEAN_TIMEOUT_MS = 60_000;
-/**
- * Budget for pruning old recovery snapshots.
- *
- * Each snapshot is a full package copy (about 1.3 GB on the owner's host), so a
- * recursive delete of several of them is I/O bound; two minutes is ample and a
- * timeout only leaves the snapshots for the next run.
- */
-const PRUNE_TIMEOUT_MS = 120_000;
-/** Budget for reading a pid's cgroup and for `systemctl stop|start` of one unit. */
+/** Budget for reading the cgroup of the backend the app is attached to. */
 const MANAGED_TIMEOUT_MS = 30_000;
 
 /**
- * How long to wait for a killed command to report its own exit (review R02).
+ * How long to wait for a killed WSL command to report its own exit.
  *
- * A timeout is not proof that the Linux side is gone. `wsl.exe` is killed and then
- * awaited until it reports `close`; only then does the app treat the attempt as
- * finished and consider removing its temporary snapshot. If the exit never
- * arrives, the tree is kept and the run fails closed instead of deleting a
- * directory a surviving writer might still fill.
+ * A timeout is not proof that the Linux side is gone, so the app keeps waiting
+ * for `close` instead of assuming the process stopped.
  */
 const TERMINATION_GRACE_MS = 15_000;
-
-/**
- * Reasons a snapshot carried no exit status of its own.
- *
- * `terminated` is the evidence the cleanup path depends on: `true` only when the
- * owned process reported its exit after the kill.
- */
-export class WslTimeoutError extends ShellError {
-  constructor(
-    message: string,
-    hint: string,
-    readonly terminated: boolean,
-  ) {
-    super('unexpected', message, hint);
-    this.name = 'WslTimeoutError';
-  }
-}
 
 export function createWslGateway(options: WslGatewayOptions): WslGateway {
   const wslExe = options.wslExe ?? WSL_EXE;
   const spawnImpl = options.spawnImpl ?? spawn;
-  const backupTimeoutMs = options.timeouts?.backupMs ?? BACKUP_TIMEOUT_MS;
-  const pruneTimeoutMs = options.timeouts?.pruneMs ?? PRUNE_TIMEOUT_MS;
-  const cleanTimeoutMs = options.timeouts?.cleanMs ?? CLEAN_TIMEOUT_MS;
   const terminationGraceMs = options.timeouts?.terminationGraceMs ?? TERMINATION_GRACE_MS;
 
-  const run = (args: string[], timeoutMs: number, input?: string): Promise<CommandResult> =>
+  const run = (args: string[], timeoutMs: number): Promise<CommandResult> =>
     new Promise((resolve, reject) => {
       let child: ChildProcessWithoutNullStreams;
       try {
-        // stdin is piped only when a caller has something to write (a password
-        // never belongs in argv, where every process on the machine can read it);
-        // stdout/stderr are always piped.
         child = spawnImpl(wslExe, args, {
           windowsHide: true,
-          stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+          stdio: ['ignore', 'pipe', 'pipe'],
         }) as unknown as ChildProcessWithoutNullStreams;
       } catch (error) {
         reject(error);
@@ -191,21 +104,15 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
           if (settled) return;
           settled = true;
           reject(
-            new WslTimeoutError(
+            new ShellError(
+              'unexpected',
               'A WSL command timed out and did not confirm its exit.',
               'The distribution may be unresponsive. The process was not confirmed to have stopped.',
-              false,
             ),
           );
         }, terminationGraceMs);
       }, timeoutMs);
 
-      if (input !== undefined) {
-        // The child may exit before reading everything; a broken pipe here is not
-        // an error of its own, the exit code tells the story.
-        child.stdin.on('error', () => undefined);
-        child.stdin.end(input);
-      }
       child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
       child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
       child.once('error', (error: NodeJS.ErrnoException) => {
@@ -232,11 +139,7 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         if (graceTimer !== undefined) clearTimeout(graceTimer);
         if (timedOut) {
           reject(
-            new WslTimeoutError(
-              'A WSL command timed out.',
-              'The distribution may be unresponsive.',
-              true,
-            ),
+            new ShellError('unexpected', 'A WSL command timed out.', 'The distribution may be unresponsive.'),
           );
           return;
         }
@@ -248,159 +151,12 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       });
     });
 
-  /**
-   * Run one long updater step, streaming every line to the modal window.
-   *
-   * The child gets no TTY and its output is treated as data: escapes and secrets
-   * are removed by the terminal buffer, while the last lines are kept here so a
-   * failure can explain itself.
-   */
-  const spawnStreaming = (
-    argv: string[],
-    onLine: (line: string) => void,
-    label: string,
-  ): Promise<UpdateRunResult> =>
-    new Promise((resolve) => {
-      let child: ChildProcessWithoutNullStreams;
-      try {
-        child = spawnImpl(wslExe, argv, {
-          windowsHide: true,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: { ...process.env, WSL_UTF8: '1' },
-        }) as unknown as ChildProcessWithoutNullStreams;
-      } catch (error) {
-        options.log.error(`${label} failed to spawn: ${error instanceof Error ? error.message : 'unknown'}`);
-        resolve({ code: null, tail: `${label} could not be started.` });
-        return;
-      }
-      const stdoutBuffer = new LineBuffer();
-      const stderrBuffer = new LineBuffer();
-      const tail: string[] = [];
-      const emit = (line: string): void => {
-        const clean = stripAnsi(line);
-        if (clean.trim() === '') return;
-        tail.push(clean);
-        if (tail.length > 20) tail.shift();
-        onLine(clean);
-      };
-      child.stdout.setEncoding('utf8');
-      child.stderr.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => {
-        for (const line of stdoutBuffer.push(chunk)) emit(line);
-      });
-      child.stderr.on('data', (chunk: string) => {
-        for (const line of stderrBuffer.push(chunk)) emit(line);
-      });
-      child.once('error', (error: NodeJS.ErrnoException) => {
-        options.log.error(`${label} error: ${error.code ?? error.message}`);
-        resolve({ code: null, tail: tail.slice(-2).join(' ') || `${label} failed to start.` });
-      });
-      child.once('close', (code) => {
-        for (const line of stdoutBuffer.flush()) emit(line);
-        for (const line of stderrBuffer.flush()) emit(line);
-        resolve({ code, tail: tail.slice(-2).join(' ') });
-      });
-    });
-
   const ensureSuccess = (result: CommandResult, message: string): CommandResult => {
     if (result.code !== 0) {
       const detail = (result.stderr || result.stdout).trim().split('\n').slice(-2).join(' ');
       throw new ShellError('unexpected', message, detail === '' ? null : detail);
     }
     return result;
-  };
-
-  /**
-   * Finish the work of a killed snapshot attempt (issue #31).
-   *
-   * `wsl.exe` killed at the timeout takes its whole Linux subtree with it, so no
-   * writer survives; the script can therefore no longer clean up after itself.
-   * The cleanup is transaction-scoped and refuses anything it does not recognize,
-   * and it reprints the recorded phase lines so the failure can name the phase.
-   */
-  const cleanInterruptedSnapshot = async (
-    request: PrepareBackupRequest,
-    lease: string,
-  ): Promise<CleanSnapshotReport | null> => {
-    try {
-      const result = await run(
-        buildCleanSnapshotArgs({
-          distro: request.distro,
-          appRoot: request.appRoot,
-          transaction: request.transaction,
-          lease,
-          mountInfo: options.mountInfo,
-        }),
-        cleanTimeoutMs,
-      );
-      const report = parseCleanSnapshotReport(`${result.stdout}\n${result.stderr}`);
-      if (report === null) {
-        options.log.warn(
-          `the leftovers of the interrupted snapshot ${request.transaction} could not be cleaned up (code=${result.code ?? 'null'})`,
-        );
-        return null;
-      }
-      if (report.phases.length > 0) {
-        const first = report.phases[0]?.at ?? 0;
-        const trail = report.phases
-          .map((entry) => `${entry.phase}@${Math.max(0, entry.at - first)}ms`)
-          .join(' -> ');
-        options.log.info(`interrupted snapshot phases (${request.transaction}): ${trail}`);
-      } else {
-        options.log.info(`the interrupted snapshot ${request.transaction} recorded no phase markers`);
-      }
-      if (report.removed) {
-        options.log.info(`removed the interrupted snapshot directory for ${request.transaction}`);
-      }
-      return report;
-    } catch (error) {
-      // A failing cleanup never masks the original failure; it is reported only.
-      options.log.warn(
-        `the leftovers of the interrupted snapshot ${request.transaction} could not be removed: ${(error as Error).message}`,
-      );
-      return null;
-    }
-  };
-
-  const phaseNote = (report: CleanSnapshotReport | null): string | null => {
-    const phase = report?.phases.at(-1)?.phase;
-    return phase === undefined ? null : `stopped during: ${phase}`;
-  };
-
-  const withPhaseNote = (detail: string, report: CleanSnapshotReport | null): string => {
-    const note = phaseNote(report);
-    if (note === null) return detail;
-    return detail === '' ? `the backup step ${note}` : `${detail} (${note})`;
-  };
-
-  /**
-   * Re-throw a killed command with the phase appended, so the update window and
-   * `app.log` say where the budget was spent instead of only "it timed out".
-   */
-  /** Say plainly that the leftovers were kept, without hiding the original error. */
-  const keptLeftoversNote = (error: unknown, what: string): unknown => {
-    if (!(error instanceof Error)) return error;
-    const message = `${error.message} (${what} for a manual check)`;
-    if (error instanceof WslTimeoutError) {
-      return new WslTimeoutError(message, error.hint ?? '', error.terminated);
-    }
-    if (error instanceof ShellError) return new ShellError(error.code, message, error.hint);
-    const wrapped = new Error(message);
-    wrapped.name = error.name;
-    return wrapped;
-  };
-
-  const withPhaseNoteOnError = (error: unknown, report: CleanSnapshotReport | null): unknown => {
-    const note = phaseNote(report);
-    if (note === null || !(error instanceof Error)) return error;
-    const message = `${error.message} (${note})`;
-    if (error instanceof WslTimeoutError) {
-      return new WslTimeoutError(message, error.hint ?? '', error.terminated);
-    }
-    if (error instanceof ShellError) return new ShellError(error.code, message, error.hint);
-    const wrapped = new Error(message);
-    wrapped.name = error.name;
-    return wrapped;
   };
 
   return {
@@ -442,21 +198,6 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         );
       }
       options.log.info(`isolated environment ready: ${result.stdout.trim().split('\n').pop() ?? root}`);
-    },
-
-    async resolveRecoveryNode(distro) {
-      // Recovery runs before Supervisor.bringUp(), so resolvedRuntime() is null.
-      // Reuse the read-only runtime probe but do not require a working DSH:
-      // npm may have removed its shim before the interrupted update crashed.
-      const result = await run(buildResolveRuntimeArgs(distro, null, null), 30_000);
-      if (result.code !== 0) {
-        throw new ShellError('unexpected', 'The Node.js runtime could not be resolved for update recovery.');
-      }
-      const nodePath = parseRuntimeProbe(result.stdout).nodePath;
-      if (nodePath === null) {
-        options.log.warn('update recovery: Node.js runtime not found; keeping the journal');
-      }
-      return nodePath;
     },
 
     async resolveRuntime(distro, override, isolationRoot) {
@@ -589,45 +330,6 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       };
     },
 
-    async checkPublishedVersion(request) {
-      const result = await run(
-        buildNpmViewArgs({
-          distro: request.distro,
-          appRoot: request.appRoot,
-          version: request.version,
-          nodePath: request.nodePath,
-        }),
-        120_000,
-      );
-      const lines = `${result.stdout}\n${result.stderr}`.split('\n');
-      const npmPath = lines.map((line) => parseNpmMarker(line)).find((value) => value !== null) ?? null;
-      const reported = parseDshVersion(lines.filter((line) => !line.includes(NPM_MARKER)).join('\n'));
-      if (npmPath === null) {
-        return {
-          found: false,
-          npmPath: null,
-          reported: null,
-          message: 'npm was not found in this distribution, so nothing can be verified or installed.',
-        };
-      }
-      if (result.code !== 0 || reported === null) {
-        const detail = (result.stderr || result.stdout)
-          .split('\n')
-          .filter((line) => !line.includes(NPM_MARKER))
-          .map((line) => line.trim())
-          .filter((line) => line !== '')
-          .slice(-1)
-          .join(' ');
-        return {
-          found: false,
-          npmPath,
-          reported,
-          message: detail === '' ? 'npm did not report this version.' : detail,
-        };
-      }
-      return { found: reported === request.version, npmPath, reported, message: null };
-    },
-
     async probeManagedBackend(request: { distro: string; pid: number }): Promise<ManagedBackend> {
       const result = await run(buildProbeManagedArgs(request), MANAGED_TIMEOUT_MS);
       const managed = parseManagedReport(`${result.stdout}\n${result.stderr}`);
@@ -640,71 +342,14 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       if (managed.scope === 'none') {
         options.log.info('the attached backend was not started by a systemd unit');
       } else {
-        options.log.info(
-          `the attached backend belongs to ${managed.unit} (${managed.scope} scope, ` +
-            `control=${managed.canControl ? 'allowed' : 'not allowed'})`,
-        );
+        options.log.info(`the attached backend belongs to ${managed.unit} (${managed.scope} scope)`);
       }
       return managed;
     },
 
-    async controlManagedBackend(request: {
-      distro: string;
-      scope: 'system' | 'user';
-      unit: string;
-      action: 'stop' | 'start';
-    }): Promise<{ ok: boolean; message: string | null }> {
-      const result = await run(buildControlManagedArgs(request), MANAGED_TIMEOUT_MS);
-      const output = `${result.stdout}\n${result.stderr}`;
-      if (result.code === 0 && output.includes(`${request.action}`) && output.includes('ok=1')) {
-        options.log.info(`${request.action}ed ${request.unit} (${request.scope}) for the update`);
-        return { ok: true, message: null };
-      }
-      const detail = output
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith('managed:'))
-        .join(' ')
-        .slice(0, 300);
-      options.log.warn(
-        `could not ${request.action} ${request.unit} (${request.scope}, code=${result.code ?? 'null'})${detail === '' ? '' : `: ${detail}`}`,
-      );
-      return { ok: false, message: detail === '' ? null : detail };
-    },
-
-    async installManagedRule(request: {
-      distro: string;
-      user: string;
-      unit: string;
-      password: string;
-    }): Promise<{ ok: boolean; message: string | null }> {
-      if (typeof request.password !== 'string' || request.password.length === 0) {
-        return { ok: false, message: 'no password was given' };
-      }
-      // Exactly one newline-terminated line: `sudo -S` reads a single line.
-      const input = `${request.password.replace(/\r?\n$/, '')}\n`;
-      let result: CommandResult;
-      try {
-        result = await run(buildInstallRuleArgs(request), MANAGED_TIMEOUT_MS, input);
-      } finally {
-        // Nothing to wipe in the string, but never keep it reachable from here.
-        request.password = '';
-      }
-      const report = parseInstallRuleReport(`${result.stdout}\n${result.stderr}`);
-      if (result.code === 0 && report.ok) {
-        options.log.info(`installed the sudo rule for ${request.unit}; further updates need no password`);
-        return { ok: true, message: null };
-      }
-      options.log.warn(`the sudo rule for ${request.unit} was not installed (code=${result.code ?? 'null'})`);
-      return {
-        ok: false,
-        message: report.message ?? 'the password was rejected or sudo refused the rule',
-      };
-    },
-
     async inspectSharedDsh(request: InspectSharedRequest) {
       const result = await run(
-        buildInspectSharedArgs({
+        buildInspectArgs({
           distro: request.distro,
           appRoot: request.appRoot,
           dshPath: request.dshPath,
@@ -725,144 +370,6 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         );
       }
       return report;
-    },
-
-    async prepareSharedBackup(request: PrepareBackupRequest) {
-      // A fresh lease per attempt: the only proof that a temporary snapshot tree
-      // belongs to this run and may therefore be removed (review R02).
-      const lease = randomBytes(16).toString('hex');
-      const argv = buildPrepareBackupArgs({
-        distro: request.distro,
-        appRoot: request.appRoot,
-        prefix: request.prefix,
-        packageDir: request.packageDir,
-        dshPath: request.dshPath,
-        realPath: request.realPath,
-        installedVersion: request.installedVersion,
-        transaction: request.transaction,
-        nodePath: request.nodePath,
-        lease,
-      });
-      let result: CommandResult;
-      try {
-        result = await run(argv, backupTimeoutMs);
-      } catch (error) {
-        // The command was killed. Cleanup may only start once the owned process has
-        // confirmed its exit; otherwise the tree is kept and the run fails closed.
-        const terminated = error instanceof WslTimeoutError && error.terminated;
-        options.log.error(
-          `the recovery snapshot for ${request.installedVersion} could not be created: ${
-            error instanceof Error ? error.message : 'unknown error'
-          }`,
-        );
-        if (!terminated) {
-          options.log.warn(
-            `the partial snapshot of ${request.transaction} was kept for a manual check: the snapshot process did not confirm its exit`,
-          );
-          throw keptLeftoversNote(error, 'the partial snapshot was kept');
-        }
-        const cleaned = await cleanInterruptedSnapshot(request, lease);
-        throw withPhaseNoteOnError(error, cleaned);
-      }
-      const report = parseBackupReport(`${result.stdout}\n${result.stderr}`);
-      if (result.code !== 0 || report === null) {
-        // Subprocess output never leaves the gateway unsanitized: the helper
-        // strips escapes and control characters, redacts credentials and bounds
-        // the line, exactly like a terminal line.
-        const detail = backupFailureDetail(result.stdout, result.stderr);
-        options.log.error(
-          `the recovery snapshot for ${request.installedVersion} could not be created (code=${result.code ?? 'null'}): ` +
-            `${detail === '' ? 'no output' : detail}`,
-        );
-        // Only a run that could have created the tree may clean it up. A refusal of
-        // a pre-existing path (79) or of the arguments (64) never wrote anything,
-        // and every other status is additionally guarded by the lease inside the
-        // cleanup script, so an unowned directory can never be deleted.
-        if (result.code === 64 || result.code === 79) {
-          options.log.info(
-            `the snapshot step refused the transaction path (code=${result.code}); nothing was deleted`,
-          );
-          return { ok: false, code: result.code, detail };
-        }
-        // The script may have been killed mid-way, so finish its work for it and
-        // report which phase was still running when the budget expired.
-        const cleaned = await cleanInterruptedSnapshot(request, lease);
-        return { ok: false, code: result.code, detail: withPhaseNote(detail, cleaned) };
-      }
-      options.log.info(`recovery snapshot ready at ${report.path} (${report.files} files, version=${report.version})`);
-      return { ok: true, snapshot: { path: report.path, files: report.files } };
-    },
-
-    async pruneUpdateSnapshots(request: {
-      distro: string;
-      appRoot: string;
-      keep: number;
-      transaction: string;
-    }) {
-      let result: CommandResult;
-      try {
-        result = await run(buildPruneSnapshotsArgs(request), pruneTimeoutMs);
-      } catch (error) {
-        options.log.warn(
-          `old recovery snapshots were left in place: ${error instanceof Error ? error.message : 'unknown error'}`,
-        );
-        return { removed: [] as string[] };
-      }
-      const removed = parsePruneReport(`${result.stdout}\n${result.stderr}`);
-      if (result.code !== 0) {
-        options.log.warn(
-          `old recovery snapshots could not all be removed (code=${result.code ?? 'null'}); the update continues`,
-        );
-      } else if (removed.length > 0) {
-        options.log.info(`removed ${removed.length} old recovery snapshot(s)`);
-      }
-      return { removed };
-    },
-
-    async updateSharedDsh(request: SharedUpdateRunRequest, onLine) {
-      const argv = buildUpdateSharedArgs(
-        {
-          distro: request.distro,
-          appRoot: request.appRoot,
-          prefix: request.prefix,
-          packageDir: request.packageDir,
-          dshPath: request.dshPath,
-          realPath: request.realPath,
-          npmPath: request.npmPath,
-          nodePath: request.nodePath,
-          transaction: request.transaction,
-          version: request.version,
-          installedVersion: request.installedVersion,
-          ownPid: request.ownPid,
-          snapshotDir: request.snapshotDir,
-        },
-        request.transaction,
-      );
-      options.log.info(
-        `updating the shared DSH installation ${request.installedVersion} -> ${request.version} ` +
-          `(prefix=${request.prefix}, tx=${request.transaction})`,
-      );
-      return await spawnStreaming(argv, onLine, 'the update process');
-    },
-
-    async rollbackSharedDsh(request: SharedRollbackRequest, version, transaction, onLine) {
-      const argv = buildRollbackSharedArgs(
-        {
-          distro: request.distro,
-          appRoot: request.appRoot,
-          prefix: request.prefix,
-          packageDir: request.packageDir,
-          dshPath: request.dshPath,
-          realPath: request.realPath,
-          npmPath: request.npmPath,
-          nodePath: request.nodePath,
-          snapshotDir: request.snapshotDir,
-        },
-        version,
-        transaction,
-      );
-      options.log.warn(`reinstalling the previous DeepSeek Harness version ${version} (tx=${transaction})`);
-      return await spawnStreaming(argv, onLine, 'the rollback process');
     },
 
     async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {

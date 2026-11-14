@@ -1,5 +1,5 @@
 /*
- * Update windows (issue #12): confirmation and terminal output.
+ * Manual update window (issue #12 follow-up).
  *
  * Same palette as the footer/settings surfaces so the modal never looks like a
  * separate product, and no remote resources of any kind.
@@ -13,7 +13,6 @@
   --accent: #38bdf8;
   --ok: #22c55e;
   --warn: #f59e0b;
-  --error: #ef4444;
   --radius: 8px;
 }
 
@@ -42,6 +41,13 @@ main {
 h1 {
   margin: 0;
   font-size: 16px;
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+h2 {
+  margin: 0;
+  font-size: 13px;
   font-weight: 600;
   color: var(--fg-strong);
 }
@@ -84,89 +90,86 @@ h1 {
   font-size: 12px;
 }
 
-.notes {
-  margin: 0;
-  padding-left: 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-}
-
 code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   color: var(--fg-strong);
 }
 
-.warn {
+.status {
+  margin: 0;
+  color: var(--fg-strong);
+}
+
+.status[data-state="installed"] {
+  color: var(--ok);
+}
+
+.status[data-state="unknown"] {
+  color: var(--warn);
+}
+
+.detail {
   margin: 0;
   padding: 10px 12px;
   border-radius: var(--radius);
   border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
-  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
   color: #fde68a;
 }
 
-.hint {
-  margin: 0;
-  padding: 10px 12px;
-  border-radius: var(--radius);
-  border: 1px dashed color-mix(in srgb, var(--fg) 30%, transparent);
-  color: var(--fg);
-}
-
-.hint code,
-.warn code {
-  color: inherit;
-}
-
-.rule {
+.commands {
   display: grid;
-  gap: 10px;
-  padding: 12px;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
   border-radius: var(--radius);
-  border: 1px solid color-mix(in srgb, var(--accent, #7dd3fc) 45%, transparent);
-  background: color-mix(in srgb, var(--accent, #7dd3fc) 10%, transparent);
+  background: var(--panel);
 }
 
-.rule-lead,
-.rule-line,
-.rule-error {
+.commands-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.command-list {
   margin: 0;
-}
-
-.rule-line code {
-  display: block;
-  overflow-wrap: anywhere;
-  color: var(--fg-strong);
-}
-
-.rule-field {
+  padding: 0;
+  list-style: none;
   display: grid;
   gap: 6px;
 }
 
-.rule-field input {
-  font: inherit;
-  padding: 7px 10px;
-  border-radius: var(--radius);
+.command {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  background: #070a10;
   border: 1px solid var(--border);
-  background: transparent;
-  color: var(--fg-strong);
+  border-radius: var(--radius);
 }
 
-.rule-field input:focus {
-  outline: 2px solid color-mix(in srgb, var(--accent, #7dd3fc) 60%, transparent);
-  outline-offset: 1px;
+.command code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
-.rule-error {
-  color: #fca5a5;
+.hint {
+  margin: 0;
+  color: var(--fg);
+  font-size: 12px;
 }
 
-.rule-actions {
-  margin-top: 0;
+.copied {
+  min-height: 18px;
+  margin: 0;
+  color: var(--ok);
+  font-size: 12px;
 }
 
 .actions {
@@ -195,6 +198,11 @@ button.primary {
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
+button.small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 button:disabled {
   opacity: 0.45;
   cursor: default;
@@ -203,72 +211,4 @@ button:disabled {
 button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-}
-
-/* --- terminal modal ------------------------------------------------------ */
-.progress-page main {
-  gap: 10px;
-}
-
-.status {
-  margin: 0;
-  color: var(--fg-strong);
-}
-
-.status[data-phase="done"] {
-  color: var(--ok);
-}
-
-.status[data-phase="failed"] {
-  color: var(--error);
-}
-
-.terminal {
-  flex: 1;
-  margin: 0;
-  padding: 12px 14px;
-  min-height: 200px;
-  overflow: auto;
-  background: #070a10;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  color: #cbd5e1;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.45;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  user-select: text;
-}
-
-.detail {
-  margin: 0;
-  font-size: 12px;
-  color: var(--fg);
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .status[data-phase="checking"]::after,
-  .status[data-phase="installing"]::after,
-  .status[data-phase="verifying"]::after,
-  .status[data-phase="activating"]::after {
-    content: "";
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    margin-left: 8px;
-    border-radius: 50%;
-    background: var(--accent);
-    animation: pulse 1.1s ease-in-out infinite;
-  }
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 0.25;
-  }
-  50% {
-    opacity: 1;
-  }
 }

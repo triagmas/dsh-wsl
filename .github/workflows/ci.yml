@@ -163,18 +163,6 @@ jobs:
           "$setupHash  $setupName" | Out-File -FilePath release/SHA256SUMS.txt -Append -Encoding ascii
           Get-Content release/SHA256SUMS.txt
 
-      - name: Packaged relaunch check - portable (issue #12)
-        shell: pwsh
-        run: |
-          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-          $exe = Join-Path 'release' "DSH-WSL-$version-x64-Portable.exe"
-          if (-not (Test-Path $exe)) { throw 'portable EXE was not produced' }
-          $dir = Join-Path $env:RUNNER_TEMP 'relaunch-probe-portable'
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Write-Host "probing $exe"
-          Start-Process -FilePath $exe -ArgumentList "--relaunch-probe=$dir" -Wait
-          node scripts/check-relaunch.cjs $dir $exe 180 --mode=portable
-
       # Issue #14: the rename must not move the profile. A pre-existing
       # %APPDATA%\wsl-web-shell (config, logs) has to stay the live one for both
       # packages, and the new display name must not create a second profile.
@@ -263,18 +251,6 @@ jobs:
           if (Test-Path $renamed) { throw "the installed build created a second profile at $renamed" }
           if (-not (Test-Path (Join-Path $legacy 'logs\app.log'))) { throw 'the existing profile was replaced by the installed build' }
           'installed build keeps the legacy profile' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
-      - name: Packaged relaunch check - installed (issue #14)
-        shell: pwsh
-        run: |
-          $target = Join-Path $env:RUNNER_TEMP 'dsh-wsl-installed'
-          $app = Join-Path $target 'DSH WSL.exe'
-          $dir = Join-Path $env:RUNNER_TEMP 'relaunch-probe-installed'
-          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Write-Host "probing $app"
-          Start-Process -FilePath $app -ArgumentList "--relaunch-probe=$dir" -Wait
-          node scripts/check-relaunch.cjs $dir $app 180 --mode=installed
 
       - name: Setup EXE uninstall smoke
         shell: pwsh

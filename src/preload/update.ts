@@ -1,36 +1,17 @@
-/** Minimal, explicit bridge for the update windows (issue #12). */
+/** Minimal, explicit bridge for the manual update window (issue #12). */
 import { contextBridge, ipcRenderer } from 'electron';
-import type { UpdateProbe, UpdateStartResult } from '../shared/types.js';
-import type { UpdateState } from '../main/core/update.js';
+import type { UpdateProbe } from '../shared/types.js';
 
 const api = {
-  /** What the confirmation window shows: versions, distribution, runtime. */
+  /** Installed and published versions plus the commands the owner runs. */
   probe(): Promise<UpdateProbe> {
     return ipcRenderer.invoke('update:probe') as Promise<UpdateProbe>;
   },
-  /** Starts the accepted plan. Output arrives on `onState`. */
-  start(): Promise<UpdateStartResult> {
-    return ipcRenderer.invoke('update:start') as Promise<UpdateStartResult>;
+  /** Same read-only inspection again, after the owner ran a command. */
+  recheck(): Promise<UpdateProbe> {
+    return ipcRenderer.invoke('update:recheck') as Promise<UpdateProbe>;
   },
-  /** Current state, so a late window still renders the running update. */
-  state(): Promise<UpdateState> {
-    return ipcRenderer.invoke('update:state') as Promise<UpdateState>;
-  },
-  onState(listener: (state: UpdateState) => void): void {
-    ipcRenderer.on('update:state', (_event, state: UpdateState) => listener(state));
-  },
-  /**
-   * Installs the one narrow sudo rule with the password the owner typed. The
-   * password goes straight into an IPC argument, is used for a single `sudo -S`
-   * call in the main process, and is never stored or logged.
-   */
-  installRule(password: string): Promise<{ ok: boolean; message: string | null }> {
-    return ipcRenderer.invoke('update:install-rule', password) as Promise<{
-      ok: boolean;
-      message: string | null;
-    }>;
-  },
-  /** Closes the window that sent it (confirmation or finished progress). */
+  /** Closes the window that sent it. */
   close(): Promise<void> {
     return ipcRenderer.invoke('update:close') as Promise<void>;
   },
