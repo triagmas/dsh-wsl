@@ -293,6 +293,16 @@ export class Supervisor {
     return this.runtime;
   }
 
+  /**
+   * Pid of the backend this app started, for the manual update instructions.
+   *
+   * The update window says how to stop it, so it must name the real process: the
+   * app deliberately leaves that backend running when the owner quits.
+   */
+  ownedBackendPid(): number | null {
+    return this.owned ? this.serverPid : null;
+  }
+
   get state(): LifecycleState {
     return this.lifecycle.state;
   }

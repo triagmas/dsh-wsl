@@ -35,10 +35,16 @@ The plan is built by the pure `buildManualUpdatePlan()` in
 | the owner's systemd **system** unit runs the attached backend | `sudo systemctl stop <unit>`, `<manager> install -g @deepseek-ai/dsh@<version>`, `sudo systemctl start <unit>` |
 | a **user** unit runs it | `systemctl --user stop <unit>`, install, `systemctl --user start <unit>` |
 | the attached backend was started by hand | install only, plus "stop the backend by hand before running this command" |
-| the backend belongs to DSH WSL | install only, plus "Quit DSH WSL before running this command" |
+| the backend belongs to DSH WSL | `kill <pid>` then install — quitting the app deliberately leaves that backend running |
 | no backend is running | install only |
 | the manager is pnpm | `pnpm add -g @deepseek-ai/dsh@<version>` |
 | the manager, installed version or target is unknown | no command, only an explanation |
+| the published version could not be checked | no command: the cached target is not presented as current |
+
+`npm install -g` is bound to the inspected installation (`"<npmPath>" install -g --prefix "<prefix>"`)
+whenever both are known and safe to quote, because a bare command installs into
+whatever prefix the owner's own terminal resolves. When the prefix is not writable
+by the owner, the window says the install needs root.
 
 `npm install -g` and `pnpm add -g` are the only install forms. The target must be an
 exact version: ranges, tags and anything a shell could interpret are refused. A unit

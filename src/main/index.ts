@@ -272,7 +272,14 @@ async function bootstrap(): Promise<void> {
       }
     }
 
-    const plan = buildManualUpdatePlan({ installation, target, backend, unit });
+    const plan = buildManualUpdatePlan({
+      installation,
+      target,
+      targetError: versions.snapshot().error,
+      backend,
+      unit,
+      ownedPid: backend === 'owned' ? supervisor.ownedBackendPid() : null,
+    });
     return {
       installed: plan.installed,
       target,

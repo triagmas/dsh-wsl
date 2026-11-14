@@ -78,7 +78,7 @@ describe('manual update commands', () => {
     expect(plan.installed).toBe('0.2.1');
     expect(plan.commands).toEqual([
       'sudo systemctl stop dsh-web.service',
-      `npm install -g ${DSH_PACKAGE}@0.2.2`,
+      `"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`,
       'sudo systemctl start dsh-web.service',
     ]);
   });
@@ -92,7 +92,7 @@ describe('manual update commands', () => {
     });
     expect(plan.commands).toEqual([
       'systemctl --user stop dsh-web.service',
-      `npm install -g ${DSH_PACKAGE}@0.2.2`,
+      `"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`,
       'systemctl --user start dsh-web.service',
     ]);
   });
@@ -114,19 +114,61 @@ describe('manual update commands', () => {
       backend: 'attached',
       unit: null,
     });
-    expect(plan.commands).toEqual([`npm install -g ${DSH_PACKAGE}@0.2.2`]);
+    expect(plan.commands).toEqual([`"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`]);
     expect(plan.description).toContain('not started by systemd');
   });
 
-  it('never stops a backend the app started itself', () => {
+  it('names the pid of its own backend instead of telling the owner to quit', () => {
+    // Quit deliberately leaves that backend running, so "quit the app" would
+    // leave the installation in use while npm replaces the files it executes.
+    const plan = buildManualUpdatePlan({
+      installation: installation(),
+      target: '0.2.2',
+      backend: 'owned',
+      unit: null,
+      ownedPid: 194,
+    });
+    expect(plan.commands).toEqual(['kill 194', `"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`]);
+    expect(plan.description).toContain('194');
+    expect(plan.description).not.toContain('Quit');
+  });
+
+  it('shows no command when the published version could not be checked', () => {
+    // The cache keeps the last version after a failed lookup; presenting it as
+    // current would produce a command for a version that may not be the newest.
+    const plan = buildManualUpdatePlan({
+      installation: installation(),
+      target: '0.2.2',
+      targetError: 'upstream lookup timed out',
+      backend: 'attached',
+      unit: { scope: 'system', name: 'dsh-web.service' },
+    });
+    expect(plan.commands).toEqual([]);
+    expect(plan.state).toBe('unknown');
+    expect(plan.description).toContain('upstream lookup timed out');
+  });
+
+  it('says the install needs root when the prefix is not writable', () => {
+    const plan = buildManualUpdatePlan({
+      installation: installation({ writable: false }),
+      target: '0.2.2',
+      backend: 'attached',
+      unit: { scope: 'system', name: 'dsh-web.service' },
+    });
+    expect(plan.description).toContain('needs root');
+    // The command is not escalated: npm as root is the owner's decision, not ours.
+    expect(plan.commands.some((line) => line.startsWith('sudo') && line.includes('install'))).toBe(false);
+  });
+
+  it('never stops a backend the app started itself without a known pid', () => {
     const plan = buildManualUpdatePlan({
       installation: installation(),
       target: '0.2.2',
       backend: 'owned',
       unit: null,
     });
-    expect(plan.commands).toEqual([`npm install -g ${DSH_PACKAGE}@0.2.2`]);
-    expect(plan.description).toContain('Quit DSH WSL');
+    expect(plan.commands).toEqual([`"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`]);
+    expect(plan.description).toContain('still using the installation');
   });
 
   it('shows only the install line when no backend is running', () => {
@@ -136,7 +178,7 @@ describe('manual update commands', () => {
       backend: 'none',
       unit: null,
     });
-    expect(plan.commands).toEqual([`npm install -g ${DSH_PACKAGE}@0.2.2`]);
+    expect(plan.commands).toEqual([`"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`]);
     expect(plan.description).toContain('start the backend again');
   });
 
@@ -147,7 +189,7 @@ describe('manual update commands', () => {
       backend: 'attached',
       unit: { scope: 'system', name: '..;rm -rf' },
     });
-    expect(plan.commands).toEqual([`npm install -g ${DSH_PACKAGE}@0.2.2`]);
+    expect(plan.commands).toEqual([`"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" ${DSH_PACKAGE}@0.2.2`]);
     expect(plan.description).toContain('could not be identified reliably');
   });
 

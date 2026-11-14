@@ -9,7 +9,7 @@
  *
  * Pure module: no fs, no Electron, no process spawning.
  */
-import type { DshInstallation, InstallManager } from './dsh-locate.js';
+import type { DshInstallation } from './dsh-locate.js';
 
 /** The npm package the manual command installs. */
 export const DSH_PACKAGE = '@deepseek-ai/dsh';
@@ -40,6 +40,16 @@ export function isValidUnitName(value: unknown): value is string {
   return typeof value === 'string' && value.length <= 255 && value.endsWith('.service') && UNIT_PATTERN.test(value);
 }
 
+/** A path may be quoted into a command only with this charset. */
+const SAFE_PATH = /^\/[A-Za-z0-9_./@+-]+$/;
+
+function isSafePath(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 300 && SAFE_PATH.test(value);
+}
+
+/** A pid may appear in a command only as plain digits. */
+const SAFE_PID = /^[1-9][0-9]{0,6}$/;
+
 /** Which systemd unit serves the backend the app is attached to. */
 export interface ManualUpdateUnit {
   scope: 'system' | 'user';
@@ -54,9 +64,18 @@ export interface ManualUpdateInput {
   installation: DshInstallation | null;
   /** Exact published version, `null` while the lookup has not succeeded. */
   target: string | null;
+  /**
+   * Why the last published-version lookup failed, `null` when it succeeded.
+   *
+   * The cache keeps the last known version after a failed lookup, so without
+   * this a stale target would be presented as if it were current.
+   */
+  targetError?: string | null;
   backend: ManualUpdateBackend;
   /** Unit of an attached backend, `null` when it has none or is unknown. */
   unit: ManualUpdateUnit | null;
+  /** Pid of the backend this app started, `null` when unknown. */
+  ownedPid?: number | null;
 }
 
 export type ManualUpdateState = 'pending' | 'installed' | 'unknown';
@@ -71,10 +90,22 @@ export interface ManualUpdatePlan {
   description: string | null;
 }
 
-/** The one install command for the manager that owns the installation. */
-function installCommand(manager: InstallManager, version: string): string | null {
-  if (manager === 'npm') return `npm install -g ${DSH_PACKAGE}@${version}`;
-  if (manager === 'pnpm') return `pnpm add -g ${DSH_PACKAGE}@${version}`;
+/**
+ * The one install command for the manager that owns the installation.
+ *
+ * A bare `npm install -g` installs into whatever prefix the owner's terminal
+ * resolves, which is not necessarily the installation this window inspected (a
+ * user prefix, a version manager, a project-local npmrc). The inspected binary
+ * and prefix are therefore named explicitly whenever both are known and safe to
+ * quote; otherwise the plain form is used.
+ */
+function installCommand(installation: DshInstallation, version: string): string | null {
+  if (installation.manager === 'npm') {
+    const npm = isSafePath(installation.npmPath) ? `"${installation.npmPath}"` : 'npm';
+    const prefix = isSafePath(installation.prefix) ? ` --prefix "${installation.prefix}"` : '';
+    return `${npm} install -g${prefix} ${DSH_PACKAGE}@${version}`;
+  }
+  if (installation.manager === 'pnpm') return `pnpm add -g ${DSH_PACKAGE}@${version}`;
   return null;
 }
 
@@ -95,6 +126,12 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
   const installed = input.installation?.version ?? null;
   const target = input.target;
 
+  if (typeof input.targetError === 'string' && input.targetError !== '') {
+    return unknown(
+      installed,
+      `The latest published version could not be checked (${input.targetError}), so no command is shown. Check again in a moment.`,
+    );
+  }
   if (target === null) {
     return unknown(installed, 'The latest published DeepSeek Harness version is not known yet. Check again in a moment.');
   }
@@ -119,7 +156,7 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
     };
   }
 
-  const install = installCommand(input.installation.manager, target);
+  const install = installCommand(input.installation, target);
   if (install === null) {
     return unknown(
       installed,
@@ -128,12 +165,19 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
   }
 
   if (input.backend === 'owned') {
+    // Quit does not stop this backend: its lifetime follows the WSL distribution.
+    // Telling the owner to quit would leave the installation in use while npm
+    // replaces the files it executes.
+    const pid = typeof input.ownedPid === 'number' && SAFE_PID.test(String(input.ownedPid)) ? input.ownedPid : null;
+    const stop = pid === null ? [] : [`kill ${pid}`];
     return {
       installed,
       state: 'pending',
-      commands: [install],
+      commands: [...stop, install],
       description:
-        'Quit DSH WSL before running this command: the installation is in use by the backend this app started, and the app does not replace it while it runs.',
+        pid === null
+          ? 'The backend this app started is still using the installation. Stop it in a WSL terminal first, then run the command.'
+          : `The backend this app started (pid ${pid}) keeps running after you quit the app. The first command stops it; run both in a WSL terminal.`,
     };
   }
 
@@ -157,7 +201,9 @@ export function buildManualUpdatePlan(input: ManualUpdateInput): ManualUpdatePla
         install,
         `${prefix} start ${input.unit.name}`,
       ],
-      description: `These commands stop ${input.unit.name}, install the exact version, and start it again. Run them in a WSL terminal.`,
+      description:
+        `These commands stop ${input.unit.name}, install the exact version, and start it again. Run them in a WSL terminal.` +
+        (input.installation.writable ? '' : ' The global prefix is not writable by your user, so the install needs root.'),
     };
   }
 
