@@ -25,6 +25,22 @@ import type { SharedDshReport } from './dsh-locate.js';
  */
 const FALLBACK_PORT_WINDOW = 8;
 
+/**
+ * Is this Windows pid still running?
+ *
+ * Signal 0 performs the existence check without delivering anything. It is the
+ * only cheap liveness probe for a process the app created but does not reap.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but belongs to another user.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 /** Is `port` one of the fallback ports that belong to `base`? */
 function isFallbackPort(port: number, base: number): boolean {
   return Number.isInteger(port) && port > base && port <= base + FALLBACK_PORT_WINDOW && port <= 65535;
@@ -104,7 +120,7 @@ export interface WslGateway {
   /**
    * Keep the distribution alive while a backend the app does not own is serving.
    *
-   * Detached and left behind on quit on purpose: WSL2 powers a distribution off
+   * Left behind on quit on purpose: WSL2 powers a distribution off
    * about ten seconds after its last client exits, so a session owned by this
    * process would take the owner's backend down with the app. Returns the PID of
    * the session in use, or `null` when none could be kept.
@@ -159,6 +175,11 @@ export interface SupervisorDeps {
   discoveryGraceMs?: number;
   /** Poll interval used during that discovery window. */
   discoveryPollMs?: number;
+  /**
+   * Liveness of a keepalive session. Tests inject it; production checks the
+   * Windows pid the app created.
+   */
+  keepaliveAlive?(pid: number): boolean;
 }
 
 export type ShellErrorCode =
@@ -224,6 +245,16 @@ export class Supervisor {
   private attached = false;
   /** Pid of the attached backend: needed to find the unit that owns it. */
   private attachedPid: number | null = null;
+
+  /**
+   * Windows pid of the session holding the distribution open while attached.
+   *
+   * A linux-level check would need another `wsl.exe` run on every tick, so the
+   * app watches the process it created instead. When that session dies the
+   * distribution powers off about ten seconds later, taking the owner's backend
+   * with it - the exact chain that ended two WebUI sessions on 2026-11-14.
+   */
+  private keepalivePid: number | null = null;
   /**
    * The profile expects this port to be served by a backend the owner started
    * (a previous attach succeeded). While true the app waits for that backend
@@ -458,6 +489,7 @@ export class Supervisor {
     }
     if (code === 200) {
       this.failures = 0;
+      await this.repairDistroKeepalive();
       await this.maybeHandBack();
       return;
     }
@@ -1061,10 +1093,30 @@ export class Supervisor {
     const nodePath = this.runtime?.nodePath ?? null;
     try {
       const pid = await this.deps.wsl.ensureKeepalive(this.distro(), nodePath);
+      this.keepalivePid = pid;
       if (pid !== null) this.deps.log.info(`the distribution is kept open while attached (keepalive pid=${pid})`);
     } catch (error) {
+      this.keepalivePid = null;
       this.deps.log.warn(`could not keep the distribution open: ${describe(error)}`);
     }
+  }
+
+  /**
+   * Restart the keepalive session if whatever held the distribution open is gone.
+   *
+   * Leaving the distribution without a client is not a slow degradation: WSL2
+   * powers it off within about ten seconds, which stops the owner's backend and
+   * drops the WebUI. Re-arming the session is cheap and invisible; a failure here
+   * is logged and retried on the next healthy tick rather than escalated.
+   */
+  private async repairDistroKeepalive(): Promise<void> {
+    if (!this.attached) return;
+    const alive = this.deps.keepaliveAlive ?? isProcessAlive;
+    if (this.keepalivePid !== null && alive(this.keepalivePid)) return;
+    if (this.keepalivePid !== null) {
+      this.deps.log.warn(`the session holding the distribution open is gone (pid=${this.keepalivePid}); re-arming it`);
+    }
+    await this.ensureDistroKeepalive();
   }
 
   /**

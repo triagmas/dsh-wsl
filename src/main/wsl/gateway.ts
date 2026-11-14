@@ -1,5 +1,5 @@
 /** Real `wsl.exe` gateway used by the Electron main process. */
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import type {
   WslGateway,
   ServerHandle,
@@ -54,7 +54,11 @@ export interface WslGatewayOptions {
    * How long a killed WSL command gets to report its own exit; tests lower it so
    * the timeout path does not wait the production grace period.
    */
-  timeouts?: { terminationGraceMs?: number };
+  timeouts?: {
+    terminationGraceMs?: number;
+    /** How long a keepalive must stay alive before it is reported as working. */
+    keepaliveAliveMs?: number;
+  };
 }
 
 /** Budget for reading the cgroup of the backend the app is attached to. */
@@ -68,10 +72,39 @@ const MANAGED_TIMEOUT_MS = 30_000;
  */
 const TERMINATION_GRACE_MS = 15_000;
 
+/**
+ * How long a new keepalive must survive before it counts as started.
+ *
+ * `exit` arrives asynchronously, so returning the pid immediately would let the
+ * supervisor log "the distribution is kept open" for a session that is already
+ * gone.
+ */
+const KEEPALIVE_ALIVE_MS = 750;
+
+/** Did the child survive its first moments, or exit (or fail to start) instead? */
+function staysAlive(child: ChildProcess, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve(false);
+      return;
+    }
+    const onExit = (): void => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    const timer = setTimeout(() => {
+      child.removeListener('exit', onExit);
+      resolve(true);
+    }, ms);
+    child.once('exit', onExit);
+  });
+}
+
 export function createWslGateway(options: WslGatewayOptions): WslGateway {
   const wslExe = options.wslExe ?? WSL_EXE;
   const spawnImpl = options.spawnImpl ?? spawn;
   const terminationGraceMs = options.timeouts?.terminationGraceMs ?? TERMINATION_GRACE_MS;
+  const keepaliveAliveMs = options.timeouts?.keepaliveAliveMs ?? KEEPALIVE_ALIVE_MS;
 
   const run = (args: string[], timeoutMs: number): Promise<CommandResult> =>
     new Promise((resolve, reject) => {
@@ -425,9 +458,17 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       try {
         const child = spawnImpl(wslExe, buildKeepaliveArgs(distro), {
           windowsHide: true,
-          detached: true,
           stdio: 'ignore',
         });
+        // Deliberately not `detached`. On Windows `detached` maps to
+        // DETACHED_PROCESS, which defeats CREATE_NO_WINDOW: the console program
+        // then allocates its own console and the default terminal application
+        // opens a visible window for it. The owner closed exactly that window on
+        // 2026-11-14, which killed the only client holding the distribution open;
+        // WSL2 powered the distro off ten seconds later and took the backend, and
+        // the WebUI session with it. A child outlives this process without
+        // `detached`; `unref()` is what keeps it out of our event loop.
+        //
         // A failed creation (a missing wsl.exe, for example) arrives as an
         // asynchronous `error` event. Without a listener Node treats it as an
         // uncaught exception, and the app's fatal handler would exit over a
@@ -436,8 +477,23 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
           options.log.warn(`could not hold the distribution open: ${describeError(error)}`);
         });
         child.unref();
+        const pid = child.pid ?? null;
+        if (pid === null) {
+          options.log.warn('could not hold the distribution open: wsl.exe reported no process id');
+          return null;
+        }
+        if (!(await staysAlive(child, keepaliveAliveMs))) {
+          options.log.warn('the distribution keepalive exited immediately; the backend may be powered off');
+          return null;
+        }
+        child.on('exit', (code, signal) => {
+          options.log.warn(
+            `the distribution keepalive exited (code=${code ?? 'null'}, signal=${signal ?? 'null'}); ` +
+              'WSL2 powers a distribution off about ten seconds after its last client exits',
+          );
+        });
         options.log.info('holding the WSL distribution open while its backend runs outside the app');
-        return child.pid ?? null;
+        return pid;
       } catch (error) {
         options.log.warn(`could not hold the distribution open: ${describeError(error)}`);
         return null;

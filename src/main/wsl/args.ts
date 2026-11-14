@@ -438,8 +438,10 @@ export const KEEPALIVE_SLEEP_SECONDS = 2147483647;
  * WSL2 powers a distribution off about ten seconds after its last `wsl.exe`
  * client exits, which kills everything inside it. While the app is attached to a
  * backend it does not own it has no client of its own, so it keeps this one.
- * The session is detached and deliberately left behind: quitting the app must
- * never take the distribution, and the owner's backend, down with it.
+ * The session is deliberately left behind: quitting the app must never take the
+ * distribution, and the owner's backend, down with it. It must not be spawned
+ * with `detached`, which on Windows defeats `CREATE_NO_WINDOW` and opens a
+ * visible terminal window (see `gateway.ensureKeepalive`).
  */
 export function buildKeepaliveArgs(distro: string): string[] {
   return ['-d', assertDistroName(distro), '--exec', '/bin/sh', '-c', `exec sleep ${KEEPALIVE_SLEEP_SECONDS}`];
