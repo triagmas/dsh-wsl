@@ -58,7 +58,14 @@ import {
   parseNpmMarker,
   type CleanSnapshotReport,
 } from './update-args.js';
-import { buildControlManagedArgs, buildProbeManagedArgs, parseManagedReport, type ManagedBackend } from './managed.js';
+import {
+  buildControlManagedArgs,
+  buildInstallRuleArgs,
+  buildProbeManagedArgs,
+  parseInstallRuleReport,
+  parseManagedReport,
+  type ManagedBackend,
+} from './managed.js';
 
 export interface CommandResult {
   code: number | null;
@@ -150,12 +157,17 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
   const cleanTimeoutMs = options.timeouts?.cleanMs ?? CLEAN_TIMEOUT_MS;
   const terminationGraceMs = options.timeouts?.terminationGraceMs ?? TERMINATION_GRACE_MS;
 
-  const run = (args: string[], timeoutMs: number): Promise<CommandResult> =>
+  const run = (args: string[], timeoutMs: number, input?: string): Promise<CommandResult> =>
     new Promise((resolve, reject) => {
       let child: ChildProcessWithoutNullStreams;
       try {
-        // stdio[0] is 'ignore', so stdin is null; stdout/stderr are piped.
-        child = spawnImpl(wslExe, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }) as unknown as ChildProcessWithoutNullStreams;
+        // stdin is piped only when a caller has something to write (a password
+        // never belongs in argv, where every process on the machine can read it);
+        // stdout/stderr are always piped.
+        child = spawnImpl(wslExe, args, {
+          windowsHide: true,
+          stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        }) as unknown as ChildProcessWithoutNullStreams;
       } catch (error) {
         reject(error);
         return;
@@ -188,6 +200,12 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         }, terminationGraceMs);
       }, timeoutMs);
 
+      if (input !== undefined) {
+        // The child may exit before reading everything; a broken pipe here is not
+        // an error of its own, the exit code tells the story.
+        child.stdin.on('error', () => undefined);
+        child.stdin.end(input);
+      }
       child.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
       child.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
       child.once('error', (error: NodeJS.ErrnoException) => {
@@ -652,6 +670,36 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
         `could not ${request.action} ${request.unit} (${request.scope}, code=${result.code ?? 'null'})${detail === '' ? '' : `: ${detail}`}`,
       );
       return { ok: false, message: detail === '' ? null : detail };
+    },
+
+    async installManagedRule(request: {
+      distro: string;
+      user: string;
+      unit: string;
+      password: string;
+    }): Promise<{ ok: boolean; message: string | null }> {
+      if (typeof request.password !== 'string' || request.password.length === 0) {
+        return { ok: false, message: 'no password was given' };
+      }
+      // Exactly one newline-terminated line: `sudo -S` reads a single line.
+      const input = `${request.password.replace(/\r?\n$/, '')}\n`;
+      let result: CommandResult;
+      try {
+        result = await run(buildInstallRuleArgs(request), MANAGED_TIMEOUT_MS, input);
+      } finally {
+        // Nothing to wipe in the string, but never keep it reachable from here.
+        request.password = '';
+      }
+      const report = parseInstallRuleReport(`${result.stdout}\n${result.stderr}`);
+      if (result.code === 0 && report.ok) {
+        options.log.info(`installed the sudo rule for ${request.unit}; further updates need no password`);
+        return { ok: true, message: null };
+      }
+      options.log.warn(`the sudo rule for ${request.unit} was not installed (code=${result.code ?? 'null'})`);
+      return {
+        ok: false,
+        message: report.message ?? 'the password was rejected or sudo refused the rule',
+      };
     },
 
     async inspectSharedDsh(request: InspectSharedRequest) {

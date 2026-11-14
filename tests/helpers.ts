@@ -229,6 +229,22 @@ export class FakeWsl implements WslGateway {
   }
 
   readonly probedManagedPids: number[] = [];
+  readonly installedRules: { user: string; unit: string; password: string }[] = [];
+  /** What the fake `sudo -S` answers; the real one only writes when it is right. */
+  ruleResult: { ok: boolean; message: string | null } = { ok: true, message: null };
+  /** The manager a successful rule install reveals. */
+  afterRule: ManagedBackend | null = null;
+
+  async installManagedRule(request: {
+    distro: string;
+    user: string;
+    unit: string;
+    password: string;
+  }): Promise<{ ok: boolean; message: string | null }> {
+    this.installedRules.push({ user: request.user, unit: request.unit, password: request.password });
+    if (this.ruleResult.ok && this.afterRule !== null) this.managed = this.afterRule;
+    return this.ruleResult;
+  }
 
   readonly prunedSnapshots: { distro: string; appRoot: string; keep: number; transaction: string }[] = [];
   pruneRemoved: string[] = [];

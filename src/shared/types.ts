@@ -147,10 +147,19 @@ export interface UpdateProbe {
   running: boolean;
 }
 
+export interface ManagedRuleHint {
+  unit: string;
+  user: string;
+  /** The exact `sudoers` line the app installs; shown before asking anything. */
+  line: string;
+}
+
 export interface UpdateStartResult {
   started: boolean;
   reason: string | null;
   description: string | null;
+  /** Set when the updater needs one password to be allowed to stop the backend. */
+  rule?: ManagedRuleHint | null;
 }
 
 export interface ConfigPatch {

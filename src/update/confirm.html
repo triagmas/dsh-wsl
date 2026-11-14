@@ -33,6 +33,24 @@
       </dl>
 
       <p class="warn" id="blocked" hidden></p>
+
+      <section class="rule" id="rule" hidden>
+        <p class="rule-lead">
+          The DeepSeek Harness serving this window runs as the systemd unit <code id="rule-unit">—</code>, which only
+          root can stop. Type your WSL password once: the app installs exactly one line that lets it stop and start
+          that single unit, and never asks again.
+        </p>
+        <p class="rule-line"><code id="rule-line">—</code></p>
+        <label class="rule-field">
+          <span>WSL password for <code id="rule-user">—</code></span>
+          <input type="password" id="rule-pass" autocomplete="off" spellcheck="false" />
+        </label>
+        <div class="actions rule-actions">
+          <button type="button" id="rule-cancel" class="secondary">Not now</button>
+          <button type="button" id="rule-install" class="primary">Install and update</button>
+        </div>
+        <p class="rule-error" id="rule-error" hidden></p>
+      </section>
       <p class="hint" id="manual" hidden></p>
 
       <ul class="notes">

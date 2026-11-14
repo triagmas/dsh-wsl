@@ -11,9 +11,13 @@ import { describe, expect, it } from 'vitest';
 import { ArgumentError } from '../src/main/wsl/args.js';
 import {
   CONTROL_MANAGED_SCRIPT,
+  INSTALL_RULE_SCRIPT,
   PROBE_MANAGED_SCRIPT,
   buildControlManagedArgs,
+  buildInstallRuleArgs,
   buildProbeManagedArgs,
+  buildRootRuleScript,
+  parseInstallRuleReport,
   parseManagedReport,
   sudoersLines,
 } from '../src/main/wsl/managed.js';
@@ -135,5 +139,56 @@ describe('managed backend probe on this host (linux)', () => {
     const run = spawnSync('/bin/sh', ['-c', PROBE_MANAGED_SCRIPT, 'not-a-pid'], { encoding: 'utf8' });
     expect(run.status).toBe(64);
     expect(run.stderr).toContain('rejected pid');
+  });
+});
+
+describe('one-password rule install', () => {
+  it('never puts the password in the argument list', () => {
+    // Anything in argv is readable by every process on the machine, so the
+    // password has to travel on the stdin pipe of the WSL command.
+    const argv = buildInstallRuleArgs({ distro: 'Ubuntu', user: 'triag', unit: 'dsh-web.service' });
+    expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', INSTALL_RULE_SCRIPT]);
+    expect(argv).toHaveLength(7);
+    // The only extra argument is the already validated root script.
+    expect(argv[6]).toContain('/etc/sudoers.d/dsh-update');
+    // The password is read from stdin, not from a positional argument.
+    expect(INSTALL_RULE_SCRIPT).not.toContain('$1');
+    expect(INSTALL_RULE_SCRIPT).toContain('IFS= read -r dsh_pass');
+    expect(INSTALL_RULE_SCRIPT).toContain('sudo -S -p ""');
+    // The password is only handed to sudo's stdin, never echoed.
+    expect(INSTALL_RULE_SCRIPT).not.toMatch(/echo \$dsh_pass/);
+  });
+
+  it('installs exactly the rule it advertises', () => {
+    const root = buildRootRuleScript({ user: 'triag', unit: 'dsh-web.service' });
+    const rule = sudoersLines({ user: 'triag', unit: 'dsh-web.service' })[0] ?? '';
+    expect(root).toContain(rule);
+    expect(root).toContain('/etc/sudoers.d/dsh-update');
+    expect(root).toContain('chmod 0440');
+    expect(root).toContain('visudo -c');
+    // A rejected file is removed instead of left behind.
+    expect(root).toContain('rm -f /etc/sudoers.d/dsh-update');
+  });
+
+  it('refuses to build a root script from unvalidated text', () => {
+    expect(() => buildRootRuleScript({ user: 'triag; rm -rf /', unit: 'dsh-web.service' })).toThrow(ArgumentError);
+    expect(() => buildRootRuleScript({ user: 'triag', unit: 'dsh-web.service\nroot ALL=(ALL) ALL' })).toThrow(
+      ArgumentError,
+    );
+    expect(() => buildInstallRuleArgs({ distro: 'Ubuntu', user: 'triag', unit: '../evil.service' })).toThrow(
+      ArgumentError,
+    );
+  });
+
+  it('reads the marker and reports failures with their own words', () => {
+    expect(parseInstallRuleReport('__dsh_wsl_managed__ ok=1 unit=dsh-web.service')).toEqual({
+      ok: true,
+      message: null,
+    });
+    expect(parseInstallRuleReport('rule: the sudoers syntax check failed, the file was removed')).toEqual({
+      ok: false,
+      message: 'rule: the sudoers syntax check failed, the file was removed',
+    });
+    expect(parseInstallRuleReport('')).toEqual({ ok: false, message: null });
   });
 });

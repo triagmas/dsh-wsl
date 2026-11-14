@@ -17,7 +17,7 @@ import { ArgumentError, assertDistroName } from './args.js';
 const UNIT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.@:-]*$/;
 
 /** Marker echoed by both scripts; parsed, never trusted as prose. */
-const MANAGED_MARKER = '__dsh_wsl_managed__';
+export const MANAGED_MARKER = '__dsh_wsl_managed__';
 
 /** Reports which manager owns a pid and whether the app may use it. */
 export const PROBE_MANAGED_SCRIPT = [
@@ -137,4 +137,69 @@ export function sudoersLines(request: { user: string; unit: string }): string[] 
   return [
     `${user} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}, /usr/bin/systemctl start ${unit}`,
   ];
+}
+
+/**
+ * Installs the one sudo rule that lets the app stop and start a system unit.
+ *
+ * The password is asked once, inside the app, and only travels over the stdin
+ * pipe of the WSL command: never in an argument list (every process on the
+ * machine can read those), never in a log line, never written to disk. `sudo -S`
+ * reads the first line; the root script then writes the drop-in, checks it with
+ * `visudo -c` and removes it again when the syntax is rejected, so a mistake can
+ * never leave a broken sudoers file behind.
+ */
+export const INSTALL_RULE_SCRIPT = [
+  'set -u',
+  'IFS= read -r dsh_pass || { echo "rule: no password on stdin" >&2; exit 64; }',
+  'if [ -z "$dsh_pass" ]; then echo "rule: empty password" >&2; exit 64; fi',
+  // $0 carries the already validated root script; the password stays on stdin.
+  'printf "%s\\n" "$dsh_pass" | sudo -S -p "" /bin/sh -c "$0"',
+  'rc=$?',
+  'dsh_pass=""',
+  'exit "$rc"',
+].join('\n');
+
+/** The root half: writes the drop-in, validates it, and reports one marker line. */
+export function buildRootRuleScript(request: { user: string; unit: string }): string {
+  const user = assertUserName(request.user);
+  const unit = assertUnitName(request.unit);
+  const rule = `${user} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${unit}, /usr/bin/systemctl start ${unit}`;
+  return [
+    'set -eu',
+    `printf '%s\\n' '${rule}' > /etc/sudoers.d/dsh-update`,
+    'chmod 0440 /etc/sudoers.d/dsh-update',
+    'if ! { visudo -c || /usr/sbin/visudo -c; } >/dev/null 2>&1; then',
+    '  rm -f /etc/sudoers.d/dsh-update',
+    '  echo "rule: the sudoers syntax check failed, the file was removed" >&2',
+    '  exit 2',
+    'fi',
+    `printf '%s\\n' "${MANAGED_MARKER} ok=1 unit=${unit}"`,
+    'exit 0',
+  ].join('\n');
+}
+
+export function assertUserName(user: string): string {
+  if (typeof user !== 'string' || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(user)) {
+    throw new ArgumentError('invalid-user-name');
+  }
+  return user;
+}
+
+export function buildInstallRuleArgs(request: { distro: string; user: string; unit: string }): string[] {
+  const root = buildRootRuleScript({ user: request.user, unit: request.unit });
+  return ['-d', assertDistroName(request.distro), '--exec', '/bin/sh', '-c', INSTALL_RULE_SCRIPT, root];
+}
+
+export function parseInstallRuleReport(text: string): { ok: boolean; message: string | null } {
+  for (const rawLine of text.split(/\r?\n/)) {
+    if (rawLine.trim().startsWith(`${MANAGED_MARKER} ok=1`)) return { ok: true, message: null };
+  }
+  const detail = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .join(' ')
+    .slice(0, 300);
+  return { ok: false, message: detail === '' ? null : detail };
 }

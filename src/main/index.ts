@@ -698,6 +698,17 @@ async function bootstrap(): Promise<void> {
     return updateProbe();
   });
   guard('update:state', () => updateRunner.snapshot());
+  guard('update:install-rule', async (_event, password: unknown) => {
+    if (typeof password !== 'string' || password.length === 0) {
+      return { ok: false, message: 'no password was given' };
+    }
+    // Never log the value, and drop the reference as soon as sudo has it.
+    const result = await supervisor.installManagedRule(password);
+    if (result.ok) log.info('the narrow sudo rule is installed; updates no longer ask for a password');
+    else log.warn(`the sudo rule was not installed: ${result.message ?? 'unknown'}`);
+    return result;
+  });
+
   guard('update:close', () => {
     if (updateRunner.running()) {
       // The terminal stays until the run finished; only the confirmation window
@@ -707,9 +718,18 @@ async function bootstrap(): Promise<void> {
     }
     windows.closeUpdateWindows();
   });
-  guard('update:start', (): UpdateStartResult => {
+  guard('update:start', async (): Promise<UpdateStartResult> => {
     if (updateRunner.running()) {
       return { started: false, reason: 'busy', description: 'An update is already running.' };
+    }
+    // The backend that serves the WebUI runs the installation this update would
+    // replace, so it has to be stoppable first. Asking here — before the window
+    // promises anything and before a plan is built — keeps the answer cheap and
+    // turns "cannot" into "give me one password" instead of a dead end.
+    const blocker = await supervisor.updateBlocker();
+    if (blocker !== null) {
+      const rule = supervisor.pendingRule();
+      return { started: false, reason: rule === null ? 'blocked' : 'rule-needed', description: blocker, rule };
     }
     const result = resolveUpdatePlan();
     if (!result.ok) {

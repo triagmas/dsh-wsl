@@ -233,6 +233,13 @@ export interface WslGateway {
     unit: string;
     action: 'stop' | 'start';
   }): Promise<{ ok: boolean; message: string | null }>;
+  /** Install the one sudo rule that lets the app control a system unit. */
+  installManagedRule(request: {
+    distro: string;
+    user: string;
+    unit: string;
+    password: string;
+  }): Promise<{ ok: boolean; message: string | null }>;
   /** Remove recovery snapshots beyond the newest few. Never blocks an update. */
   pruneUpdateSnapshots(request: {
     distro: string;
@@ -360,6 +367,8 @@ export class Supervisor {
   private attachedPid: number | null = null;
   /** Unit the app stopped for the current update; started again afterwards. */
   private stoppedManaged: { scope: 'system' | 'user'; unit: string } | null = null;
+  /** Manager seen by the last probe; drives the one-password hint. */
+  private lastManaged: ManagedBackend | null = null;
   /**
    * The profile expects this port to be served by a backend the owner started
    * (a previous attach succeeded). While true the app waits for that backend
@@ -585,11 +594,54 @@ export class Supervisor {
     const pid = this.attachedPid;
     if (!this.attached || pid === null) return null;
     try {
-      return await this.deps.wsl.probeManagedBackend({ distro: this.distro(), pid });
+      const managed = await this.deps.wsl.probeManagedBackend({ distro: this.distro(), pid });
+      this.lastManaged = managed;
+      return managed;
     } catch (error) {
       this.deps.log.warn(`could not identify the manager of the attached backend: ${describe(error)}`);
       return null;
     }
+  }
+
+  /**
+   * The rule the app would need to control the attached backend, or `null` when
+   * it needs none. The confirmation window uses it to ask for the password once
+   * instead of sending the owner to a terminal.
+   */
+  pendingRule(): { unit: string; user: string; scope: 'system' | 'user'; line: string } | null {
+    const managed = this.lastManaged;
+    if (!this.attached || managed === null || managed.scope !== 'system' || managed.unit === null) return null;
+    if (managed.canControl) return null;
+    return {
+      unit: managed.unit,
+      user: managed.user,
+      scope: managed.scope,
+      line: sudoersLines({ user: managed.user, unit: managed.unit })[0] ?? '',
+    };
+  }
+
+  /** Install that rule with the password the owner typed, then re-probe. */
+  async installManagedRule(password: string): Promise<{ ok: boolean; message: string | null }> {
+    const rule = this.pendingRule();
+    if (rule === null) return { ok: true, message: null };
+    const result = await this.deps.wsl
+      .installManagedRule({
+        distro: this.distro(),
+        user: rule.user,
+        unit: rule.unit,
+        password,
+      })
+      .catch((error: unknown) => ({ ok: false, message: describe(error) }));
+    if (!result.ok) return result;
+    // Prove it works instead of trusting the write: the probe re-checks `sudo -n`.
+    const verified = await this.discoverManaged();
+    if (verified === null || !verified.canControl) {
+      return {
+        ok: false,
+        message: 'the rule was written but sudo still refuses it; check /etc/sudoers.d/dsh-update inside WSL',
+      };
+    }
+    return { ok: true, message: null };
   }
 
   /**

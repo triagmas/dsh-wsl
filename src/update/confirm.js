@@ -48,12 +48,91 @@ function render(probe) {
   }
 }
 
+// --- one-password rule install -----------------------------------------
+const ruleSection = document.getElementById('rule');
+const ruleUnitEl = document.getElementById('rule-unit');
+const ruleLineEl = document.getElementById('rule-line');
+const ruleUserEl = document.getElementById('rule-user');
+const rulePassEl = document.getElementById('rule-pass');
+const ruleErrorEl = document.getElementById('rule-error');
+const ruleInstallButton = document.getElementById('rule-install');
+const ruleCancelButton = document.getElementById('rule-cancel');
+
+function showRule(hint) {
+  ruleSection.hidden = false;
+  ruleUnitEl.textContent = hint.unit;
+  ruleLineEl.textContent = hint.line;
+  ruleUserEl.textContent = hint.user;
+  ruleErrorEl.hidden = true;
+  ruleErrorEl.textContent = '';
+  startButton.disabled = true;
+  ruleInstallButton.disabled = false;
+  rulePassEl.value = '';
+  rulePassEl.focus();
+}
+
+function hideRule() {
+  ruleSection.hidden = true;
+  // The value never stays in the DOM after it was used or abandoned.
+  rulePassEl.value = '';
+}
+
+/** Asks for the password once, then starts the update that was refused for it. */
+function installRuleAndStart() {
+  const password = rulePassEl.value;
+  if (password.length === 0) {
+    ruleErrorEl.hidden = false;
+    ruleErrorEl.textContent = 'Type the password for this WSL user.';
+    return;
+  }
+  ruleInstallButton.disabled = true;
+  rulePassEl.value = '';
+  window.update
+    ?.installRule(password)
+    .then((result) => {
+      if (result.ok === true) {
+        hideRule();
+        startButton.click();
+        return;
+      }
+      ruleErrorEl.hidden = false;
+      ruleErrorEl.textContent =
+        result.message === null
+          ? 'The password was rejected; nothing was changed.'
+          : `The rule was not installed: ${result.message}`;
+      ruleInstallButton.disabled = false;
+    })
+    .catch(() => {
+      ruleErrorEl.hidden = false;
+      ruleErrorEl.textContent = 'The rule could not be installed.';
+      ruleInstallButton.disabled = false;
+    });
+}
+
+ruleInstallButton.addEventListener('click', installRuleAndStart);
+rulePassEl.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    installRuleAndStart();
+  }
+});
+ruleCancelButton.addEventListener('click', () => {
+  hideRule();
+  startButton.disabled = false;
+});
+
 startButton.addEventListener('click', () => {
   startButton.disabled = true;
   window.update
     ?.start()
     .then((result) => {
       if (result.started === true) return;
+      if (result.reason === 'rule-needed' && result.rule) {
+        // Not a dead end: one password turns the refusal into a working update.
+        blockedEl.hidden = true;
+        showRule(result.rule);
+        return;
+      }
       blockedEl.hidden = false;
       blockedEl.textContent = result.description ?? 'The update could not be started.';
       startButton.disabled = false;

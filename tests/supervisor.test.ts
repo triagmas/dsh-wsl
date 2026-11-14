@@ -592,6 +592,51 @@ describe('update preflight', () => {
     ]);
   });
 
+  it('offers the one password instead of a dead end', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: false });
+    await supervisor.start();
+    await supervisor.updateBlocker();
+
+    const rule = supervisor.pendingRule();
+    expect(rule).toEqual({
+      unit: 'dsh-web.service',
+      user: 'triag',
+      scope: 'system',
+      line: 'triag ALL=(root) NOPASSWD: /usr/bin/systemctl stop dsh-web.service, /usr/bin/systemctl start dsh-web.service',
+    });
+
+    // The password goes to the gateway once, and the probe afterwards decides
+    // whether the update may proceed — the write alone is not proof.
+    harness.wsl.afterRule = { scope: 'system', unit: 'dsh-web.service', canControl: true, user: 'triag' };
+    await expect(supervisor.installManagedRule('hunter2')).resolves.toEqual({ ok: true, message: null });
+    expect(harness.wsl.installedRules).toEqual([
+      { user: 'triag', unit: 'dsh-web.service', password: 'hunter2' },
+    ]);
+    await expect(supervisor.updateBlocker()).resolves.toBeNull();
+  });
+
+  it('reports a rule that did not take effect', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: false });
+    await supervisor.start();
+    await supervisor.updateBlocker();
+
+    harness.wsl.ruleResult = { ok: true, message: null };
+    harness.wsl.afterRule = null;
+    const result = await supervisor.installManagedRule('wrong');
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('sudo still refuses');
+  });
+
+  it('has nothing to install when the unit is already controllable', async () => {
+    const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: true });
+    await supervisor.start();
+    await supervisor.updateBlocker();
+
+    expect(supervisor.pendingRule()).toBeNull();
+    await expect(supervisor.installManagedRule('unused')).resolves.toEqual({ ok: true, message: null });
+    expect(harness.wsl.installedRules).toHaveLength(0);
+  });
+
   it('leaves the unit alone when the stop is not allowed', async () => {
     const { harness, supervisor } = attached({ scope: 'system', unit: 'dsh-web.service', canControl: false });
     await supervisor.start();
