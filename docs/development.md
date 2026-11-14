@@ -30,7 +30,7 @@ npm run paint:probe      # real screen pixels of a composed window: the remote
 ## Packaging
 
 See [packaging.md](packaging.md) for the two Windows artifacts, the installer
-behaviour, the CI pipeline and the relaunch checks:
+behaviour and the CI pipeline:
 
 ```sh
 npm run dist           # both packages
@@ -48,10 +48,10 @@ npm run dist:dir       # unpacked app
 
 ```
 src/main/          Electron main process
-  core/            Electron-free logic: supervisor, ownership, isolation, update,
-                   update recovery, relaunch target, config, branding, diagnostics
+  core/            Electron-free logic: supervisor, ownership, isolation, manual
+                   update plan, config, branding, diagnostics
   electron/        windows, tray, config store, web client (Electron-specific)
-  wsl/             wsl.exe gateway, argument validation, update scripts
+  wsl/             wsl.exe gateway, argument validation, inspection scripts
   backend/         DeepSeek Harness specifics (URLs, versions, GitHub releases)
 src/preload/       contextIsolation bridges (sandboxed)
 src/chrome/        app-owned window: 32 px footer bar

@@ -12,7 +12,6 @@ recording content.
 | Settings | `%APPDATA%\wsl-web-shell\config.json` |
 | Owned-backend registry | `%APPDATA%\wsl-web-shell\owned-server.json` |
 | Version cache | `%APPDATA%\wsl-web-shell\versions-cache.json` |
-| Update journal | `%APPDATA%\wsl-web-shell\update-journal.json` |
 | Isolated WSL runtime | `~/.local/share/wsl-web-shell` inside the distribution |
 
 The profile directory keeps its original name after the rename to **DSH WSL** on
@@ -45,9 +44,8 @@ Launch tokens, cookies, prompt or workspace content, and local user directories
 3. `Port … is already in use by a service this app does not own` is a deliberate
    fail-closed decision: DSH WSL never adopts or kills a backend it did not start.
    Choose another port in the settings popover.
-4. For a stuck update, the update journal in the profile records the transaction. A
-   journal that cannot be read blocks the start instead of guessing; the terminal
-   window and the log explain which file is affected.
+4. For an update, open the footer pill: the window shows the read-only inspection
+   result and the commands to run yourself. `Check again` repeats the inspection.
 
 See [architecture.md](architecture.md) for the state machine and
-[update.md](update.md) for the update transaction.
+[update.md](update.md) for the manual update instructions.

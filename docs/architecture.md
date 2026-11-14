@@ -39,8 +39,8 @@ while a backend is already owned and healthy.
 
 The backend never inherits a shared harness home. Every launch derives one
 validated root — `~/.local/share/wsl-web-shell` by default — and puts
-`DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files, the test workspace and the
-app's own update bookkeeping below it (`src/main/core/isolation.ts`):
+`DSH_HOME`, `DSH_AGENTS_HOME`, caches, temp files and the test workspace below it
+(`src/main/core/isolation.ts`):
 
 | Path | Purpose |
 |---|---|
@@ -48,11 +48,10 @@ app's own update bookkeeping below it (`src/main/core/isolation.ts`):
 | `<root>/agents` | `DSH_AGENTS_HOME`: keeps the shared `~/.agents` out of the backend |
 | `<root>/cache`, `<root>/tmp` | `XDG_CACHE_HOME`, `TMPDIR` |
 | `<root>/workspace` | test workspace used when the configured workspace is the bare `~` |
-| `<root>/update` | update backups of the shared npm package (`shared-backup-<tx>`) |
-| `<root>/cache/npm` | npm cache used by the in-app update |
 
-Since issue #17 this is **data** isolation only: the executable is not stored
-here. An older `<root>/runtime/bin` copy may still exist on disk; it is reported
+An empty `<root>/update` directory may remain from older versions; the app no
+longer writes to it. Since issue #17 this is **data** isolation only: the
+executable is not stored here. An older `<root>/runtime/bin` copy may still exist on disk; it is reported
 (`legacy=yes`) and never selected.
 
 **Root rules.** The root must be a dedicated, application-owned subtree at least
@@ -140,35 +139,29 @@ behind it belongs to a dead backend session. Navigations are serialized through 
 single in-flight promise, so a recovery burst cannot race two loads; no substitute
 UI and no injected styles are involved, and DSH session state stays server-side.
 
-### One-click update (issue #12)
+### Manual update (issue #12)
 
-The updater is the only component allowed to change what runs inside the isolation
-root, so it is split the same way as the launcher:
+The app does not update DeepSeek Harness. It observes the installation and renders
+instructions, split the usual way:
 
-- `src/main/core/update.ts` — pure: exact-version and exact-equality checks,
-  `isExpectedRuntimePath()` against the canonical root WSL reported,
-  `planUpdate()` (rejects global installs, custom executables, foreign runtimes,
-  unsafe roots), terminal buffer with a rolling-cap offset, phase model,
-  transaction journal and every recovery decision;
-- `src/main/wsl/update-args.ts` — argv construction and the five `/bin/sh` scripts
-  (npm lookup, stage, activate, restore, inspect), all sharing one prologue that
-  expands a configured `~` inside the script, canonicalises the root, refuses
-  symlinked components and pins npm to the private cache;
-- `src/main/core/update-runner.ts` — the fixed transaction (npm lookup → stage →
-  verify → **quiesce the owned backend** → swap → full start) with no retries and
-  no parallel runs;
-- `src/main/core/update-recovery.ts` — journal persistence and the start-up repair
-  (`finalize`, `rollback`, `blocked`);
-- `src/main/core/relaunch.ts` — pure decision about which executable may be
-  relaunched after an update;
-- `src/update/*` + `src/preload/update.ts` — the confirmation and terminal
-  windows, rendering only state pushed by the main process.
+- `src/main/core/manual-update.ts` — pure `buildManualUpdatePlan()`: exact-version
+  guard, manager-specific install line, stop/install/start order for a discovered
+  unit, and a refusal (no command) when the manager, installed version or target is
+  unknown;
+- `src/main/wsl/inspect.ts` — the read-only inspection script (`INSPECT_SCRIPT`) and
+  its argv construction; it reports paths, versions, manager, prefix, writability and
+  foreign processes, and never writes;
+- `src/main/wsl/managed.ts` — read-only cgroup lookup for the systemd unit behind an
+  attached backend; discovery only, no `systemctl` and no `sudo`;
+- `src/main/index.ts` — builds the plan from a fresh inspection and the supervisor's
+  ownership state (`owned`, `attached`, `none`) and exposes `update:probe`,
+  `update:recheck`, `update:close`;
+- `src/update/*` + `src/preload/update.ts` — the window that renders facts, commands
+  and per-line **Copy** / **Copy all**.
 
-The plan is recomputed in the main process for `update:start`; the confirmation
-window cannot start something `planUpdate()` rejected. The backend is stopped only
-immediately before the swap, with auto-recovery paused, and the update is reported
-as successful only after the new runtime passed a full start. Success then takes
-the same graceful shutdown path as Quit and relaunches the portable executable.
+`update:recheck` runs the inspection again instead of reading a cache, so the window
+reflects a command the owner just ran. No component stops, starts, installs or writes
+anything in the distribution.
 
 ## Ownership
 
@@ -336,14 +329,10 @@ policy, offline fail-soft) and `tests/r09.test.ts` (composition guards). The
 workspace contract moved to `src/main/core/workspace.ts` so Settings and the
 launcher cannot disagree about a trailing slash (issue #8).
 
-Issue #12 added `tests/update.test.ts` (guards, exact version equality, ownership
-paths, rolling-cap streaming, journal and recovery decisions, the full runner
-transaction, portable relaunch, window/shutdown wiring) and
-`tests/wsl-update-args.test.ts`, which runs the shipped scripts under `/bin/sh`
-with a fake `$HOME` and a fake npm: `~/` expansion, the private cache, symlink
-refusal, substring version refusal, staging, activation, rollback and recovery
-from an interruption at both swap boundaries. `tests/supervisor.test.ts` covers
-the quiesce/resume contract. No test starts WSL or touches an installation.
+Issue #12 now has `tests/manual-update.test.ts` (exact version guard, manager-specific
+install line, stop/install/start order, every backend/scope branch, refusals) and
+`tests/inspect.test.ts` plus `tests/managed.test.ts`, which pin the read-only
+inspection and cgroup probes. No test starts WSL or touches an installation.
 
 Configuration gained two fields: `isolateEnvironment` (default on) and
 `runtimeRoot`. Both require a backend restart, so the tray decision stays

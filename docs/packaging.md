@@ -41,14 +41,13 @@ settings and the installed DeepSeek Harness version are the same whichever you
 start. (This is about the two files of one release, not about sharing data with a
 globally installed `dsh` or with the official Windows DeepSeek Harness: the
 isolated `DSH_HOME` starts empty.) Running both under one Windows account therefore
-shares settings, logs, the owned-backend registry, the update journal and the
-installed DSH version; only one instance can run at a time, and an update performed
-in one variant is visible in the other.
+shares settings, logs, the owned-backend registry and the installed DSH version;
+only one instance can run at a time.
 
 The product was renamed from "WSL Web Shell" to "DSH WSL" in issue #14. The profile
 directory keeps its original name on purpose: it holds the user's `config.json`,
-logs, `owned-server.json`, `versions-cache.json` and `update-journal.json`, so
-renaming it would silently orphan that data. The Windows CI job proves the
+logs, `owned-server.json` and `versions-cache.json`, so renaming it would silently
+orphan that data. The Windows CI job proves the
 continuity on both packages with `--profile-probe`.
 
 ## Building
@@ -72,33 +71,21 @@ The `windows-package` job builds both artifacts from one `npm run dist` and then
    each at least 50 MB (no `Select-Object -First 1`, no ambiguous glob),
 2. writes `SHA256SUMS.txt` with both hashes and records names, sizes and hashes in
    the job summary,
-3. runs the portable relaunch probe (7/7),
 4. proves that a pre-existing `%APPDATA%\wsl-web-shell` (config + logs) is still the
    live profile for the portable build and that no `%APPDATA%\DSH WSL` appears,
 5. silently installs the Setup EXE into a temporary per-user directory and checks the
    installed files, the single uninstaller, the Start-menu shortcut and the
    Installed Apps entry,
-6. runs the profile probe from the installed build and the installed relaunch probe
-   (9/9),
+6. runs the profile probe from the installed build,
 7. uninstalls and asserts the installation directory, shortcut and uninstall entry
    are gone while the legacy profile and its files survive,
 8. uploads both EXEs and `SHA256SUMS.txt` in one artifact.
 
-## Relaunch targets
+## Probes
 
-`resolveRelaunchTarget()` in `src/main/core/relaunch.ts` decides what may be started
-again after an in-app DSH update:
-
-- **portable** — `PORTABLE_EXECUTABLE_FILE` must exist; `process.execPath` points into
-  the temporary extraction directory and is never used.
-- **installed** — `process.execPath` is accepted only when `app.isPackaged` and the
-  `resources` directory with its `app.asar` belongs to that same executable.
-- **anything else** — a development run or an unverifiable installation is refused
-  with an explicit message instead of a guessed restart.
-
-Probes: `--relaunch-probe=<dir>` and `scripts/check-relaunch.cjs <dir> <exe>
-[timeout] [--mode=portable|installed]`, plus `--profile-probe=<file>` for the profile
-continuity check.
+`--profile-probe=<file>` is kept for the profile continuity check: the packaged app
+writes its name, `userData` path and packaged state, then exits before starting a
+backend. It does not start, stop or update anything.
 
 ## Release checklist
 

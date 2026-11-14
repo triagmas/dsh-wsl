@@ -30,14 +30,14 @@ dropped first, then the state word is shortened (`chrome.css` media queries).
 | `DSH <version>` | `dsh --version` inside the distro, read by the supervisor | `DSH —` until the backend has answered; never guessed |
 | `GitHub <version>` | `https://api.github.com/repos/deepseek-ai/deepseek-harness/releases` | newest published `dsh-v*` release; `GitHub …` while unknown |
 | `↑` | comparison of the two | shown only when upstream is strictly newer (SemVer precedence including pre-releases) |
-| `⟳ <version>` | same comparison, plus `planUpdate()` | pill with a circular arrow; **hidden unless** an update is available and installable, opens the update confirmation window (issue #12) |
+| `⟳ <version>` | same comparison | pill with a circular arrow; **hidden unless** a newer release is published, opens the manual update window (issue #12) |
 
 Rules:
 
 - The GitHub lookup is **informational only**: it downloads nothing and sends no
-  credentials or cookies. The only action it enables is the explicit, confirmed
-  update described in [update.md](update.md), which changes the shared WSL installation
-  and only when the user clicks Update.
+  credentials or cookies. The only action it enables is the manual instruction window
+  described in [update.md](update.md), which shows commands the owner runs; the app
+  changes nothing.
 - Results are cached in `userData/versions-cache.json` for 18 h so a restart or a
   network outage never blocks or delays startup. A failed refresh keeps the last good
   version and only records a short error.
@@ -91,10 +91,10 @@ Settings and the launcher share `src/main/core/workspace.ts` (issue #8):
 - `tests/r09.test.ts` — composition guards: WebUI stays in a `WebContentsView` with
   its sandbox and navigation allowlist, no CSS/DOM injection into remote pages, all
   new IPC channels go through the trusted-sender guard, the popover anchor is
-  validated, installation stays confined to the explicit update path (issue #17),
+  validated, installation never changes outside the plan built for the manual window (issue #17),
   and issue #7's automation mode stays out.
 - `npm run chrome:smoke` — renders the shipped footer and popover under Xvfb and
-  asserts 19 observable facts (labels, tone, arrow, release click, bar height,
+  asserts 36 observable facts (labels, tone, arrow, release click, bar height,
   groups, pre-filled values, save round-trip, close). Runs in CI.
 - `npm run composition:smoke` — builds the **real** `Windows` class and drives it
   the way the app does: a `BrowserWindow` with the footer page, the
