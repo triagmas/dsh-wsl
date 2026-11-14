@@ -71,14 +71,14 @@ function renderVersions(snapshot) {
     : 'DeepSeek Harness version is not known yet (backend not started).';
   installedButton.dataset.state = installedVersion ? 'ready' : 'loading';
 
-  // The circular-arrow offer exists only while an update is available: the new
+  // The circular-arrow hint exists only while an update is available: the new
   // version is never shown as an action when there is nothing to install.
   const target = snapshot.updateAvailable ? (snapshot.latest?.version ?? null) : null;
   updateButton.hidden = target === null;
   if (target !== null) {
     updateVersion.textContent = target;
-    updateButton.setAttribute('aria-label', `Update DeepSeek Harness to ${target}`);
-    updateButton.title = `Update DeepSeek Harness ${installedVersion ?? ''} → ${target} in your WSL installation`;
+    updateButton.setAttribute('aria-label', `How to update DeepSeek Harness to ${target}`);
+    updateButton.title = `Show the commands that update DeepSeek Harness ${installedVersion ?? ''} → ${target} in your WSL installation`;
   }
 
   releaseUrl = snapshot.latest?.url ?? null;

@@ -1,44 +1,19 @@
 import type {
   ExitInfo,
   InspectSharedRequest,
-  NpmVersionCheck,
   ResolvedRuntime,
   ServerHandle,
-  BackupAttempt,
-  PrepareBackupRequest,
-  SharedRollbackRequest,
-  SharedUpdateRunRequest,
   StartServerRequest,
-  UpdateRunResult,
   WslGateway,
 } from '../src/main/core/supervisor.js';
 import type { ProcessProbe } from '../src/main/wsl/output.js';
 import type { ManagedBackend } from '../src/main/wsl/managed.js';
-import type { SharedInstallObservation } from '../src/main/core/update.js';
 import type { DshInstallation, SharedDshReport } from '../src/main/core/dsh-locate.js';
 import type { WebClient } from '../src/main/core/supervisor.js';
 import { createMemoryExternalStore } from '../src/main/core/external.js';
 import { createMemoryRegistry } from '../src/main/core/registry.js';
 import { createNullLogger } from '../src/main/core/logger.js';
 import { DEFAULT_CONFIG, type AppConfig, type ShellStatus } from '../src/shared/types.js';
-
-/** A realistic npm-global installation used by the update tests. */
-export const DEFAULT_INSTALLATION: DshInstallation = {
-  path: '/home/dev/.npm-global/bin/dsh',
-  realPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
-  symlink: true,
-  version: '0.2.1-rc.5',
-  manager: 'npm',
-  prefix: '/home/dev/.npm-global',
-  packageDir: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh',
-  writable: true,
-  npmPath: '/usr/bin/npm',
-  source: 'login-shell',
-  foreignProcesses: 0,
-  foreignPids: [],
-  loginShellRealPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
-  loginShellVersion: '0.2.1-rc.5',
-};
 
 export const BACKEND_PID = 4242;
 export const KEEPALIVE_PID = 5151;
@@ -147,141 +122,38 @@ export class FakeWsl implements WslGateway {
   dshVersionValue: string | null = '0.2.1-rc.5';
   readonly versionQueries: { distro: string; dshPath: string; nodePath: string | null }[] = [];
 
-  /** Update-related fake state (issues #12 and #17). */
-  npmCheckResult: NpmVersionCheck = { found: true, npmPath: '/usr/bin/npm', reported: '0.2.2-rc.1', message: null };
-  /** Exit code of the shared-install update, and the lines it streams. */
-  updateCode: number | null = 0;
-  rollbackCode: number | null = 0;
-  updateRunLines: string[] = ['update: installing @deepseek-ai/dsh@0.2.2-rc.1 into /home/dev/.npm-global'];
-  /** What the inspection reports before the update. */
-  installation: DshInstallation = { ...DEFAULT_INSTALLATION };
-  /** What it reports afterwards (the runner verifies the target version). */
-  installationAfterUpdate: Partial<DshInstallation> = { version: '0.2.2-rc.1', loginShellVersion: '0.2.2-rc.1' };
-  /** What the recovery inspection reports (`null` = use `installation`). */
-  recoveryObservation: SharedInstallObservation | null = null;
+  /** Installation reported by the read-only inspection. */
+  installation: DshInstallation = {
+    path: '/home/dev/.npm-global/bin/dsh',
+    realPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+    symlink: true,
+    version: '0.2.1-rc.5',
+    manager: 'npm',
+    prefix: '/home/dev/.npm-global',
+    packageDir: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh',
+    writable: true,
+    npmPath: '/usr/bin/npm',
+    source: 'login-shell',
+    foreignProcesses: 0,
+    foreignPids: [],
+    loginShellRealPath: '/home/dev/.npm-global/lib/node_modules/@deepseek-ai/dsh/bin/dsh.js',
+    loginShellVersion: '0.2.1-rc.5',
+  };
   legacyRuntimePresent = false;
-  readonly updateRuns: SharedUpdateRunRequest[] = [];
-  readonly rollbackRuns: { request: SharedRollbackRequest; version: string; transaction: string }[] = [];
-  /** Verified snapshot step (B1): recorded, and failable on demand. */
-  readonly backupRequests: PrepareBackupRequest[] = [];
-  backupFails = false;
-  backupFiles = 128;
-  /** Exit code and stderr line reported when `backupFails` is set (issue #27). */
-  backupFailureCode: number | null = 81;
-  backupFailureDetail = 'backup: /home/dev/.local/bin/dsh reports [] instead of [0.2.1-rc.5]';
-  readonly npmChecks: { distro: string; appRoot: string; version: string; nodePath: string | null }[] = [];
   readonly inspections: InspectSharedRequest[] = [];
-
-  async checkPublishedVersion(request: {
-    distro: string;
-    appRoot: string;
-    version: string;
-    nodePath: string | null;
-  }): Promise<NpmVersionCheck> {
-    this.npmChecks.push(request);
-    return { ...this.npmCheckResult, reported: this.npmCheckResult.reported ?? request.version };
-  }
 
   async inspectSharedDsh(request: InspectSharedRequest): Promise<SharedDshReport> {
     this.inspections.push(request);
-    if (this.recoveryObservation !== null) {
-      const observation = this.recoveryObservation;
-      return {
-        found: observation.present,
-        legacyRuntimePresent: this.legacyRuntimePresent,
-        installation: observation.present
-          ? { ...this.installation, version: observation.version, realPath: observation.realPath ?? this.installation.realPath }
-          : null,
-      };
-    }
     return { found: true, installation: { ...this.installation }, legacyRuntimePresent: this.legacyRuntimePresent };
   }
 
-  async prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupAttempt> {
-    this.backupRequests.push(request);
-    if (this.backupFails) {
-      return { ok: false, code: this.backupFailureCode, detail: this.backupFailureDetail };
-    }
-    const root = request.appRoot === '-' ? '/home/dev/.cache/wsl-web-shell' : request.appRoot.replace(/^~/, '/home/dev');
-    return {
-      ok: true,
-      snapshot: { path: `${root}/update/shared-backup-${request.transaction}`, files: this.backupFiles },
-    };
-  }
-
   /** What the app believes owns a backend pid; tests override it per case. */
-  managed: ManagedBackend = { scope: 'none', unit: null, canControl: false, user: 'triag' };
-  readonly managedCalls: { scope: 'system' | 'user'; unit: string; action: 'stop' | 'start' }[] = [];
-  controlResult: { ok: boolean; message: string | null } = { ok: true, message: null };
+  managed: ManagedBackend = { scope: 'none', unit: null, user: 'triag' };
+  readonly probedManagedPids: number[] = [];
 
   async probeManagedBackend(request: { distro: string; pid: number }): Promise<ManagedBackend> {
     this.probedManagedPids.push(request.pid);
     return this.managed;
-  }
-
-  async controlManagedBackend(request: {
-    distro: string;
-    scope: 'system' | 'user';
-    unit: string;
-    action: 'stop' | 'start';
-  }): Promise<{ ok: boolean; message: string | null }> {
-    this.managedCalls.push({ scope: request.scope, unit: request.unit, action: request.action });
-    return this.controlResult;
-  }
-
-  readonly probedManagedPids: number[] = [];
-  readonly installedRules: { user: string; unit: string; password: string }[] = [];
-  /** What the fake `sudo -S` answers; the real one only writes when it is right. */
-  ruleResult: { ok: boolean; message: string | null } = { ok: true, message: null };
-  /** The manager a successful rule install reveals. */
-  afterRule: ManagedBackend | null = null;
-
-  async installManagedRule(request: {
-    distro: string;
-    user: string;
-    unit: string;
-    password: string;
-  }): Promise<{ ok: boolean; message: string | null }> {
-    this.installedRules.push({ user: request.user, unit: request.unit, password: request.password });
-    if (this.ruleResult.ok && this.afterRule !== null) this.managed = this.afterRule;
-    return this.ruleResult;
-  }
-
-  readonly prunedSnapshots: { distro: string; appRoot: string; keep: number; transaction: string }[] = [];
-  pruneRemoved: string[] = [];
-
-  async pruneUpdateSnapshots(request: {
-    distro: string;
-    appRoot: string;
-    keep: number;
-    transaction: string;
-  }): Promise<{ removed: string[] }> {
-    this.prunedSnapshots.push(request);
-    return { removed: this.pruneRemoved };
-  }
-
-  async updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
-    this.updateRuns.push(request);
-    for (const line of this.updateRunLines) onLine(line);
-    if (this.updateCode === 0) {
-      // The executable really reports the new version afterwards.
-      this.installation = { ...this.installation, ...this.installationAfterUpdate };
-    }
-    return { code: this.updateCode, tail: this.updateRunLines.slice(-2).join(' ') };
-  }
-
-  async rollbackSharedDsh(
-    request: SharedRollbackRequest,
-    version: string,
-    transaction: string,
-    onLine: (line: string) => void,
-  ): Promise<UpdateRunResult> {
-    this.rollbackRuns.push({ request, version, transaction });
-    onLine(`update: restoring @deepseek-ai/dsh@${version}`);
-    if (this.rollbackCode === 0) {
-      this.installation = { ...this.installation, version };
-    }
-    return { code: this.rollbackCode, tail: this.rollbackCode === 0 ? `update: restored ${version}` : 'update: the previous version could not be restored' };
   }
 
   async dshVersion(distro: string, dshPath: string, nodePath: string | null = null): Promise<string | null> {

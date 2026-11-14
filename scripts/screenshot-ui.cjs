@@ -69,55 +69,21 @@ const config = {
   maxRestartAttempts: 3,
 };
 
-/** The update fixture is what the confirmation window shows (issues #12, #17). */
+/** The update fixture is what the manual update window shows (issues #12, #17). */
 const updateProbe = {
   installed: '0.2.1-rc.5',
   target: '0.2.2-rc.1',
   distro: 'Ubuntu',
-  eligible: true,
-  reason: null,
-  description: null,
   dshPath: '/home/tester/.npm-global/bin/dsh',
   installManager: 'npm',
-  installScope: 'user',
-  sharedWithTerminal: true,
-  manualCommand: null,
-  running: false,
-};
-
-const updateRunning = {
-  phase: 'installing',
-  message: 'Installing 0.2.2-rc.1',
-  detail: 'Installing into /home/tester/.npm-global',
-  targetVersion: '0.2.2-rc.1',
-  installedVersion: '0.2.1-rc.5',
-  updateAvailable: true,
-  dropped: 0,
-  lines: [
-    'update: published version 0.2.2-rc.1 confirmed by npm',
-    'update: previous package copied to ~/.local/share/wsl-web-shell/update/shared-backup-20261106T134500Z',
-    'npm: add 1 package in 4s',
-    'npm: found 0 vulnerabilities',
+  installScope: 'user (/home/tester/.npm-global)',
+  commands: [
+    'sudo systemctl stop dsh-web.service',
+    'npm install -g @deepseek-ai/dsh@0.2.2-rc.1',
+    'sudo systemctl start dsh-web.service',
   ],
-  startedAt: '2026-11-06T13:45:00.000Z',
-  finishedAt: null,
-};
-
-const updateDone = {
-  ...updateRunning,
-  phase: 'done',
-  message: 'Updated to 0.2.2-rc.1',
-  detail:
-    'The shared installation at /home/tester/.npm-global/bin/dsh now reports 0.2.2-rc.1. ' +
-    'An ordinary dsh web in WSL uses the same executable.',
-  lines: [
-    ...updateRunning.lines,
-    'update: verifying the installation',
-    'update: /home/tester/.npm-global/bin/dsh reports 0.2.2-rc.1',
-    'update: a login shell resolves the updated executable',
-    'update: 0.2.2-rc.1 is serving the WebUI',
-  ],
-  finishedAt: '2026-11-06T13:45:24.000Z',
+  description: null,
+  state: 'pending',
 };
 
 /** Patches received through `settings:save`, asserted below. */
@@ -125,7 +91,7 @@ const saves = [];
 let releaseOpened = 0;
 let popoverCloseCalls = 0;
 let updateOpened = 0;
-let updateStarted = 0;
+let updateRechecks = 0;
 let updateCloseCalls = 0;
 
 function registerIpc() {
@@ -139,11 +105,10 @@ function registerIpc() {
     updateOpened += 1;
   });
   ipcMain.handle('update:probe', () => updateProbe);
-  ipcMain.handle('update:start', () => {
-    updateStarted += 1;
-    return { started: true, reason: null, description: null };
+  ipcMain.handle('update:recheck', () => {
+    updateRechecks += 1;
+    return updateProbe;
   });
-  ipcMain.handle('update:state', () => updateRunning);
   ipcMain.handle('update:close', () => {
     updateCloseCalls += 1;
   });
@@ -322,114 +287,59 @@ async function checkPopover() {
 }
 
 async function checkUpdateWindows() {
-  const confirm = await windowFor(620, 520, 'update.js', join(dist, 'update', 'confirm.html'));
+  const confirm = await windowFor(640, 620, 'update.js', join(dist, 'update', 'confirm.html'));
+  const installed = await waitForText(confirm, '#installed', '0.2.1-rc.5');
+  check('the update window states the installed version', installed.trim() === '0.2.1-rc.5', installed);
   const target = await waitForText(confirm, '#target', '0.2.2-rc.1');
-  check('the confirmation window states the exact target version', target.trim() === '0.2.2-rc.1', target);
+  check('the update window states the exact available version', target.trim() === '0.2.2-rc.1', target);
   const binary = await evaluate(confirm, "document.getElementById('binary')?.textContent ?? ''");
-  check('the confirmation window names the executable it will change', binary === '/home/tester/.npm-global/bin/dsh', binary);
+  check('the update window names the executable', binary === '/home/tester/.npm-global/bin/dsh', binary);
   const scope = await evaluate(confirm, "document.getElementById('scope')?.textContent ?? ''");
-  check('the confirmation window names the install scope', scope.toLowerCase().includes('npm, global'), scope);
-  const shared = await evaluate(confirm, "document.getElementById('shared')?.textContent ?? ''");
-  check('the confirmation window warns that the installation is shared', shared.includes('shared WSL installation'), shared);
-  const startDisabled = await evaluate(confirm, "document.getElementById('start').disabled");
-  check('an accepted plan enables the update button', startDisabled === false, String(startDisabled));
-  await evaluate(confirm, "document.getElementById('start').click(), null");
-  await settle(150);
-  check('starting the update goes through the main process', updateStarted === 1, String(updateStarted));
-  await evaluate(confirm, "document.getElementById('cancel').click(), null");
-  await settle(120);
-  check('the confirmation window can be dismissed', updateCloseCalls === 1, String(updateCloseCalls));
+  check('the update window names the install scope', scope.toLowerCase().includes('npm, global user'), scope);
 
-  const progress = await windowFor(720, 520, 'update.js', join(dist, 'update', 'progress.html'));
-  const phase = await evaluate(progress, "document.querySelector('#status')?.dataset.phase ?? ''");
-  check('the terminal window shows the running phase', phase === 'installing', phase);
-  const lines = await evaluate(progress, "document.querySelector('#terminal')?.textContent ?? ''");
-  check('the terminal shows the updater output', lines.includes('update: previous package copied to'), lines.slice(0, 60));
-  const closeDisabled = await evaluate(progress, "document.getElementById('close').disabled");
-  check('the terminal window cannot be closed mid-run', closeDisabled === true, String(closeDisabled));
-
-  // Rolling-cap regression (review blocker D): the main process keeps 400 lines
-  // and publishes how many it dropped. Appending alone would freeze the view.
-  const streamed = Array.from({ length: 450 }, (_, index) => `update: line ${index + 1}`);
-  progress.webContents.send('update:state', {
-    ...updateRunning,
-    phase: 'installing',
-    message: 'Installing 0.2.2-rc.1',
-    lines: streamed.slice(0, 400),
-    dropped: 0,
-  });
-  await settle(150);
-  progress.webContents.send('update:state', {
-    ...updateRunning,
-    phase: 'installing',
-    message: 'Installing 0.2.2-rc.1',
-    lines: streamed.slice(50),
-    dropped: 50,
-  });
-  await settle(200);
-  const tail = await evaluate(progress, "document.querySelector('#terminal')?.textContent ?? ''");
-  check('the terminal keeps streaming past the 400-line cap', tail.includes('update: line 450'), tail.slice(-60));
-  check('the terminal drops the oldest lines instead of freezing', !tail.includes('update: line 1\n'), 'contains line 1');
-
-  progress.webContents.send('update:state', updateDone);
-  await settle(250);
-  const donePhase = await evaluate(progress, "document.querySelector('#status')?.dataset.phase ?? ''");
-  check('a finished update switches the terminal to done', donePhase === 'done', donePhase);
-  const closeEnabled = await evaluate(progress, "document.getElementById('close').disabled");
-  check('the terminal window is closable once the update finished', closeEnabled === false, String(closeEnabled));
-  const keptLines = await evaluate(progress, "document.querySelector('#terminal')?.textContent ?? ''");
-  check(
-    'the terminal keeps the earlier output instead of replacing it',
-    keptLines.includes('update: previous package copied to') && keptLines.includes('is serving the WebUI'),
+  const commands = await evaluate(
+    confirm,
+    "Array.from(document.querySelectorAll('#command-list code')).map((node) => node.textContent)",
   );
+  check('the update window shows the stop/install/start commands', commands.length === 3, JSON.stringify(commands));
+  check('the first command stops the system unit', commands[0] === 'sudo systemctl stop dsh-web.service', commands[0]);
+  check('the install command names the exact version', commands[1] === 'npm install -g @deepseek-ai/dsh@0.2.2-rc.1', commands[1]);
+  check('the last command starts the unit again', commands[2] === 'sudo systemctl start dsh-web.service', commands[2]);
+  const copyButtons = await evaluate(confirm, "document.querySelectorAll('#command-list button').length");
+  check('every command has its own copy button', copyButtons === 3, String(copyButtons));
+  const copyAll = await evaluate(confirm, "document.getElementById('copy-all')?.hidden ?? true");
+  check('the window offers Copy all', copyAll === false, String(copyAll));
+  const password = await evaluate(confirm, "document.querySelectorAll('input[type=password]').length");
+  check('the window never asks for a password', password === 0, String(password));
 
-  // The rollback phase is reported as a finished, closable state.
-  progress.webContents.send('update:state', {
-    ...updateRunning,
-    phase: 'rolled-back',
-    message: 'Update failed, previous version restored',
-    detail: 'The previous installation was restored. The previous version is running again.',
-  });
+  await evaluate(confirm, "document.getElementById('recheck').click(), null");
   await settle(200);
-  const rolledBack = await evaluate(progress, "document.querySelector('#status')?.dataset.phase ?? ''");
-  const rollbackClose = await evaluate(progress, "document.getElementById('close').disabled");
-  check('a rolled-back update is reported and closable', rolledBack === 'rolled-back' && rollbackClose === false, rolledBack);
+  check('Check again re-runs the read-only inspection', updateRechecks === 1, String(updateRechecks));
 
-  return { confirm, progress, done: updateDone };
+  await evaluate(confirm, "document.getElementById('close').click(), null");
+  await settle(120);
+  check('the update window can be dismissed', updateCloseCalls === 1, String(updateCloseCalls));
+
+  return { confirm, probe: updateProbe };
 }
 
-async function writeScreenshots(bar, updateWindows) {
+async function writeScreenshots(bar) {
   mkdirSync(outDir, { recursive: true });
 
-  // Issue #12: the two steps of a one-click update. The checks above leave the
-  // terminal in the rolled-back state on purpose, so the documentation image asks
-  // for the successful end state first (issue #21). This runs only with
-  // `--write-images`, never in `chrome:smoke`. It is captured before the composed
-  // windows below, because an occluded window may otherwise be captured from a
-  // stale frame.
-  updateWindows.progress.webContents.send('update:state', updateWindows.done);
-  updateWindows.progress.moveTop();
-  await settle(300);
-  writeFileSync(join(outDir, 'update-terminal.png'), (await updateWindows.progress.webContents.capturePage()).toPNG());
-
-  // The confirmation image must show the real pre-confirmation state. The checks
-  // clicked Update, which disables the button for good, so a fresh page is loaded
-  // with the same fixture IPC instead of reusing that instance - and no DOM hack
-  // may enable the button again (issue #21 review, D1).
-  const confirmShot = await windowFor(620, 520, 'update.js', join(dist, 'update', 'confirm.html'));
+  // Issue #12: the manual update window. The checks clicked buttons, so a fresh
+  // page is loaded with the same fixture IPC for the documentation image.
+  const confirmShot = await windowFor(640, 620, 'update.js', join(dist, 'update', 'confirm.html'));
   await waitForText(confirmShot, '#target', updateProbe.target);
-  const startEnabled = await evaluate(confirmShot, "document.getElementById('start').disabled === false");
-  if (!startEnabled) throw new Error('the confirmation page did not offer the Update action');
   confirmShot.moveTop();
   await settle(250);
   // The documentation capture is sized to its content so the image has no scrollbar
-  // and no clipped bullets; the production window keeps its own size.
+  // and no clipped lines; the production window keeps its own size.
   const overflow = await evaluate(
     confirmShot,
     '(() => { const m = document.querySelector("main"); return m.scrollHeight - m.clientHeight; })()',
   );
   if (overflow > 0) {
-    confirmShot.setContentSize(620, 520 + Math.ceil(overflow) + 1);
+    confirmShot.setContentSize(640, 620 + Math.ceil(overflow) + 1);
     await settle(200);
   }
   writeFileSync(join(outDir, 'update-confirm.png'), (await confirmShot.webContents.capturePage()).toPNG());
@@ -463,8 +373,8 @@ async function main() {
   registerIpc();
   const bar = await checkFooter();
   await checkPopover();
-  const updateWindows = await checkUpdateWindows();
-  if (writeImages) await writeScreenshots(bar, updateWindows);
+  await checkUpdateWindows();
+  if (writeImages) await writeScreenshots(bar);
   const failed = results.filter((result) => !result.ok);
   if (failed.length > 0) {
     throw new Error(`${failed.length} chrome check(s) failed`);

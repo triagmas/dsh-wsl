@@ -118,48 +118,27 @@ export interface VersionSnapshot {
 }
 
 /**
- * What the update confirmation window shows (issue #12). It is a snapshot: the
- * window renders it and never queries WSL itself.
+ * What the update window shows. It is a snapshot: the window renders it and
+ * never queries WSL or runs a command itself.
  */
 export interface UpdateProbe {
-  /** Version currently in use, `null` while unknown. */
+  /** Version the executable on disk reports, `null` while unknown. */
   installed: string | null;
-  /** Exact published version the update would install. */
+  /** Exact published version, `null` while the lookup has not succeeded. */
   target: string | null;
   distro: string;
-  /** Executable the launcher uses — the shared WSL installation (issue #17). */
+  /** Executable the launcher uses — the WSL installation (issue #17). */
   dshPath: string | null;
   /** How that installation is managed: `npm`, `pnpm` or `unknown`. */
   installManager: string;
   /** Human-readable scope, for example "user (~/.npm-global)". */
   installScope: string;
-  /** Always true: the WSL terminal runs the same executable. */
-  sharedWithTerminal: boolean;
-  /** True when the update may be started; `reason` explains a refusal. */
-  eligible: boolean;
-  /** Machine-readable refusal code, `null` when eligible. */
-  reason: string | null;
-  /** Human-readable explanation for the window. */
+  /** Exact commands the owner runs in a WSL terminal, in order. */
+  commands: string[];
+  /** Why no command is shown, or the context of the shown ones. */
   description: string | null;
-  /** Command the user can run when the app refuses to touch the installation. */
-  manualCommand: string | null;
-  /** True while an update is already running. */
-  running: boolean;
-}
-
-export interface ManagedRuleHint {
-  unit: string;
-  user: string;
-  /** The exact `sudoers` line the app installs; shown before asking anything. */
-  line: string;
-}
-
-export interface UpdateStartResult {
-  started: boolean;
-  reason: string | null;
-  description: string | null;
-  /** Set when the updater needs one password to be allowed to stop the backend. */
-  rule?: ManagedRuleHint | null;
+  /** `installed` and `target` agree, differ, or cannot be compared. */
+  state: 'pending' | 'installed' | 'unknown';
 }
 
 export interface ConfigPatch {

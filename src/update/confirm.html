@@ -6,23 +6,18 @@
     <title>Update DeepSeek Harness</title>
     <link rel="stylesheet" href="update.css" />
   </head>
-  <body>
+  <body class="manual-update">
     <main>
-      <h1>Update DeepSeek Harness</h1>
+      <h1>DeepSeek Harness update</h1>
       <p class="lead">
-        The DeepSeek Harness installed in your WSL distribution is updated in place with the exact published version.
-        This is the same <code>dsh</code> that an ordinary <code>dsh web</code> in a WSL terminal runs.
-      </p>
-
-      <p class="warn" id="shared">
-        This changes the shared WSL installation, not an app-private copy: a terminal started afterwards uses the new
-        version too.
+        DSH WSL does not change the installation itself. It reports the version it found and the exact commands you run
+        in a WSL terminal.
       </p>
 
       <dl class="facts">
         <dt>Installed</dt>
         <dd id="installed">—</dd>
-        <dt>New version</dt>
+        <dt>Available</dt>
         <dd id="target" class="target">—</dd>
         <dt>Distribution</dt>
         <dd id="distro">—</dd>
@@ -32,38 +27,25 @@
         <dd id="scope">—</dd>
       </dl>
 
-      <p class="warn" id="blocked" hidden></p>
+      <p class="status" id="status" data-state="checking">Checking the installation…</p>
+      <p class="detail" id="description" hidden></p>
 
-      <section class="rule" id="rule" hidden>
-        <p class="rule-lead">
-          The DeepSeek Harness serving this window runs as the systemd unit <code id="rule-unit">—</code>, which only
-          root can stop. Type your WSL password once: the app installs exactly one line that lets it stop and start
-          that single unit, and never asks again.
-        </p>
-        <p class="rule-line"><code id="rule-line">—</code></p>
-        <label class="rule-field">
-          <span>WSL password for <code id="rule-user">—</code></span>
-          <input type="password" id="rule-pass" autocomplete="off" spellcheck="false" />
-        </label>
-        <div class="actions rule-actions">
-          <button type="button" id="rule-cancel" class="secondary">Not now</button>
-          <button type="button" id="rule-install" class="primary">Install and update</button>
+      <section class="commands" id="commands" hidden>
+        <div class="commands-head">
+          <h2>Run in a WSL terminal</h2>
+          <button type="button" id="copy-all" class="secondary small">Copy all</button>
         </div>
-        <p class="rule-error" id="rule-error" hidden></p>
+        <ol class="command-list" id="command-list"></ol>
+        <p class="hint">
+          Run the lines in this order. When the last one has finished, press <strong>Check again</strong>.
+        </p>
       </section>
-      <p class="hint" id="manual" hidden></p>
 
-      <ul class="notes">
-        <li>Only <code>@deepseek-ai/dsh</code> in that npm prefix is replaced; no other package is touched.</li>
-        <li>Your isolated data directory (<code>DSH_HOME</code>, sessions, settings, caches) is kept.</li>
-        <li>The official Windows app, your projects and your npm configuration are not touched.</li>
-        <li>If the update fails, the previous exact version is reinstalled and restarted.</li>
-        <li>The app restarts itself after a successful update.</li>
-      </ul>
+      <p class="copied" id="copied" role="status" aria-live="polite"></p>
 
       <div class="actions">
-        <button type="button" id="cancel" class="secondary">Cancel</button>
-        <button type="button" id="start" class="primary">Update</button>
+        <button type="button" id="close" class="secondary">Close</button>
+        <button type="button" id="recheck" class="primary">Check again</button>
       </div>
     </main>
     <script src="confirm.js"></script>

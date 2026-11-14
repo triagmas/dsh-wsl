@@ -10,9 +10,9 @@
  *   it lets a new Setup EXE upgrade an existing installation instead of creating a
  *   second, unrelated one.
  * - `PROFILE_DIRECTORY` — the on-disk profile (`%APPDATA%\wsl-web-shell`) that holds
- *   `config.json`, logs, the owned-server registry, the versions cache and the update
- *   journal. Renaming it would silently orphan the user's settings, ports and update
- *   state, so the directory keeps its original name forever.
+ *   `config.json`, logs, the owned-server registry and the versions cache. Renaming
+ *   it would silently orphan the user's settings and port choice, so the directory
+ *   keeps its original name forever.
  */
 
 /** User-facing product name. */

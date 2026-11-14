@@ -2,11 +2,10 @@
  * Which DeepSeek Harness installation is really running (issue #17).
  *
  * DSH WSL no longer ships or prefers a private copy of `dsh`: the app must launch
- * the same executable an ordinary WSL terminal would launch, and its update
- * feature must change exactly that installation. This module turns the read-only
- * inspection report into a typed description and answers the questions the
- * update policy needs — is this an npm global install, which prefix owns it, is
- * that prefix writable without elevated rights, what version does it report.
+ * the same executable an ordinary WSL terminal would launch. This module turns
+ * the read-only inspection report into a typed description: which package manager
+ * owns it, which prefix, whether that prefix is writable without elevated rights
+ * and what version it reports — the facts the manual update window shows.
  *
  * Pure module: no fs, no Electron, no process spawning.
  */
@@ -25,8 +24,7 @@ export interface DshInstallation {
   realPath: string;
   /** True when `path` is a symlink or a generated shim. */
   symlink: boolean;
-  /** Version reported by the executable, `null` when unparseable. */
-  version: string | null;
+  /** Version reported by the executable, `null` when unparseable. */  version: string | null;
   manager: InstallManager;
   /** Global prefix reported by the package manager, `null` when unknown. */
   prefix: string | null;
@@ -160,66 +158,10 @@ function asPids(value: string): number[] {
   return pids;
 }
 
-/**
- * Is `candidate` inside `directory`?
- *
- * Exact, component-wise containment: `/usr/local/lib/node_modules/@deepseek-ai/dsh-old`
- * is not inside `/usr/local/lib/node_modules/@deepseek-ai/dsh`, and a path that
- * merely starts with the same characters is rejected as well.
- */
-export function isInsideDirectory(candidate: string | null, directory: string | null): boolean {
-  if (candidate === null || directory === null) return false;
-  if (!isValidRuntimeBinary(candidate) || !isValidRuntimeBinary(directory)) return false;
-  const base = directory.replace(/\/+$/, '');
-  if (candidate === base) return true;
-  return candidate.startsWith(`${base}/`);
-}
-
 /** Human-readable installation scope for the UI, derived from the npm prefix. */
 export function describeInstallScope(prefix: string | null): string {
   if (prefix === null) return 'unknown';
   if (prefix === '/usr/local' || prefix === '/usr') return `system-wide (${prefix})`;
   if (prefix.startsWith('/opt/')) return `system-wide (${prefix})`;
   return `user (${prefix})`;
-}
-
-/**
- * Does this installation look like an npm global package of DeepSeek Harness?
- *
- * The executable must be the one npm generated for the package, not a file that
- * happens to carry the same name: `realPath` has to live inside the package
- * directory, and the package directory has to be the expected one below the
- * reported prefix.
- */
-export function isNpmGlobalInstallation(installation: DshInstallation): boolean {
-  if (installation.manager !== 'npm') return false;
-  if (!isInsideDirectory(installation.realPath, installation.packageDir)) return false;
-  if (installation.packageDir === null || installation.prefix === null) return false;
-  const expected = `${installation.prefix.replace(/\/+$/, '')}/lib/node_modules/@deepseek-ai/dsh`;
-  const normalisedPackage = installation.packageDir.replace(/\/+$/, '');
-  return normalisedPackage === expected || normalisedPackage === `${installation.prefix.replace(/\/+$/, '')}/node_modules/@deepseek-ai/dsh`;
-}
-
-/**
- * Does the ordinary terminal run exactly the installation the app runs?
- *
- * The product contract is that an update changes *the* DeepSeek Harness a WSL
- * login shell uses. That contract cannot be verified when the shell resolves
- * nothing (no `bash`, no `dsh` on its `PATH`, an unreadable profile) or when it
- * cannot report a version — an unknown answer is not agreement (review C1), so
- * those cases return `false` and the caller refuses to update.
- */
-export function loginShellAgrees(installation: DshInstallation): boolean {
-  if (installation.loginShellRealPath === null) return false;
-  if (installation.loginShellRealPath !== installation.realPath) return false;
-  if (installation.loginShellVersion === null) return false;
-  if (installation.version === null) return false;
-  // Same file, same version: the shell must report what the app runs.
-  return installation.loginShellVersion === installation.version;
-}
-
-/** One-line description for logs: never contains tokens or session data. */
-export function describeInstallation(installation: DshInstallation): string {
-  const version = installation.version ?? 'unknown';
-  return `${installation.path} (${version}, ${installation.manager} ${describeInstallScope(installation.prefix)}, source=${installation.source})`;
 }

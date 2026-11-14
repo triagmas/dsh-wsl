@@ -9,7 +9,6 @@ import { BrowserWindow, WebContentsView, screen, session, shell, type Session } 
 import { join } from 'node:path';
 import type { Logger } from '../core/logger.js';
 import type { ShellStatus, VersionSnapshot } from '../../shared/types.js';
-import { isUpdateRunning, type UpdateState } from '../core/update.js';
 import { computePopoverBounds, computeViewBounds, type PopoverAnchor } from '../core/footer.js';
 import {
   decideExternalHandoff,
@@ -69,10 +68,8 @@ export class Windows {
   private settings: BrowserWindow | null = null;
   private popover: BrowserWindow | null = null;
   private popoverClosedAt = 0;
-  /** Issue #12: confirmation window and the modal terminal window. */
+  /** Manual update window (issue #12 follow-up). */
   private updateConfirm: BrowserWindow | null = null;
-  private updateProgress: BrowserWindow | null = null;
-  private updateState: UpdateState | null = null;
   private status: ShellStatus | null = null;
   private versions: VersionSnapshot | null = null;
   /** True once the app is definitively quitting; close then really closes. */
@@ -701,17 +698,13 @@ export class Windows {
     this.settingsWindow?.close();
   }
 
-  get updateProgressOpen(): boolean {
-    return this.updateProgress !== null && !this.updateProgress.isDestroyed();
-  }
-
   get updateConfirmOpen(): boolean {
     return this.updateConfirm !== null && !this.updateConfirm.isDestroyed();
   }
 
   /**
-   * Confirmation window (issue #12): shows target, current version, distribution
-   * and the runtime that would be replaced. It never starts anything by itself.
+   * Manual update window: installed and available version plus the commands the
+   * owner runs in a WSL terminal. It never starts, stops or installs anything.
    */
   openUpdateConfirm(): void {
     if (this.updateConfirmOpen) {
@@ -719,77 +712,30 @@ export class Windows {
       this.updateConfirm?.focus();
       return;
     }
-    const window = this.createUpdateWindow({
-      page: 'confirm.html',
-      width: 560,
-      height: 460,
-      title: 'DSH WSL — Update DeepSeek Harness',
-      modal: true,
-    });
+    const window = this.createUpdateWindow();
     window.on('closed', () => {
       this.updateConfirm = null;
     });
     this.updateConfirm = window;
   }
 
-  /** Modal terminal window that shows the updater output while it runs. */
-  openUpdateProgress(): void {
-    if (this.updateProgressOpen) {
-      this.updateProgress?.show();
-      this.updateProgress?.focus();
-      return;
-    }
-    const window = this.createUpdateWindow({
-      page: 'progress.html',
-      width: 720,
-      height: 520,
-      title: 'DSH WSL — Updating DeepSeek Harness',
-      modal: true,
-    });
-    // The window must not disappear while the runtime is being swapped: a user
-    // closing it would hide the outcome and invite a quit mid-transaction.
-    window.setClosable(false);
-    window.on('close', (event) => {
-      if (this.updateState !== null && isUpdateRunning(this.updateState.phase)) {
-        event.preventDefault();
-        this.options.log.warn('update window close blocked: an update is running');
-        this.updateProgress?.flashFrame(true);
-        this.sendUpdateState(window, this.updateState);
-      }
-    });
-    window.on('closed', () => {
-      this.updateProgress = null;
-    });
-    window.once('ready-to-show', () => {
-      window.show();
-      if (this.updateState !== null) this.sendUpdateState(window, this.updateState);
-    });
-    this.updateProgress = window;
-  }
-
   /**
-   * Update windows are local pages with the same hardening as the settings
-   * window: sandboxed, context-isolated, no navigation, no popups.
+   * The manual update page with the same hardening as the settings window:
+   * sandboxed, context-isolated, no navigation, no popups.
    */
-  private createUpdateWindow(options: {
-    page: string;
-    width: number;
-    height: number;
-    title: string;
-    modal: boolean;
-  }): BrowserWindow {
+  private createUpdateWindow(): BrowserWindow {
     const parent = this.mainWindow;
     const window = new BrowserWindow({
-      width: options.width,
-      height: options.height,
-      resizable: options.page === 'progress.html',
+      width: 640,
+      height: 620,
+      resizable: false,
       minimizable: false,
       maximizable: false,
       fullscreenable: false,
-      title: options.title,
+      title: 'DSH WSL — Update DeepSeek Harness',
       backgroundColor: '#0b0f16',
       parent: parent ?? undefined,
-      modal: options.modal && parent !== null,
+      modal: parent !== null,
       show: false,
       webPreferences: {
         preload: join(this.options.preloadDir, 'update.js'),
@@ -807,7 +753,7 @@ export class Windows {
     });
     window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     window
-      .loadFile(join(this.options.rendererDir, 'update', options.page))
+      .loadFile(join(this.options.rendererDir, 'update', 'confirm.html'))
       .catch((error: unknown) => {
         this.options.log.error(`update window load failed: ${error instanceof Error ? error.message : 'unknown'}`);
       });
@@ -815,44 +761,16 @@ export class Windows {
     return window;
   }
 
-  /** Push the update state to both update windows. */
-  publishUpdate(state: UpdateState): void {
-    this.updateState = state;
-    // The window is closable again as soon as the run reached a final phase.
-    const progress = this.updateProgress;
-    if (progress !== null && !progress.isDestroyed()) {
-      const running = isUpdateRunning(state.phase);
-      progress.setClosable(!running);
-      if (!running) progress.flashFrame(false);
-    }
-    for (const window of [this.updateConfirm, this.updateProgress]) {
-      if (window === null || window.isDestroyed() || window.webContents.isDestroyed()) continue;
-      this.sendUpdateState(window, state);
-    }
-  }
-
-  private sendUpdateState(window: BrowserWindow, state: UpdateState): void {
-    window.webContents.send('update:state', state);
-  }
-
-  /** Dismiss the confirmation window without touching a running update. */
+  /** Dismiss the manual update window; it owns no running work. */
   closeUpdateConfirm(): void {
     if (this.updateConfirm !== null && !this.updateConfirm.isDestroyed()) this.updateConfirm.destroy();
-    this.updateConfirm = null;
-  }
-
-  closeUpdateWindows(): void {
-    for (const window of [this.updateProgress, this.updateConfirm]) {
-      if (window !== null && !window.isDestroyed()) window.destroy();
-    }
-    this.updateProgress = null;
     this.updateConfirm = null;
   }
 
   destroyAll(): void {
     this.setQuitting();
     this.closeSettingsPopover();
-    this.closeUpdateWindows();
+    this.closeUpdateConfirm();
     this.destroyBackendView();
     for (const window of [this.settings, this.splash, this.main]) {
       if (window !== null && !window.isDestroyed()) window.destroy();

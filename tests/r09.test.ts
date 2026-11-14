@@ -186,16 +186,12 @@ describe('main process wiring', () => {
     expect(windowsSource).toContain('this.layoutLogged = false');
   });
 
-  it('keeps DSH installation inside the confirmed update path (issue #17)', () => {
-    // The launcher never installs anything: npm runs only inside the fixed WSL
-    // updater scripts, and only when the user confirmed the update. This guard
-    // fails when a new module starts mentioning an install outside the path.
+  it('never installs anything, only prints the command for the owner', () => {
+    // The app lost the updater: the only place an install command may exist is
+    // the read-only plan that renders it for the owner to copy.
     const allowed = new Set([
-      'src/main/wsl/update-args.ts', // the scripts that actually run npm
+      'src/main/core/manual-update.ts', // builds the copyable command
       'src/main/wsl/gateway.ts', // "install it the usual way" guidance
-      'src/main/core/update.ts', // documents that the target becomes an npm operand
-      'src/main/core/update-runner.ts', // documents the install step it drives
-      'src/main/core/update-recovery.ts', // manual recovery instructions
     ]);
     const mentions = sourceFiles('src/main').filter((file) => /npm install/.test(read(file)));
     expect(mentions.length).toBeGreaterThan(0);
@@ -222,11 +218,9 @@ describe('main process wiring', () => {
     );
     expect(sessionBlock).toContain('this.options.onSessionEnd?.()');
     expect(indexSource).toContain('onSessionEnd:');
-    expect(indexSource).toContain("quit('session-end')");
+    expect(indexSource).toContain('quit();');
     expect(indexSource).toContain('system session end: quitting gracefully');
-    expect(indexSource).toContain('session end during update');
-    // Quit hands the backend off untouched; only the update relaunch path may
-    // stop it through the owned-process shutdown.
+    // Quit hands the backend off untouched: it outlives the app.
     const quitBlock = indexSource.slice(
       indexSource.indexOf('const quit = ('),
       indexSource.indexOf('const startTray ='),
