@@ -224,7 +224,13 @@ export interface WslGateway {
    */
   prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupAttempt>;
   /** Remove recovery snapshots beyond the newest few. Never blocks an update. */
-  pruneUpdateSnapshots(request: { distro: string; appRoot: string; keep: number }): Promise<{ removed: string[] }>;
+  pruneUpdateSnapshots(request: {
+    distro: string;
+    appRoot: string;
+    keep: number;
+    /** Snapshot of the running transaction, never a pruning candidate. */
+    transaction: string;
+  }): Promise<{ removed: string[] }>;
   /** Update the shared installation, streaming npm output. */
   updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
   /** Reinstall the previous exact version (failure path and journal recovery). */

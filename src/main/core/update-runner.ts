@@ -251,7 +251,6 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
 
     async run(plan: SharedUpdatePlan, context: UpdateContext): Promise<UpdateOutcome> {
       if (busy) return { ok: false, state };
-      busy = true;
       terminal.clear();
       state = {
         ...createUpdateState(deps.now()),
@@ -261,12 +260,14 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
       // Refuse before the first expensive step. An update replaces the files the
       // running backend executes, and the self-check that used to catch this ran
       // after a minute of snapshot work, so the owner saw a failure that cost a
-      // gigabyte and told him nothing he could act on.
+      // gigabyte and told him nothing he could act on. The refusal happens before
+      // `busy` is set: a run that never started must not claim the runner.
       const blocker = deps.lifecycle.updateBlocker();
       if (blocker !== null) {
         deps.log.warn(`update refused before anything was read: ${blocker}`);
         return { ok: false, state: fail(blocker) };
       }
+      busy = true;
       publish({ phase: 'checking', message: describeUpdatePhase('checking'), detail: null });
       deps.log.info(`update: checking ${plan.version} on npm (distro=${plan.distro})`);
       const startedAt = deps.now();
@@ -382,7 +383,12 @@ export function createUpdateRunner(deps: UpdateRunnerDeps): UpdateRunner {
         // so the run always keeps a usable one even when pruning fails.
         if (deps.journal.read() === null) {
           const pruned = await deps.wsl
-            .pruneUpdateSnapshots({ distro: verified.distro, appRoot: verified.appRoot, keep: SNAPSHOT_RETENTION })
+            .pruneUpdateSnapshots({
+              distro: verified.distro,
+              appRoot: verified.appRoot,
+              keep: SNAPSHOT_RETENTION,
+              transaction: context.transaction,
+            })
             .catch((error: unknown) => {
               deps.log.warn(
                 `update: old recovery snapshots were left in place: ${

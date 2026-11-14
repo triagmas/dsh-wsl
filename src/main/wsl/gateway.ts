@@ -698,7 +698,12 @@ export function createWslGateway(options: WslGatewayOptions): WslGateway {
       return { ok: true, snapshot: { path: report.path, files: report.files } };
     },
 
-    async pruneUpdateSnapshots(request: { distro: string; appRoot: string; keep: number }) {
+    async pruneUpdateSnapshots(request: {
+      distro: string;
+      appRoot: string;
+      keep: number;
+      transaction: string;
+    }) {
       let result: CommandResult;
       try {
         result = await run(buildPruneSnapshotsArgs(request), pruneTimeoutMs);

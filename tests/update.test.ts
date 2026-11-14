@@ -603,14 +603,16 @@ interface RunnerHarness {
   runner: ReturnType<typeof createUpdateRunner>;
 }
 
-function runnerHarness(options: { pauseOk?: boolean; resumeOk?: boolean; blocker?: string } = {}): RunnerHarness {
+function runnerHarness(
+  options: { pauseOk?: boolean; resumeOk?: boolean; blocker?: string | (() => string | null) } = {},
+): RunnerHarness {
   const order: string[] = [];
   const published: string[] = [];
   const phases: string[] = [];
   const wsl = new FakeWsl();
   const store = memoryJournal(null);
   const lifecycle: UpdateLifecycle = {
-    updateBlocker: () => options.blocker ?? null,
+    updateBlocker: () => (typeof options.blocker === 'function' ? options.blocker() : (options.blocker ?? null)),
     pauseForUpdate: async () => {
       order.push('pause');
       return { ok: options.pauseOk !== false, message: options.pauseOk === false ? 'port still busy' : null };
@@ -665,6 +667,21 @@ describe('update runner transaction (issue #17)', () => {
     expect(h.wsl.updateRuns).toHaveLength(0);
     expect(h.journal.current()).toBeNull();
     expect(h.order).toEqual([]);
+  });
+
+  it('does not leave the runner busy after a refusal', async () => {
+    let blocked: string | null = 'The backend serving the WebUI was started outside this app.';
+    const h = runnerHarness({ blocker: () => blocked });
+
+    const refused = await h.runner.run(acceptedPlan(), context);
+    expect(refused.ok).toBe(false);
+    // A refusal that never started must not claim the runner: the next attempt has
+    // to be accepted as soon as the owner clears the obstacle.
+    expect(h.runner.running()).toBe(false);
+
+    blocked = null;
+    const second = await h.runner.run(acceptedPlan(), context);
+    expect(second.ok).toBe(true);
   });
 
   it('prunes old recovery snapshots after the new one is verified', async () => {

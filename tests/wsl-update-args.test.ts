@@ -451,15 +451,16 @@ describe('scripts never depend on the retired private runtime', () => {
 
 describe('snapshot pruning', () => {
   it('keeps the newest snapshots and refuses a malformed count', () => {
-    const argv = buildPruneSnapshotsArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, keep: 2 });
+    const tx = '20261114T021103Z-9d42';
+    const argv = buildPruneSnapshotsArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, keep: 2, transaction: tx });
     expect(argv.slice(0, 6)).toEqual(['-d', 'Ubuntu', '--exec', '/bin/sh', '-c', PRUNE_SNAPSHOTS_SCRIPT]);
-    expect(argv.slice(6)).toEqual([APP_ROOT, '2']);
-    expect(() => buildPruneSnapshotsArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, keep: -1 })).toThrow(ArgumentError);
-    expect(() => buildPruneSnapshotsArgs({ distro: 'Ubuntu', appRoot: APP_ROOT, keep: 1.5 })).toThrow(ArgumentError);
-    expect(() => buildPruneSnapshotsArgs({ distro: 'Ubuntu', appRoot: 'relative', keep: 2 })).toThrow(ArgumentError);
-    expect(() => buildPruneSnapshotsArgs({ distro: 'Ubuntu && rm -rf /', appRoot: APP_ROOT, keep: 2 })).toThrow(
-      ArgumentError,
-    );
+    expect(argv.slice(6)).toEqual([APP_ROOT, '2', tx]);
+    const base = { distro: 'Ubuntu', appRoot: APP_ROOT, keep: 2, transaction: tx };
+    expect(() => buildPruneSnapshotsArgs({ ...base, keep: -1 })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, keep: 1.5 })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, appRoot: 'relative' })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, transaction: '../../x' })).toThrow(ArgumentError);
+    expect(() => buildPruneSnapshotsArgs({ ...base, distro: 'Ubuntu && rm -rf /' })).toThrow(ArgumentError);
   });
 
   it('walks only snapshot directories and never follows a symlink', () => {
@@ -514,7 +515,12 @@ describe('snapshot pruning on a real tree', () => {
     const link = 'shared-backup-20261105T000000Z-ffff';
     symlinkSync(join(upd, names[0] ?? ''), join(upd, link));
 
-    const run = spawnSync('/bin/sh', ['-c', PRUNE_SNAPSHOTS_SCRIPT, '-', '2'], {
+    // The snapshot of the running transaction is created first and deliberately
+    // given the oldest mtime: a clock correction must not turn it into a victim.
+    const currentTx = '20261100T000000Z-0000';
+    const current = `shared-backup-${currentTx}`;
+    make(current, 1_700_000_000);
+    const run = spawnSync('/bin/sh', ['-c', PRUNE_SNAPSHOTS_SCRIPT, '-', '2', currentTx], {
       env: { ...process.env, HOME: home },
       encoding: 'utf8',
     });
@@ -524,6 +530,7 @@ describe('snapshot pruning on a real tree', () => {
     expect(existsSync(join(upd, names[1] ?? ''))).toBe(false);
     expect(existsSync(join(upd, names[2] ?? ''))).toBe(true);
     expect(existsSync(join(upd, names[3] ?? ''))).toBe(true);
+    expect(existsSync(join(upd, current))).toBe(true);
     expect(existsSync(join(upd, running))).toBe(true);
     expect(existsSync(join(upd, 'something-else'))).toBe(true);
     // The link is checked without following it: its target was just pruned, so it

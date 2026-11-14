@@ -998,10 +998,13 @@ const SNAPSHOT_PRUNE_MARKER = '__dsh_wsl_prune__';
  */
 export const PRUNE_SNAPSHOTS_SCRIPT = [
   'set -u',
-  'app_root="$0"; keep="$1"',
+  'app_root="$0"; keep="$1"; tx="$2"',
   'case "$keep" in ""|*[!0-9]*) echo "prune: rejected keep count" >&2; exit 64 ;; esac',
+  'case "$tx" in ""|*[!0-9A-Za-z-]*) echo "prune: rejected transaction id" >&2; exit 64 ;; esac',
   BACKUP_BASE_HELPER,
   'backup_base "$app_root" || exit 79',
+  'marker="$upd/.snapshot-prune-failed"',
+  'rm -f -- "$marker" 2>/dev/null || true',
   'find "$upd" -mindepth 1 -maxdepth 1 -type d -name "shared-backup-[0-9]*" ! -name "*.tmp" -printf "%T@ %p\\n" 2>/dev/null \\',
   '| LC_ALL=C sort -rn \\',
   '| tail -n +"$((keep + 1))" \\',
@@ -1009,10 +1012,14 @@ export const PRUNE_SNAPSHOTS_SCRIPT = [
   'p="${line#* }"',
   'case "$p" in "$upd"/shared-backup-[0-9]*) ;; *) echo "prune: [$p] is outside $upd" >&2; continue ;; esac',
   '[ -L "$p" ] && { echo "prune: $p is a symlink, kept" >&2; continue; }',
+  // The snapshot of the running transaction may be the oldest by mtime after a
+  // clock correction, and deleting it would destroy the run\'s own recovery point.
+  'case "$p" in "$upd/shared-backup-$tx") echo "prune: $p is this transaction, kept" >&2; continue ;; esac',
   'if rm -rf -- "$p" 2>/dev/null && [ ! -e "$p" ]; then',
   `printf "%s removed=%s\\n" "${SNAPSHOT_PRUNE_MARKER}" "$p"`,
-  'else echo "prune: $p could not be removed" >&2; fi',
+  'else echo "prune: $p could not be removed" >&2; : > "$marker" 2>/dev/null || true; fi',
   'done',
+  'if [ -e "$marker" ]; then rm -f -- "$marker" 2>/dev/null || true; exit 80; fi',
   'exit 0',
 ].join('\n');
 
@@ -1021,7 +1028,12 @@ export const PRUNE_SNAPSHOTS_SCRIPT = [
  *
  * `$0` = app data root, `$1` = snapshots to keep, both validated.
  */
-export function buildPruneSnapshotsArgs(request: { distro: string; appRoot: string; keep: number }): string[] {
+export function buildPruneSnapshotsArgs(request: {
+  distro: string;
+  appRoot: string;
+  keep: number;
+  transaction: string;
+}): string[] {
   if (!Number.isInteger(request.keep) || request.keep < 0 || request.keep > 16) {
     throw new ArgumentError('invalid-keep-count');
   }
@@ -1034,6 +1046,7 @@ export function buildPruneSnapshotsArgs(request: { distro: string; appRoot: stri
     PRUNE_SNAPSHOTS_SCRIPT,
     appRootArg(request.appRoot),
     String(request.keep),
+    assertTransaction(request.transaction),
   ];
 }
 
