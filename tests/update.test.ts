@@ -603,13 +603,14 @@ interface RunnerHarness {
   runner: ReturnType<typeof createUpdateRunner>;
 }
 
-function runnerHarness(options: { pauseOk?: boolean; resumeOk?: boolean } = {}): RunnerHarness {
+function runnerHarness(options: { pauseOk?: boolean; resumeOk?: boolean; blocker?: string } = {}): RunnerHarness {
   const order: string[] = [];
   const published: string[] = [];
   const phases: string[] = [];
   const wsl = new FakeWsl();
   const store = memoryJournal(null);
   const lifecycle: UpdateLifecycle = {
+    updateBlocker: () => options.blocker ?? null,
     pauseForUpdate: async () => {
       order.push('pause');
       return { ok: options.pauseOk !== false, message: options.pauseOk === false ? 'port still busy' : null };
@@ -649,6 +650,33 @@ const context: UpdateContext = {
 };
 
 describe('update runner transaction (issue #17)', () => {
+  it('refuses before the snapshot when the backend runs outside the app', async () => {
+    const h = runnerHarness({
+      blocker:
+        'The backend serving the WebUI was started outside this app, and an update replaces the files it is running.',
+    });
+    const outcome = await h.runner.run(acceptedPlan(), context);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.state.detail).toContain('started outside this app');
+    // Nothing was read from npm, nothing was copied, nothing was written.
+    expect(h.wsl.prunedSnapshots).toHaveLength(0);
+    expect(h.wsl.backupRequests).toHaveLength(0);
+    expect(h.wsl.updateRuns).toHaveLength(0);
+    expect(h.journal.current()).toBeNull();
+    expect(h.order).toEqual([]);
+  });
+
+  it('prunes old recovery snapshots after the new one is verified', async () => {
+    const h = runnerHarness();
+    h.wsl.pruneRemoved = ['/home/dev/.local/share/wsl-web-shell/update/shared-backup-old'];
+    const outcome = await h.runner.run(acceptedPlan(), context);
+
+    expect(outcome.ok).toBe(true);
+    expect(h.wsl.prunedSnapshots).toHaveLength(1);
+    expect(h.wsl.prunedSnapshots[0]?.keep).toBe(2);
+  });
+
   it('inspects, stops the owned backend, updates, verifies and only then reports done', async () => {
     const h = runnerHarness();
     const outcome = await h.runner.run(acceptedPlan(), context);

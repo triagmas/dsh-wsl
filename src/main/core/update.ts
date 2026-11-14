@@ -714,6 +714,16 @@ export class UpdateJournalError extends Error {
  * that as "nothing happened" would start DeepSeek Harness on top of an
  * installation whose state is unknown.
  */
+/**
+ * How many verified recovery snapshots are kept on disk.
+ *
+ * A snapshot is deleted only by the transaction that owns it, and a rollback
+ * always uses the snapshot of its own transaction, so older copies add disk use
+ * instead of safety. Two leaves one manual fallback for the owner without letting
+ * a habit of updating grow the app data root without bound.
+ */
+export const SNAPSHOT_RETENTION = 2;
+
 export interface UpdateJournalStore {
   read(): UpdateJournal | null;
   write(journal: UpdateJournalV2): void;

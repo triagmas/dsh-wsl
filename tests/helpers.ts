@@ -207,6 +207,14 @@ export class FakeWsl implements WslGateway {
     };
   }
 
+  readonly prunedSnapshots: { distro: string; appRoot: string; keep: number }[] = [];
+  pruneRemoved: string[] = [];
+
+  async pruneUpdateSnapshots(request: { distro: string; appRoot: string; keep: number }): Promise<{ removed: string[] }> {
+    this.prunedSnapshots.push(request);
+    return { removed: this.pruneRemoved };
+  }
+
   async updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult> {
     this.updateRuns.push(request);
     for (const line of this.updateRunLines) onLine(line);

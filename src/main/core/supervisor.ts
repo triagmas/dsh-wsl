@@ -223,6 +223,8 @@ export interface WslGateway {
    * when the snapshot cannot be proven; the update must not start then.
    */
   prepareSharedBackup(request: PrepareBackupRequest): Promise<BackupAttempt>;
+  /** Remove recovery snapshots beyond the newest few. Never blocks an update. */
+  pruneUpdateSnapshots(request: { distro: string; appRoot: string; keep: number }): Promise<{ removed: string[] }>;
   /** Update the shared installation, streaming npm output. */
   updateSharedDsh(request: SharedUpdateRunRequest, onLine: (line: string) => void): Promise<UpdateRunResult>;
   /** Reinstall the previous exact version (failure path and journal recovery). */
@@ -525,6 +527,22 @@ export class Supervisor {
   }
 
   /** Pause auto-recovery and stop the app-owned backend before the swap. */
+  /**
+   * Why an update must not start right now, or `null` when it may.
+   *
+   * An attached backend runs the very installation an update replaces, so the
+   * refusal has to come before the snapshot: asking first costs nothing, while
+   * discovering it afterwards spends a minute and a gigabyte on a dead end.
+   */
+  updateBlocker(): string | null {
+    if (!this.attached) return null;
+    return (
+      'The backend serving the WebUI was started outside this app, and an update replaces the files it is running. ' +
+      'Stop that backend first (for example `systemctl --user stop dsh-web`), then start the update again: the app ' +
+      'brings the WebUI back after the installation is replaced. Nothing was changed.'
+    );
+  }
+
   pauseForUpdate(): Promise<UpdateTransition> {
     return this.serial(async () => {
       if (this.quitting) return { ok: false, message: 'The app is quitting.' };
