@@ -62,7 +62,9 @@ export interface DshInstallation {
 /** Marker the inspection script prints before every `key=value` line. */
 export const INSPECT_MARKER = '__dsh_wsl_inspect__';
 
-const SAFE_MARKER_VALUE = /^[\w./@+-]*$/;
+// Commas are needed for the pid list (`foreignpids=194,500`); every other value
+// is still validated on its own where it is used (paths, versions, counts).
+const SAFE_MARKER_VALUE = /^[\w./@+,-]*$/;
 
 function asPath(value: string): string | null {
   return isValidRuntimeBinary(value) ? value : null;
@@ -139,7 +141,7 @@ export function parseSharedDshReport(text: string): SharedDshReport {
       npmPath,
       source: asSource(fields.get('source') ?? ''),
       foreignProcesses: asCount(fields.get('foreign') ?? '0'),
-      foreignPids: asPids(fields.get('foreign_pids') ?? ''),
+      foreignPids: asPids(fields.get('foreignpids') ?? ''),
       loginShellRealPath,
       loginShellVersion,
     },

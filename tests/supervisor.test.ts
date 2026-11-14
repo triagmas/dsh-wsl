@@ -693,6 +693,14 @@ describe('update preflight', () => {
     expect(harness.wsl.managedCalls.slice(callsBefore).map((call) => call.action)).toEqual(['stop']);
     await supervisor.stopForRollback();
     expect(harness.wsl.managedCalls.slice(callsBefore)).toHaveLength(1);
+
+    // A refused stop is reported, so the caller can abandon the rollback rather
+    // than overwrite files a live process is executing.
+    await supervisor.resumeAfterUpdate();
+    harness.wsl.controlResult = { ok: false, message: 'refused' };
+    const refused = await supervisor.stopForRollback();
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toContain('could not be stopped');
   });
 
   it('never starts a unit whose runtime must not be started', async () => {

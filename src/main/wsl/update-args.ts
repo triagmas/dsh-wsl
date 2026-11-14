@@ -450,7 +450,7 @@ export const INSPECT_SHARED_SCRIPT = [
   `printf "%s package=%s\\n" "${INSPECT_MARKER}" "$pkg"`,
   `printf "%s writable=%s\\n" "${INSPECT_MARKER}" "$writable"`,
   `printf "%s foreign=%s\\n" "${INSPECT_MARKER}" "$(foreign_count "$real" "$own")"`,
-  `printf "%s foreign_pids=%s\\n" "${INSPECT_MARKER}" "$(foreign_list "$real" "$own")"`,
+  `printf "%s foreignpids=%s\\n" "${INSPECT_MARKER}" "$(foreign_list "$real" "$own")"`,
   'exit 0',
 ].join('\n');
 
