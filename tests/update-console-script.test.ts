@@ -1,0 +1,213 @@
+/**
+ * The console script, executed for real (beta.14).
+ *
+ * `update-console.test.ts` pins the text; this file runs the generated script
+ * with fake `sudo`, `systemctl` and `npm` on PATH, so the behaviour the window
+ * promises is checked rather than asserted: the password is asked before the
+ * stop, a failed install still starts the service, a closed window is caught by
+ * the trap, and npm's `#!/usr/bin/env node` shebang needs the resolved Node.js.
+ *
+ * Nothing here touches a real service: every command is a fake in a temp dir.
+ */
+import { spawn, spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { UPDATE_LOG_DIR, buildUpdateScript } from '../src/main/core/update-console.js';
+
+const BASH = existsSync('/bin/bash') ? '/bin/bash' : null;
+const skip = BASH === null || process.platform === 'win32';
+const ROOT = join(process.cwd(), '.tmp-script-test');
+const STAMP = '2026-08-20T10-11-12-345Z';
+const LOG = `~/${UPDATE_LOG_DIR}/update-${STAMP}.log`;
+const STOP = 'sudo systemctl stop dsh-web.service';
+const START = 'sudo systemctl start dsh-web.service';
+
+let counter = 0;
+
+interface Sandbox {
+  root: string;
+  home: string;
+  bin: string;
+  record: string;
+  npm: string;
+}
+
+/** Fake command, fake HOME and a record file; no real system command is used. */
+function sandbox(
+  options: { sudoFails?: boolean; npmSleep?: string; envNodeNpm?: boolean; withoutNode?: boolean } = {},
+): Sandbox {
+  counter += 1;
+  const root = join(ROOT, `case-${counter}`);
+  const bin = join(root, 'bin');
+  const home = join(root, 'home');
+  mkdirSync(bin, { recursive: true });
+  mkdirSync(home, { recursive: true });
+  const record = join(root, 'record.log');
+  const write = (name: string, body: string): string => {
+    const path = join(bin, name);
+    writeFileSync(path, body);
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  write(
+    'sudo',
+    `#!/bin/sh
+echo "sudo $*" >> "${record}"
+if [ "$1" = "-v" ]; then exit ${options.sudoFails === true ? '1' : '0'}; fi
+exec "$@"
+`,
+  );
+  write(
+    'systemctl',
+    `#!/bin/sh
+echo "systemctl $*" >> "${record}"
+exit 0
+`,
+  );
+  const npm = write(
+    'npm',
+    options.envNodeNpm === true
+      ? `#!/usr/bin/env node
+require('node:fs').appendFileSync('${record}', 'npm ' + process.argv.slice(2).join(' ') + '\\n');
+process.exit(1);
+`
+      : `#!/bin/sh
+echo "npm $*" >> "${record}"
+sleep ${options.npmSleep ?? '0'}
+exit 1
+`,
+  );
+  if (options.withoutNode !== true) {
+    write(
+      'node',
+      `#!/bin/sh
+echo "node $*" >> "${record}"
+exit 0
+`,
+    );
+  }
+  return { root, home, bin, record, npm };
+}
+
+function runScript(sandboxed: Sandbox, commands: string[], nodePath?: string): { code: number | null; output: string } {
+  const script = buildUpdateScript(commands, LOG, nodePath === undefined ? {} : { nodePath });
+  expect(script).not.toBeNull();
+  const path = join(sandboxed.root, 'update.sh');
+  writeFileSync(path, script as string);
+  const result = spawnSync(BASH as string, [path], {
+    cwd: sandboxed.root,
+    env: { HOME: sandboxed.home, PATH: `${sandboxed.bin}:/usr/bin:/bin`, TERM: 'dumb' },
+    encoding: 'utf8',
+    input: '\n',
+    timeout: 15_000,
+  });
+  return { code: result.status, output: `${result.stdout}${result.stderr}` };
+}
+
+function recorded(sandboxed: Sandbox): string[] {
+  if (!existsSync(sandboxed.record)) return [];
+  return readFileSync(sandboxed.record, 'utf8').split('\n').filter((line) => line !== '');
+}
+
+afterEach(() => {
+  rmSync(ROOT, { recursive: true, force: true });
+});
+
+describe.skipIf(skip)('console script, executed', () => {
+  it('is valid bash for every plan shape', () => {
+    const box = sandbox();
+    const shapes: [string[], string | undefined][] = [
+      [[`"${box.npm}" install -g @deepseek-ai/dsh@0.2.2`], undefined],
+      [[STOP, `"${box.npm}" install -g @deepseek-ai/dsh@0.2.2`, START], undefined],
+      [[STOP, `"${box.npm}" install -g @deepseek-ai/dsh@0.2.2`, START], '/usr/local/bin/node'],
+      [['systemctl --user stop dsh-web.service', `"${box.npm}" install -g x`, 'systemctl --user start dsh-web.service'], undefined],
+      [["sudo env \"PATH=$PATH\" npm install -g x"], undefined],
+    ];
+    for (const [commands, nodePath] of shapes) {
+      const script = buildUpdateScript(commands, LOG, nodePath === undefined ? {} : { nodePath });
+      expect(script).not.toBeNull();
+      const path = join(box.root, 'syntax.sh');
+      writeFileSync(path, script as string);
+      const check = spawnSync(BASH as string, ['-n', path], { encoding: 'utf8' });
+      expect(check.status, `${commands.join(' && ')}: ${check.stderr}`).toBe(0);
+    }
+  });
+
+  it('asks for the password before stopping anything and starts again after a failed install', () => {
+    const box = sandbox();
+    const { code } = runScript(box, [STOP, `"${box.npm}" install -g @deepseek-ai/dsh@0.2.2`, START]);
+    const lines = recorded(box);
+    const sudoPrompt = lines.findIndex((line) => line === 'sudo -v');
+    const stop = lines.findIndex((line) => line === 'systemctl stop dsh-web.service');
+    const npm = lines.findIndex((line) => line.startsWith('npm install'));
+    const start = lines.findIndex((line) => line === 'systemctl start dsh-web.service');
+    expect(sudoPrompt).toBeGreaterThan(-1);
+    expect(stop).toBeGreaterThan(sudoPrompt);
+    expect(npm).toBeGreaterThan(stop);
+    expect(start).toBeGreaterThan(npm);
+    // The install failed, so its status is what the console reports.
+    expect(code).toBe(1);
+  });
+
+  it('leaves the service alone when the password is refused', () => {
+    const box = sandbox({ sudoFails: true });
+    const { code } = runScript(box, [STOP, `"${box.npm}" install -g @deepseek-ai/dsh@0.2.2`, START]);
+    const lines = recorded(box);
+    expect(lines).toContain('sudo -v');
+    expect(lines.some((line) => line.startsWith('systemctl '))).toBe(false);
+    expect(code).toBe(1);
+  });
+
+  it('starts the service from the trap when the window is closed mid-install', async () => {
+    const box = sandbox({ npmSleep: '3' });
+    const script = buildUpdateScript([STOP, `"${box.npm}" install -g @deepseek-ai/dsh@0.2.2`, START], LOG);
+    const path = join(box.root, 'update.sh');
+    writeFileSync(path, script as string);
+
+    const child = spawn(BASH as string, [path], {
+      cwd: box.root,
+      env: { HOME: box.home, PATH: `${box.bin}:/usr/bin:/bin`, TERM: 'dumb' },
+      stdio: 'ignore',
+    });
+    // Wait until the stop and the install are both under way, then hang up.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (recorded(box).some((line) => line.startsWith('npm install'))) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    child.kill('SIGHUP');
+    await new Promise<void>((resolve) => {
+      child.once('exit', () => resolve());
+      setTimeout(() => resolve(), 5_000);
+    });
+
+    const lines = recorded(box);
+    const stop = lines.findIndex((line) => line === 'systemctl stop dsh-web.service');
+    const start = lines.findIndex((line) => line === 'systemctl start dsh-web.service');
+    expect(stop).toBeGreaterThan(-1);
+    expect(start).toBeGreaterThan(stop);
+  }, 20_000);
+
+  it('needs the resolved Node.js on PATH for a `#!/usr/bin/env node` npm', () => {
+    const withNode = sandbox({ envNodeNpm: true });
+    const nodeDir = join(withNode.root, 'node-bin');
+    mkdirSync(nodeDir, { recursive: true });
+    const node = join(nodeDir, 'node');
+    writeFileSync(node, `#!/bin/sh\necho "node $*" >> "${withNode.record}"\nexit 0\n`);
+    chmodSync(node, 0o755);
+
+    const withResult = runScript(withNode, [`"${withNode.npm}" install -g @deepseek-ai/dsh@0.2.2`], `${nodeDir}/node`);
+    // `env` found the fake node, which was handed the npm script: the shebang
+    // resolved, which without the PATH line is exactly what fails.
+    expect(recorded(withNode).some((line) => line.startsWith('node ') && line.includes('npm'))).toBe(true);
+    expect(withResult.code).toBe(0);
+
+    const withoutNode = sandbox({ envNodeNpm: true, withoutNode: true });
+    const withoutResult = runScript(withoutNode, [`"${withoutNode.npm}" install -g @deepseek-ai/dsh@0.2.2`]);
+    expect(recorded(withoutNode).some((line) => line.startsWith('node '))).toBe(false);
+    // `/usr/bin/env: 'node': No such file or directory`
+    expect(withoutResult.code).toBe(127);
+  });
+});

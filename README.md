@@ -54,7 +54,9 @@ installed `dsh`, and it never touches the official Windows DeepSeek Harness inst
 or your projects. It does not update anything by itself: when a newer release exists it shows the
 installed and available version and the exact commands, and one button runs those same
 commands in a visible WSL console where `sudo` can ask you for your password — you watch
-it, and the app never sees the password.
+it, and the app never sees the password. The console asks for it once, before it stops
+anything, and if you close the window after that the script prints the one `systemctl
+start` line you have to run yourself.
 
 **A window that behaves like an app.**
 

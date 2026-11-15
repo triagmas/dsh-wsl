@@ -1,24 +1,29 @@
 /**
- * Console update script and result (beta.13).
+ * Console update script and result (beta.13, hardened in beta.14).
  *
  * The script is the only thing the app executes, so these tests pin what it may
- * contain: the plan's commands, a log, a start that always runs, and nothing an
- * owner could not read in the window before clicking the button.
+ * contain: the plan's commands, one password prompt up front, a log, a start that
+ * runs after a successful stop, a trap for a closed window, and nothing an owner
+ * could not read in the window before clicking the button.
  */
 import { describe, expect, it } from 'vitest';
 import type { DshInstallation } from '../src/main/core/dsh-locate.js';
 import { buildManualUpdatePlan } from '../src/main/core/manual-update.js';
 import {
   UPDATE_LOG_DIR,
+  asCommandList,
   buildUpdateLogPath,
   buildUpdateResult,
   buildUpdateScript,
   planRunsInConsole,
+  sameCommands,
 } from '../src/main/core/update-console.js';
 
 const STAMP = '2026-08-20T10-11-12-345Z';
 const LOG = `~/${UPDATE_LOG_DIR}/update-${STAMP}.log`;
 const INSTALL = '"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" @deepseek-ai/dsh@0.2.2';
+const STOP = 'sudo systemctl stop dsh-web.service';
+const START = 'sudo systemctl start dsh-web.service';
 
 function installation(overrides: Partial<DshInstallation> = {}): DshInstallation {
   return {
@@ -53,38 +58,75 @@ describe('log path', () => {
 });
 
 describe('console script', () => {
-  it('echoes, tees and keeps the first failing status', () => {
+  it('echoes, tees, keeps the first failing status and waits for Enter', () => {
     const script = buildUpdateScript([INSTALL], LOG);
     expect(script).not.toBeNull();
-    expect(script).toContain(`LOG="$HOME/${UPDATE_LOG_DIR}/update-${STAMP}.log"`);
-    expect(script).toContain('exec > >(tee -a "$LOG") 2>&1');
-    expect(script).toContain(`run '${INSTALL}'`);
-    expect(script).toContain('read -r _');
-    expect(script).toContain('exit "$fail"');
+    const text = script as string;
+    expect(text).toContain(`LOG="$HOME/${UPDATE_LOG_DIR}/update-${STAMP}.log"`);
+    expect(text).toContain('exec > >(tee -a "$LOG") 2>&1');
+    expect(text).toContain(`run '${INSTALL}'`);
+    expect(text).toContain('read -r _');
+    expect(text).toContain('exit "$fail"');
+  });
+
+  it('asks for the password once, before the stop, and only when sudo is needed', () => {
+    const withSudo = buildUpdateScript([STOP, INSTALL, START], LOG) as string;
+    const prompt = withSudo.indexOf("run 'sudo -v'");
+    const stop = withSudo.indexOf(`run '${STOP}'`);
+    expect(prompt).toBeGreaterThan(-1);
+    expect(stop).toBeGreaterThan(prompt);
+    // A refused password leaves `fail` set, so the stop never runs.
+    expect(withSudo.split('\n').find((line) => line.includes("run 'sudo -v'"))).toContain('if [ "$fail" -eq 0 ]');
+
+    const withoutSudo = buildUpdateScript([INSTALL], LOG) as string;
+    expect(withoutSudo).not.toContain('sudo -v');
+  });
+
+  it('puts the resolved Node.js on PATH so a `#!/usr/bin/env node` npm can start', () => {
+    const text = buildUpdateScript([INSTALL], LOG, {
+      nodePath: '/home/triag/.hermes/node/bin/node',
+    }) as string;
+    expect(text).toContain('export PATH=\'/home/triag/.hermes/node/bin\':"$PATH"');
+    const exported = text.indexOf('export PATH=');
+    const install = text.indexOf(`run '${INSTALL}'`);
+    expect(install).toBeGreaterThan(exported);
+
+    // Without a usable path the script must not invent one.
+    expect(buildUpdateScript([INSTALL], LOG)).not.toContain('export PATH=');
+    expect(buildUpdateScript([INSTALL], LOG, { nodePath: 'node' })).not.toContain('export PATH=');
+    expect(buildUpdateScript([INSTALL], LOG, { nodePath: "/home/x/it's/node" })).not.toContain('export PATH=');
   });
 
   it('runs the start line after the unit was stopped, even when the install fails', () => {
-    const script = buildUpdateScript(
-      ['sudo systemctl stop dsh-web.service', INSTALL, 'sudo systemctl start dsh-web.service'],
-      LOG,
-    );
-    expect(script).not.toBeNull();
-    const lines = (script as string).split('\n');
-    const stop = lines.findIndex((line) => line.includes('run \'sudo systemctl stop'));
+    const text = buildUpdateScript([STOP, INSTALL, START], LOG) as string;
+    const lines = text.split('\n');
+    expect(text).toContain(`START='${START}'`);
+    const stop = lines.findIndex((line) => line.includes(`run '${STOP}'`));
     const install = lines.findIndex((line) => line.includes('@deepseek-ai/dsh@0.2.2'));
-    const start = lines.findIndex((line) => line.includes('run \'sudo systemctl start'));
+    const bringBack = lines.findIndex((line) => line.trim() === 'bring_back');
     expect(stop).toBeGreaterThan(-1);
     expect(install).toBeGreaterThan(stop);
-    expect(start).toBeGreaterThan(install);
-    // The install line only runs while nothing has failed yet; the start line is
-    // unconditional, so a failed install leaves a running service.
-    expect(lines[install]).toContain('if [ "$fail" -eq 0 ]');
-    expect(lines[start]).toBe("run 'sudo systemctl start dsh-web.service' || true");
+    expect(bringBack).toBeGreaterThan(install);
+    // `stopped` is only set by a successful stop, which is what the recovery
+    // start is conditioned on.
+    expect(lines[stop]).toContain('then stopped=1');
+    expect(text).toContain('if [ -z "$START" ] || [ "$stopped" -ne 1 ] || [ "$started" -ne 0 ]');
+  });
+
+  it('catches a closed window or Ctrl-C and tries the start line from a trap', () => {
+    const text = buildUpdateScript([STOP, INSTALL, START], LOG) as string;
+    expect(text).toContain('trap on_signal INT TERM HUP');
+    expect(text).toContain('trap bring_back EXIT');
+    expect(text).toContain('exit 130');
+    // The trap owns the last word: it says the service may still be down and
+    // prints the line the owner has to run themselves.
+    expect(text).toContain('The service is still stopped');
   });
 
   it('runs a plan with only the install line and no phantom start', () => {
-    const script = buildUpdateScript([INSTALL], LOG);
-    expect(script).not.toContain('systemctl start');
+    const text = buildUpdateScript([INSTALL], LOG) as string;
+    expect(text).not.toContain('systemctl start');
+    expect(text).toContain("START=''");
   });
 
   it('refuses text the shell would reinterpret', () => {
@@ -105,10 +147,27 @@ describe('console result', () => {
       after: '0.2.2',
       target: '0.2.2',
       installation: installation(),
+      backend: 'READY',
     });
     expect(result.success).toBe(true);
     expect(result.rollbackCommand).toBeNull();
     expect(result.message).toContain('0.2.2');
+    expect(result.message).toContain('The backend is running again');
+  });
+
+  it('does not claim the backend is back when the supervisor is still recovering', () => {
+    const result = buildUpdateResult({
+      code: 0,
+      logPath: LOG,
+      before: '0.2.1',
+      after: '0.2.2',
+      target: '0.2.2',
+      installation: installation(),
+      backend: 'RECOVERING',
+    });
+    expect(result.success).toBe(true);
+    expect(result.message).not.toContain('running again');
+    expect(result.message).toContain('RECOVERING');
   });
 
   it('offers the rollback line when the installation did not move', () => {
@@ -119,12 +178,29 @@ describe('console result', () => {
       after: '0.2.1',
       target: '0.2.2',
       installation: installation(),
+      backend: 'ERROR',
     });
     expect(result.success).toBe(false);
     expect(result.rollbackCommand).toBe(
       '"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" @deepseek-ai/dsh@0.2.1',
     );
     expect(result.message).toContain('0.2.1');
+    expect(result.message).not.toContain('running again');
+    expect(result.message).toContain('ERROR');
+  });
+
+  it('says the backend state is unknown when it could not be read', () => {
+    const result = buildUpdateResult({
+      code: 0,
+      logPath: LOG,
+      before: '0.2.1',
+      after: '0.2.2',
+      target: '0.2.2',
+      installation: installation(),
+      backend: null,
+    });
+    expect(result.message).toContain('unknown');
+    expect(result.message).not.toContain('running again');
   });
 
   it('reports a console that never started, and changes nothing', () => {
@@ -135,6 +211,7 @@ describe('console result', () => {
       after: '0.2.1',
       target: '0.2.2',
       installation: installation(),
+      backend: 'READY',
     });
     expect(result.success).toBe(false);
     expect(result.message).toContain('could not be started');
@@ -149,11 +226,11 @@ describe('console result', () => {
       after: null,
       target: '0.2.2',
       installation: installation(),
+      backend: 'READY',
     });
     expect(result.success).toBe(false);
     expect(result.message).toContain('could not be read');
-    // Nothing is known about the previous version either, so no "go back" line
-    // is offered: guessing a version here would be worse than silence.
+    // The previous version is known, so a "go back" line is still offered.
     expect(result.rollbackCommand).toBe(
       '"/usr/bin/npm" install -g --prefix "/home/triag/.npm-global" @deepseek-ai/dsh@0.2.1',
     );
@@ -176,5 +253,24 @@ describe('plan gate', () => {
       unit: null,
     });
     expect(planRunsInConsole(attached)).toBe(false);
+  });
+});
+
+describe('stale window guard', () => {
+  it('accepts only a plausible list of command strings', () => {
+    expect(asCommandList([INSTALL])).toEqual([INSTALL]);
+    expect(asCommandList([])).toBeNull();
+    expect(asCommandList('npm install')).toBeNull();
+    expect(asCommandList([1])).toBeNull();
+    expect(asCommandList([''])).toBeNull();
+    expect(asCommandList(['echo one\necho two'])).toBeNull();
+    expect(asCommandList(new Array(21).fill(INSTALL))).toBeNull();
+  });
+
+  it('compares the list in order, not by membership', () => {
+    expect(sameCommands([STOP, INSTALL, START], [STOP, INSTALL, START])).toBe(true);
+    expect(sameCommands([STOP, INSTALL, START], [INSTALL, STOP, START])).toBe(false);
+    expect(sameCommands([INSTALL], [INSTALL, START])).toBe(false);
+    expect(sameCommands([], [])).toBe(true);
   });
 });
