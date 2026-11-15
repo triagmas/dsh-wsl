@@ -1,4 +1,4 @@
-# DeepSeek Harness update: run it in a WSL console (issues #12, #17, beta.13)
+# DeepSeek Harness update: run it in a WSL console (issues #12, #17, beta.13, hardened in beta.14)
 
 DSH WSL does not update the installation itself. When a newer release is published,
 the footer pill opens a window that states the installed and the published version and
@@ -26,14 +26,47 @@ presence means something else was built.
 The script:
 
 1. creates `~/.local/share/wsl-web-shell/update-<UTC>.log` and tees everything to it;
-2. echoes each command before running it (`$ sudo systemctl stop …`), so the window is
+2. puts the directory of the **Node.js the app resolved** in front of `PATH` (see
+   below) — this is the one environment line the app can verify before it runs
+   anything;
+3. when the plan escalates, asks for the password **once** (`sudo -v`) before it
+   stops or installs anything: a refused password ends the run with the service
+   untouched, instead of stopping it and then failing at the install;
+4. echoes each command before running it (`$ sudo systemctl stop …`), so the window is
    readable after the fact without the log;
-3. runs the commands in order and stops at the first failure;
-4. when the list is `stop … install … start`, runs the **start line on every path**
-   after the stop was attempted — a failed install must never leave the owner without
-   a service;
-5. exits with the first failing status, prints the exit code and the log path, then
-   waits for **Enter** so the window stays open long enough to read.
+5. runs the commands in order and stops at the first failure;
+6. when the list is `stop … install … start`, runs the **start line on every ordinary
+   path** after a successful stop — normal exit and a failed install both end with the
+   service started;
+7. traps `INT`, `TERM` and `HUP` and tries the same start line from the `EXIT` trap, so
+   `Ctrl-C` or a closed window does not skip it. That path is best effort, see below;
+8. exits with the first failing status, prints the exit code and the log path, then
+   waits for **Enter** so the window stays open long enough to read. When the recovery
+   start itself fails, the step-7 trap prints the exact line the owner has to run.
+
+Step 2 matters because `wsl.exe --exec /bin/bash -c` starts **no login shell**: the
+interactive `PATH` (a `~/.local/bin` shim, nvm, a distro profile script) is absent, and
+an npm whose shebang is `#!/usr/bin/env node` then fails with
+`env: 'node': No such file or directory`. The app already knows that Node.js from its
+own start (`ResolvedRuntime.nodePath`), so it prepends exactly that directory and
+nothing else; a path that is not an absolute, quote-free directory is not used.
+
+Step 3 is also why the console may show one line that is not in the list the window
+displayed: `sudo -v` only validates the password, it changes nothing.
+
+## When the console cannot bring the backend back
+
+Closing the console or pressing `Ctrl-C` means the script may be killed between
+`stop` and `start`. The trap catches that, and it works whenever `sudo` can still
+reach a terminal — `Ctrl-C` keeps the window, and within the timestamp window the
+password is already cached.
+
+Once the window is gone, however, `sudo` has no TTY to ask for the password, and
+`systemctl start` fails. The script prints
+`Run this in a WSL terminal: sudo systemctl start <unit>` and the window says the
+backend is not running; the app keeps retrying, but it will not start a unit it does
+not own. **This is the one case the button cannot repair**, and it is why the window
+states the caveat before the owner clicks it.
 
 `eval "$(echo '<base64>' | base64 -d)"` carries the script into `bash -c`: base64
 survives `wsl.exe` argument quoting, and the command substitution keeps stdin on the
@@ -55,9 +88,11 @@ While the console owns the backend, `Supervisor.suspendForUpdate()` sets a pause
   quiet. Left running, the supervisor would read the unit stop as a lost backend and
   start its own from the files npm is replacing (the beta.6 `EADDRINUSE` bug).
 
-`resumeAfterUpdate()` runs on every outcome, including a console the owner closed
-early: it clears the flag and goes through the ordinary bring-up path, which
-re-attaches to the restarted unit or starts an app-owned backend again. A failure
+The pause starts inside the same `try` as the console, so `resumeAfterUpdate()` runs
+even when suspending itself throws: a flag left set would keep recovery away from the
+backend for the rest of the session. Resume runs on every outcome, including a console
+the owner closed early: it clears the flag and goes through the ordinary bring-up path,
+which re-attaches to the restarted unit or starts an app-owned backend again. A failure
 there is logged, not escalated — the owner already sees the console result.
 
 Only where the app can stop and start the backend itself does the button appear: an
@@ -86,6 +121,11 @@ the log path and, when the version did not move, the one line that installs the
 previous version again. Success is decided by the version the app reads afterwards,
 not by the exit code: a console the owner closed reports a signal, and npm can fail
 after writing.
+
+What the result says about the **backend** comes from the supervisor's own state
+(`supervisor.getStatus().state`) read after the resume, never from the version:
+`READY` or `HIDDEN_IN_TRAY` means it is running again, anything else is reported as
+"not running yet (RECOVERING)" together with the fact that the app keeps retrying.
 
 ## The commands
 
@@ -150,6 +190,12 @@ Channels: `footer:open-update`, `update:probe`, `update:recheck`, `update:run`,
 run can be in flight at a time. The page performs no network I/O and has no password
 field.
 
+`update:run` carries the **command list the page is rendering**. The main process
+rebuilds the plan (it needs the current installation and Node.js path) and refuses the
+run when the rebuilt list differs, because the window may have been filled minutes
+earlier and a service can start or a release appear in between. The page then re-reads
+the installation and asks again instead of running something the owner never saw.
+
 Per-line **Copy**, **Copy all** and the rollback line use the clipboard API with a
 selection-based fallback; each copied line is announced through an `aria-live` region.
 
@@ -163,8 +209,14 @@ script the owner can read in the window; going back is one copied install line.
 ## Verification
 
 - `tests/update-console.test.ts` — script text (log, tee, echo, first-failure status,
-  start-after-stop), refusal of quote/newline log paths, result verdicts (success,
-  unchanged, console never started, version unreadable), plan gate.
+  `sudo -v` before the stop, `PATH` from the resolved Node.js, start-after-stop, the
+  traps), refusal of quote/newline log paths, result verdicts by supervisor state
+  (success, unchanged, console never started, version unreadable, backend unknown),
+  plan gate and the stale-window guard.
+- `tests/update-console-script.test.ts` — the generated script **executed** with fake
+  `sudo`/`systemctl`/`npm`: password first, service untouched on a refused password,
+  start after a failed install, start from the trap when the window is closed, and a
+  `#!/usr/bin/env node` npm failing without the `PATH` line and running with it.
 - `tests/console-update-runner.test.ts` — console argv, base64 encoding, no
   `detached`, `windowsHide: false`, exit/error handling.
 - `tests/manual-update.test.ts` — exact-version guard, downgrade refusal,
@@ -177,4 +229,5 @@ script the owner can read in the window; going back is one copied install line.
 
 A real update of the owner's WSL installation is still an owner step: these tests
 cover the script, the decisions and the window. The Windows console itself is only
-exercised on a real desktop, never in CI.
+exercised on a real desktop, never in CI. bash runs on Linux and macOS; the executed
+script test is skipped on Windows.

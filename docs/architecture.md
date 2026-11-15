@@ -155,11 +155,15 @@ instructions, split the usual way:
   attached backend; discovery only, no `systemctl` and no `sudo`;
 - `src/main/index.ts` — builds the plan from a fresh inspection and the supervisor's
   ownership state (`owned`, `attached`, `none`) and exposes `update:probe`,
-  `update:recheck`, `update:run`, `update:close`;
+  `update:recheck`, `update:run`, `update:close`; `update:run` compares the list the
+  page rendered with the rebuilt plan and refuses a stale window;
 - `src/main/core/update-console.ts` — pure: `buildUpdateScript()` (bash text, log path,
-  first-failure status, guaranteed `start` after `stop`), `buildUpdateResult()` (the
-  verdict the window shows, decided by the version read afterwards) and
-  `planRunsInConsole()`;
+  `sudo -v` preflight, `PATH` for the resolved Node.js, first-failure status,
+  `start` after `stop` including a `HUP`/`INT` trap, and the line the owner must run
+  when no terminal is left), `buildUpdateResult()` (the verdict the window shows,
+  decided by the version read afterwards; the backend sentence comes from the
+  supervisor state), `planRunsInConsole()`, `asCommandList()` and `sameCommands()`
+  for the stale-window guard;
 - `src/main/wsl/console.ts` — spawns `wsl.exe -d <distro> --exec /bin/bash -c …` with
   `windowsHide: false`, no `detached`, and waits for the exit event;
 - `src/main/core/supervisor.ts` — `suspendForUpdate()` / `resumeAfterUpdate()`: the
@@ -343,7 +347,12 @@ launcher cannot disagree about a trailing slash (issue #8).
 Issue #12 now has `tests/manual-update.test.ts` (exact version guard, downgrade
 refusal, manager-specific install line, root escalation, stop/install/start order,
 every backend/scope branch, console availability), `tests/update-console.test.ts`
-(script text, first-failure status, guaranteed start, result verdicts) and
+(script text, password preflight, `PATH` line, first-failure status, guaranteed start,
+traps, result verdicts by backend state, stale-window guard),
+`tests/update-console-script.test.ts` (the generated script executed against fake
+`sudo`/`systemctl`/`npm`: password first, refused password leaves the service alone,
+start after a failed install, start from the trap on a closed window, `env node`
+shebang needs the `PATH` line) and
 `tests/console-update-runner.test.ts` (console argv, base64, no `detached`), plus
 `tests/inspect.test.ts` and `tests/managed.test.ts`, which pin the read-only
 inspection and cgroup probes. `tests/supervisor.test.ts` pins the pause: no recovery,

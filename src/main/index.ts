@@ -18,7 +18,14 @@ import {
 import { createLatestVersionService } from './backend/github-versions.js';
 import { describeInstallScope, type DshInstallation, type SharedDshReport } from './core/dsh-locate.js';
 import { buildManualUpdatePlan, type ManualUpdatePlan } from './core/manual-update.js';
-import { buildUpdateLogPath, buildUpdateResult, buildUpdateScript, planRunsInConsole } from './core/update-console.js';
+import {
+  asCommandList,
+  buildUpdateLogPath,
+  buildUpdateResult,
+  buildUpdateScript,
+  planRunsInConsole,
+  sameCommands,
+} from './core/update-console.js';
 import { runInConsole } from './wsl/console.js';
 import { APP_DISPLAY_NAME, APP_ID, PROFILE_DIRECTORY } from './core/branding.js';
 import { createLogger } from './core/logger.js';
@@ -311,25 +318,46 @@ async function bootstrap(): Promise<void> {
    *
    * The supervisor is paused for the duration: left running, it would see the
    * unit stop as a lost backend and start its own from the files npm is
-   * replacing (the beta.6 EADDRINUSE bug). It resumes on every outcome, so a
-   * failed install still ends with the service running on the old version.
+   * replacing (the beta.6 EADDRINUSE bug). The pause starts inside the same
+   * `try` as the console, so the resume runs even when suspending itself throws.
+   *
+   * `expected` is the list the window rendered. The plan is rebuilt here to get
+   * the current installation and node runtime, but a list that no longer matches
+   * what the owner saw is refused: the window re-reads instead of running
+   * something else behind their back.
    */
-  async function runConsoleUpdate(): Promise<UpdateRunResult> {
+  async function runConsoleUpdate(expected: unknown): Promise<UpdateRunResult> {
     if (consoleUpdateRunning) throw new Error('A console update is already running.');
     consoleUpdateRunning = true;
     try {
+      const shown = asCommandList(expected);
+      if (shown === null) throw new Error('the window did not send a usable command list');
       const before = await updatePlan(false);
       if (!planRunsInConsole(before.plan)) throw new Error('these commands cannot run in one console');
+      if (!sameCommands(shown, before.plan.commands)) {
+        throw new Error('the update window is out of date; check it again');
+      }
       const logPath = buildUpdateLogPath(new Date().toISOString().replace(/[:.]/g, '-'));
-      const script = logPath === null ? null : buildUpdateScript(before.plan.commands, logPath);
+      const script =
+        logPath === null
+          ? null
+          : buildUpdateScript(before.plan.commands, logPath, {
+              // `wsl.exe --exec` starts no login shell, so the Node.js that runs
+              // npm has to be put on PATH explicitly.
+              nodePath: supervisor.resolvedRuntime()?.nodePath ?? null,
+            });
       if (logPath === null || script === null) throw new Error('the update script could not be built');
       log.info(`console update: ${before.plan.commands.length} command(s), log ${logPath}`);
-      await supervisor.suspendForUpdate();
       let code: number | null = null;
       try {
+        await supervisor.suspendForUpdate();
         ({ code } = await runInConsole({ distro: config.distro, script }));
       } finally {
-        await supervisor.resumeAfterUpdate();
+        // A failure here must not hide the console outcome, but it must be logged:
+        // the pause flag is what keeps recovery away from the backend.
+        await supervisor.resumeAfterUpdate().catch((error: unknown) => {
+          log.error(`the supervisor did not resume after the console update: ${describeError(error)}`);
+        });
       }
       const after = await updatePlan(true);
       const result = buildUpdateResult({
@@ -339,9 +367,11 @@ async function bootstrap(): Promise<void> {
         after: after.probe.installed,
         target: after.probe.target,
         installation: after.installation ?? before.installation,
+        // Only the supervisor knows whether the backend is actually back.
+        backend: supervisor.getStatus().state,
       });
       log.info(
-        `console update finished: code=${code ?? 'null'} success=${result.success} installed=${result.installed ?? 'unknown'}`,
+        `console update finished: code=${code ?? 'null'} success=${result.success} installed=${result.installed ?? 'unknown'} backend=${supervisor.getStatus().state}`,
       );
       return result;
     } finally {
@@ -547,7 +577,7 @@ async function bootstrap(): Promise<void> {
   guard('update:recheck', async () => await updateProbe(true));
   // The one channel that runs anything: the same commands the window shows, in
   // a visible console, and nothing else.
-  guard('update:run', async () => await runConsoleUpdate());
+  guard('update:run', async (_event, expected: unknown) => await runConsoleUpdate(expected));
   guard('update:close', () => {
     windows.closeUpdateConfirm();
   });

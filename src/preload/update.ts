@@ -14,10 +14,12 @@ const api = {
   /**
    * Runs the shown commands in one visible WSL console, then reports the result.
    *
-   * The one channel that executes anything; it refuses plans that are copy-only.
+   * The one channel that executes anything. `commands` is the list this window
+   * is rendering, so the main process can refuse to run a list the owner never
+   * saw; it also refuses plans that are copy-only.
    */
-  run(): Promise<UpdateRunResult> {
-    return ipcRenderer.invoke('update:run') as Promise<UpdateRunResult>;
+  run(commands: string[]): Promise<UpdateRunResult> {
+    return ipcRenderer.invoke('update:run', commands) as Promise<UpdateRunResult>;
   },
   /** Closes the window that sent it. */
   close(): Promise<void> {

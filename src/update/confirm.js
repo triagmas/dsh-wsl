@@ -22,6 +22,7 @@ const copiedEl = document.getElementById('copied');
 const recheckButton = document.getElementById('recheck');
 const closeButton = document.getElementById('close');
 const runButton = document.getElementById('run-console');
+const consoleNoteEl = document.getElementById('console-note');
 const resultEl = document.getElementById('result');
 const resultTitleEl = document.getElementById('result-title');
 const resultMessageEl = document.getElementById('result-message');
@@ -109,7 +110,9 @@ function render(probe) {
   descriptionEl.hidden = probe.description === null || probe.description === '';
   descriptionEl.textContent = probe.description ?? '';
 
-  runButton.hidden = probe.runAvailable !== true || commands.length === 0;
+  const canRun = probe.runAvailable === true && commands.length > 0;
+  runButton.hidden = !canRun;
+  if (consoleNoteEl !== null) consoleNoteEl.hidden = !canRun;
 
   if (probe.state === 'installed') {
     statusEl.dataset.state = 'installed';
@@ -152,7 +155,9 @@ async function runInConsole() {
   statusEl.textContent = 'A console window is running the commands. Press Enter in that window when it finishes.';
   announce('');
   try {
-    const result = await bridge.run();
+    // Hand back the exact list this window is showing: the main process refuses
+    // to run a list that no longer matches what was rendered.
+    const result = await bridge.run([...commands]);
     renderResult(result);
     statusEl.dataset.state = result.success ? 'installed' : 'pending';
     statusEl.textContent = result.success
@@ -163,15 +168,27 @@ async function runInConsole() {
     const probe = await bridge.probe();
     render(probe);
   } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    const stale = message.includes('out of date');
     resultEl.hidden = false;
     resultEl.dataset.outcome = 'failure';
-    resultTitleEl.textContent = 'The console could not be started';
-    resultMessageEl.textContent =
-      error instanceof Error && error.message !== '' ? error.message : 'The update did not run.';
+    resultTitleEl.textContent = stale ? 'This window was out of date' : 'The console could not be started';
+    resultMessageEl.textContent = stale
+      ? 'The installation changed since this window was filled, so nothing was run. The list was refreshed; review it and press the button again.'
+      : message !== ''
+        ? message
+        : 'The update did not run.';
     resultLogEl.hidden = true;
     rollbackEl.hidden = true;
     statusEl.dataset.state = 'unknown';
     statusEl.textContent = 'The update did not run.';
+    if (stale) {
+      try {
+        render(await bridge.probe());
+      } catch {
+        // Keep the message above; the next "Check again" retries the read.
+      }
+    }
   } finally {
     runButton.disabled = false;
     recheckButton.disabled = false;
