@@ -10,7 +10,7 @@
  * Nothing here touches a real service: every command is a fake in a temp dir.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { UPDATE_LOG_DIR, buildUpdateScript } from '../src/main/core/update-console.js';
@@ -31,11 +31,33 @@ interface Sandbox {
   bin: string;
   record: string;
   npm: string;
+  /** A PATH containing only the tools the script needs, or `null` for the host PATH. */
+  tools: string | null;
+}
+
+const NEEDED_TOOLS = ['mkdir', 'tee', 'sleep'] as const;
+
+/** Absolute path of a real host tool, so a hermetic PATH needs no `/usr/bin`. */
+function systemTool(name: string): string | null {
+  for (const dir of ['/bin', '/usr/bin']) {
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
 }
 
 /** Fake command, fake HOME and a record file; no real system command is used. */
 function sandbox(
-  options: { sudoFails?: boolean; npmSleep?: string; envNodeNpm?: boolean; withoutNode?: boolean } = {},
+  options: {
+    sudoFails?: boolean;
+    npmSleep?: string;
+    envNodeNpm?: boolean;
+    withoutNode?: boolean;
+    /** Build a PATH with only the tools the script needs and no host `node`. */
+    hermetic?: boolean;
+    /** Make `systemctl start` fail, like a unit that refuses to come back. */
+    systemctlStartFails?: boolean;
+  } = {},
 ): Sandbox {
   counter += 1;
   const root = join(ROOT, `case-${counter}`);
@@ -63,6 +85,7 @@ exec "$@"
     'systemctl',
     `#!/bin/sh
 echo "systemctl $*" >> "${record}"
+if [ "${options.systemctlStartFails === true ? 'yes' : 'no'}" = yes ] && [ "$1" = "start" ]; then exit 1; fi
 exit 0
 `,
   );
@@ -79,6 +102,15 @@ sleep ${options.npmSleep ?? '0'}
 exit 1
 `,
   );
+  let tools: string | null = null;
+  if (options.hermetic === true) {
+    tools = join(root, 'tools');
+    mkdirSync(tools, { recursive: true });
+    for (const name of NEEDED_TOOLS) {
+      const source = systemTool(name);
+      if (source !== null) symlinkSync(source, join(tools, name));
+    }
+  }
   if (options.withoutNode !== true) {
     write(
       'node',
@@ -88,7 +120,7 @@ exit 0
 `,
     );
   }
-  return { root, home, bin, record, npm };
+  return { root, home, bin, record, npm, tools };
 }
 
 function runScript(sandboxed: Sandbox, commands: string[], nodePath?: string): { code: number | null; output: string } {
@@ -98,7 +130,11 @@ function runScript(sandboxed: Sandbox, commands: string[], nodePath?: string): {
   writeFileSync(path, script as string);
   const result = spawnSync(BASH as string, [path], {
     cwd: sandboxed.root,
-    env: { HOME: sandboxed.home, PATH: `${sandboxed.bin}:/usr/bin:/bin`, TERM: 'dumb' },
+    env: {
+      HOME: sandboxed.home,
+      PATH: sandboxed.tools === null ? `${sandboxed.bin}:/usr/bin:/bin` : `${sandboxed.bin}:${sandboxed.tools}`,
+      TERM: 'dumb',
+    },
     encoding: 'utf8',
     input: '\n',
     timeout: 15_000,
@@ -190,6 +226,23 @@ describe.skipIf(skip)('console script, executed', () => {
     expect(start).toBeGreaterThan(stop);
   }, 20_000);
 
+  it('says the service is still stopped and prints the command, without guessing why', () => {
+    const box = sandbox({ systemctlStartFails: true });
+    const { code, output } = runScript(box, [STOP, `"${box.npm}" install -g @deepseek-ai/dsh@0.2.2`, START]);
+    const lines = recorded(box);
+    // The stop succeeded, the install failed, the recovery start failed too.
+    expect(lines).toContain('systemctl stop dsh-web.service');
+    expect(lines).toContain('systemctl start dsh-web.service');
+    expect(code).toBe(1);
+
+    expect(output).toContain('The service is still stopped. Run this in a WSL terminal:');
+    expect(output).toContain(`  ${START}`);
+    // The log path is printed next to the command, and no cause is asserted:
+    // a closed window is only one of the ways a start can fail.
+    expect(output).toContain(`log: ${box.home}/${UPDATE_LOG_DIR}/`);
+    expect(output).not.toContain('closed window');
+  });
+
   it('needs the resolved Node.js on PATH for a `#!/usr/bin/env node` npm', () => {
     const withNode = sandbox({ envNodeNpm: true });
     const nodeDir = join(withNode.root, 'node-bin');
@@ -204,10 +257,17 @@ describe.skipIf(skip)('console script, executed', () => {
     expect(recorded(withNode).some((line) => line.startsWith('node ') && line.includes('npm'))).toBe(true);
     expect(withResult.code).toBe(0);
 
-    const withoutNode = sandbox({ envNodeNpm: true, withoutNode: true });
+    // Hermetic: the sandbox PATH holds only mkdir/tee/sleep, so a host `node`
+    // in /usr/bin cannot make this pass. `/usr/bin/env` itself is absolute.
+    const withoutNode = sandbox({ envNodeNpm: true, withoutNode: true, hermetic: true });
+    expect(withoutNode.tools).not.toBeNull();
+    expect(existsSync(join(withoutNode.tools as string, 'node'))).toBe(false);
     const withoutResult = runScript(withoutNode, [`"${withoutNode.npm}" install -g @deepseek-ai/dsh@0.2.2`]);
     expect(recorded(withoutNode).some((line) => line.startsWith('node '))).toBe(false);
-    // `/usr/bin/env: 'node': No such file or directory`
+    // The shebang cannot be resolved: `env` cannot find `node` anywhere on PATH.
+    expect(withoutResult.output).toContain('node');
     expect(withoutResult.code).toBe(127);
+    // The PATH line is missing, so the script says so before the commands.
+    expect(withoutResult.output).toContain('note: node directory unknown, PATH unchanged');
   });
 });

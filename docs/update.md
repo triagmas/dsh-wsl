@@ -42,7 +42,11 @@ The script:
    `Ctrl-C` or a closed window does not skip it. That path is best effort, see below;
 8. exits with the first failing status, prints the exit code and the log path, then
    waits for **Enter** so the window stays open long enough to read. When the recovery
-   start itself fails, the step-7 trap prints the exact line the owner has to run.
+   start itself fails, the step-7 trap says the service is still stopped and prints the
+   exact command to run in a WSL terminal, with the log path — it does not guess why.
+   When the app has no usable Node.js directory, step 2 prints
+   `note: node directory unknown, PATH unchanged` before the commands instead of
+   leaving only `node: not found` in the middle of the run.
 
 Step 2 matters because `wsl.exe --exec /bin/bash -c` starts **no login shell**: the
 interactive `PATH` (a `~/.local/bin` shim, nvm, a distro profile script) is absent, and

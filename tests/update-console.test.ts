@@ -91,10 +91,18 @@ describe('console script', () => {
     const install = text.indexOf(`run '${INSTALL}'`);
     expect(install).toBeGreaterThan(exported);
 
-    // Without a usable path the script must not invent one.
-    expect(buildUpdateScript([INSTALL], LOG)).not.toContain('export PATH=');
-    expect(buildUpdateScript([INSTALL], LOG, { nodePath: 'node' })).not.toContain('export PATH=');
-    expect(buildUpdateScript([INSTALL], LOG, { nodePath: "/home/x/it's/node" })).not.toContain('export PATH=');
+    // Without a usable path the script must not invent one - and says so, because
+    // the only other symptom is `node: not found` halfway through the install.
+    const unknown = buildUpdateScript([INSTALL], LOG) as string;
+    expect(unknown).not.toContain('export PATH=');
+    expect(unknown).toContain('note: node directory unknown, PATH unchanged');
+    const note = unknown.indexOf('note: node directory unknown');
+    expect(unknown.indexOf(`run '${INSTALL}'`)).toBeGreaterThan(note);
+
+    expect(buildUpdateScript([INSTALL], LOG, { nodePath: 'node' })).toContain('note: node directory unknown');
+    expect(buildUpdateScript([INSTALL], LOG, { nodePath: "/home/x/it's/node" })).toContain('note: node directory unknown');
+    // A usable directory prints the note only in its own branch, never both.
+    expect(text).not.toContain('note: node directory unknown');
   });
 
   it('runs the start line after the unit was stopped, even when the install fails', () => {
@@ -119,8 +127,13 @@ describe('console script', () => {
     expect(text).toContain('trap bring_back EXIT');
     expect(text).toContain('exit 130');
     // The trap owns the last word: it says the service may still be down and
-    // prints the line the owner has to run themselves.
+    // prints the line the owner has to run themselves, with the log path.
     expect(text).toContain('The service is still stopped');
+    expect(text).toContain('Run this in a WSL terminal');
+    // No guessed cause: a closed window is only one of several reasons a failed
+    // start can have, and the script cannot tell which one it was.
+    expect(text).not.toContain('closed window');
+    expect(text).not.toContain('cannot ask for the password');
   });
 
   it('runs a plan with only the install line and no phantom start', () => {
