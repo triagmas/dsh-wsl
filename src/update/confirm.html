@@ -43,8 +43,9 @@
 
       <p class="hint" id="console-note" hidden>
         The console asks for your password once, before it stops anything. If you close the console or press
-        Ctrl-C after the service was stopped, the script tries the start line again, but a closed window leaves
-        no terminal for <code>sudo</code>: if the backend stays down, run the start line above in a WSL terminal.
+        Ctrl-C after the service was stopped, the script tries the start line again; that recovery is best effort,
+        because a closed console may leave no terminal for <code>sudo</code>. If the backend stays down, run the
+        start line above in a WSL terminal.
       </p>
 
       <p class="copied" id="copied" role="status" aria-live="polite"></p>
