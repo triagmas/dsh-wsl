@@ -197,7 +197,11 @@ app-owned process — verified, `SIGTERM`, then `SIGKILL` — before the port is
 probed again, so a hung-but-alive backend can never survive a failed recovery and
 an occupied port afterwards is necessarily somebody else's listener (collision).
 A process that already died is simply forgotten; a PID whose start time no longer
-matches is never signalled.
+matches is never signalled. A probe that cannot answer at all is **unavailable, not
+missing** (issue #29): a timed-out `wsl.exe` keeps the record, PID and start time,
+sends nothing and starts nothing, and the recovery ends in the terminal `ERROR`
+state with Retry rather than staying in `RECOVERING`, where the health loop would
+never look at it again.
 
 Recovery is **serialized with manual starts and tied to a backend generation**
 (issue #24). Every spawned backend gets a monotonic generation; an exit event is

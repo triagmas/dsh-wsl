@@ -632,7 +632,25 @@ export class Supervisor {
 
     // Keep the recorded PID/start time until the process is proven gone or
     // stopped: a hung-but-alive backend still has to be reclaimed safely.
-    await this.releaseOwnedProcess();
+    //
+    // A probe that throws (a timed-out `wsl.exe`) is "unavailable", not "process
+    // missing": the record, the PID and the start time stay as they are, nothing
+    // is signalled and no second backend is started while ownership is unknown.
+    // Without this the rejection escaped recovery and left the window in
+    // RECOVERING for ever, where no retry ever happens (issue #29).
+    try {
+      await this.releaseOwnedProcess();
+    } catch (error) {
+      this.deps.log.error(`recovery stopped: the stopped backend could not be checked (${describe(error)})`);
+      this.fail(
+        new ShellError(
+          'backend-lost',
+          'The stopped backend could not be checked, so recovery stopped.',
+          'WSL did not answer while the stopped backend was being checked; use Retry once WSL responds.',
+        ),
+      );
+      return;
+    }
 
     const config = this.deps.config();
     if (!config.autoRestart) {
