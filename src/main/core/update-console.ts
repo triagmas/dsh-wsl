@@ -128,6 +128,10 @@ export function buildUpdateScript(
   if (nodeDir !== null) {
     // Without this an npm/pnpm with a `#!/usr/bin/env node` shebang cannot start.
     lines.push(`export PATH='${nodeDir}':"$PATH"`);
+  } else {
+    // Silence here used to surface only as `node: not found` in the middle of the
+    // run. Say it up front, in the log as well, so the cause is readable.
+    lines.push("printf 'note: node directory unknown, PATH unchanged\\n'");
   }
   lines.push(
     '',
@@ -150,7 +154,7 @@ export function buildUpdateScript(
     '  started=1',
     '  printf \'\\nStarting the service again...\\n\'',
     '  if ! run "$START"; then',
-    '    printf \'\\nThe service is still stopped. A closed window leaves no terminal, so sudo cannot ask for the password.\\nRun this in a WSL terminal:\\n  %s\\n\' "$START"',
+    '    printf \'\\nThe service is still stopped. Run this in a WSL terminal:\\n  %s\\nlog: %s\\n\' "$START" "$LOG"',
     '  fi',
     '}',
     '',
