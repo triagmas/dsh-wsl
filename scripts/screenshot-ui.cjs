@@ -311,6 +311,14 @@ async function checkUpdateWindows() {
   check('the window offers Copy all', copyAll === false, String(copyAll));
   const password = await evaluate(confirm, "document.querySelectorAll('input[type=password]').length");
   check('the window never asks for a password', password === 0, String(password));
+  // Issue #29 follow-up: `hidden` must actually hide. The author stylesheet sets
+  // `display` on these blocks, which outranks the user-agent `[hidden]` rule, so
+  // the window showed an empty "Update result" section and a rollback line with a
+  // Copy button before the console had run anything.
+  const resultDisplay = await evaluate(confirm, "getComputedStyle(document.getElementById('result')).display");
+  check('the result block stays invisible until a run happened', resultDisplay === 'none', resultDisplay);
+  const rollbackDisplay = await evaluate(confirm, "getComputedStyle(document.getElementById('rollback')).display");
+  check('the rollback line stays invisible until a failure', rollbackDisplay === 'none', rollbackDisplay);
 
   await evaluate(confirm, "document.getElementById('recheck').click(), null");
   await settle(200);
