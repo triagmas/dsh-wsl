@@ -145,19 +145,29 @@ describe.skipIf(skip)('inspection script prefix detection', () => {
   });
 
   it('still prefers the prefix npm reports when the package is inside it', () => {
-    // Precedence matters: the pre-#55 behaviour must not change for a healthy
-    // install. Both prefixes hold a package here, and npm's own prefix wins.
+    // Precedence, not just presence: a fallback candidate resolves to the *same*
+    // real package directory here, so an implementation that tried the fallback
+    // list first would report `~/.local` instead of npm's own prefix.
     const box = sandbox({ npmPrefix: join(tmpdir(), 'dsh-inspect-npm-prefix'), packagePrefix: null });
     const npmPrefix = join(box.root, 'npm');
     const entry = installAt(npmPrefix);
     rmSync(box.dsh, { force: true });
-    symlinkSync(join(entry), box.dsh);
+    symlinkSync(entry, box.dsh);
     writeFileSync(join(box.home, '.local', 'bin', 'npm'), `#!/bin/sh\nprintf '%s\\n' '${npmPrefix}'\n`);
     chmodSync(join(box.home, '.local', 'bin', 'npm'), 0o755);
+
+    // `~/.local/lib/node_modules/@deepseek-ai/dsh` points at the very same package,
+    // so containment holds for both candidates.
+    mkdirSync(join(box.home, '.local', 'lib', 'node_modules', '@deepseek-ai'), { recursive: true });
+    symlinkSync(
+      join(npmPrefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh'),
+      join(box.home, '.local', 'lib', 'node_modules', '@deepseek-ai', 'dsh'),
+    );
 
     const report = parseSharedDshReport(inspect(box));
     expect(report.installation?.manager).toBe('npm');
     expect(report.installation?.prefix).toBe(npmPrefix);
+    expect(report.installation?.packageDir).toBe(join(npmPrefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh'));
   });
 
   it('reports an unwritable fallback prefix as readonly', () => {
