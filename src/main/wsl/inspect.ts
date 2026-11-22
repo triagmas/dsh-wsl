@@ -153,6 +153,22 @@ export const INSPECT_SCRIPT = [
   'fi',
   'done',
   'fi',
+  // Issue #55: the npm prefix is not always the prefix the package sits in. A
+  // Node.js reinstall (a bundled npm under ~/.local/node, a distro switch) moves
+  // `npm prefix -g` away from an installation that npm still owns globally.
+  // The known global prefixes are tried next; a candidate only counts when the
+  // resolved executable really lives inside its package directory, so a stray
+  // package elsewhere never becomes an ownership claim.
+  'if [ "$manager" = "unknown" ] && [ "$npm_bin" != "-" ]; then',
+  'for cand_prefix in "$HOME/.local" "/usr/local" "$HOME/.npm-global" "/usr"; do',
+  'for layout in lib/node_modules node_modules; do',
+  `cand="$cand_prefix/$layout/${DSH_PACKAGE}"`,
+  '[ -d "$cand" ] || continue',
+  'creal="$(cd "$cand" && pwd -P 2>/dev/null)" || creal="$cand"',
+  'case "$real" in "$creal"/*) manager="npm"; prefix="$cand_prefix"; pkg="$creal"; break 2 ;; esac',
+  'done',
+  'done',
+  'fi',
   'if [ "$manager" = "unknown" ] && command -v pnpm >/dev/null 2>&1; then',
   'proot="$(pnpm root -g 2>/dev/null | tr -d "\\r" | tail -n 1)"',
   'case "$proot" in /*) case "$real" in "$proot"/*) manager="pnpm"; prefix="$proot"; pkg="$proot" ;; esac ;; esac',
