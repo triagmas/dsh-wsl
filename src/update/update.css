@@ -4,6 +4,17 @@
  * Same palette as the footer/settings surfaces so the modal never looks like a
  * separate product, and no remote resources of any kind.
  */
+/*
+ * `hidden` must win over the layout rules below: `.commands`, `.result` and
+ * `.rollback` set `display`, which outranks the user-agent `[hidden]` rule (the
+ * author stylesheet always wins that conflict). Without this an empty "Update
+ * result" section and a rollback line with a Copy button were visible before the
+ * console had run anything.
+ */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   --bg: #0b0f16;
   --panel: #0d1219;
