@@ -172,7 +172,11 @@ operands. It only reads:
 1. the executable a login shell resolves, the minimal `--exec` path, or the
    configured path;
 2. `readlink -f`, the package directory and `package.json` identity;
-3. `npm prefix -g` / `pnpm root -g` and whether the prefix is writable;
+3. `npm prefix -g` / `pnpm root -g` and whether the prefix is writable; when the npm
+   prefix does not contain the package (a Node.js reinstall moves it, #55), the known
+   global prefixes `~/.local`, `/usr/local`, `~/.npm-global` and `/usr` are tried, and a
+   candidate counts only when `readlink -f` of the executable really lands inside the
+   package directory;
 4. `/proc` for other processes running from the same real path;
 5. the versions reported by the app executable and by the login-shell executable.
 
