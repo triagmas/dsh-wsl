@@ -35,18 +35,18 @@ credentials of the official Windows DeepSeek Harness are never touched. Because 
 your normal `~/.dsh` data as well.
 
 > **Release status.** The current published prerelease is
-> [`v0.1.0-beta.14`](https://github.com/triagmas/dsh-wsl/releases/tag/v0.1.0-beta.14) —
-> built from `main@8b2d8df` by Windows CI run
-> [`43695658417`](https://github.com/triagmas/dsh-wsl/actions/runs/43695658417). It ships
+> [`v0.1.0-beta.15`](https://github.com/triagmas/dsh-wsl/releases/tag/v0.1.0-beta.15) —
+> built from `main@db472d9` by Windows CI run
+> [`45023477159`](https://github.com/triagmas/dsh-wsl/actions/runs/45023477159). It ships
 > both variants from that one commit:
-> [`DSH-WSL-0.1.0-beta.14-x64-Portable.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.14/DSH-WSL-0.1.0-beta.14-x64-Portable.exe),
-> [`DSH-WSL-0.1.0-beta.14-x64-Setup.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.14/DSH-WSL-0.1.0-beta.14-x64-Setup.exe)
-> and [`SHA256SUMS.txt`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.14/SHA256SUMS.txt).
+> [`DSH-WSL-0.1.0-beta.15-x64-Portable.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.15/DSH-WSL-0.1.0-beta.15-x64-Portable.exe),
+> [`DSH-WSL-0.1.0-beta.15-x64-Setup.exe`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.15/DSH-WSL-0.1.0-beta.15-x64-Setup.exe)
+> and [`SHA256SUMS.txt`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.15/SHA256SUMS.txt).
 > Since `v0.1.0-beta.13` the file names carry the beta number; the earlier
 > `DSH-WSL-0.1.0-x64-…` assets belong to `v0.1.0-beta.2` … `v0.1.0-beta.12`. There is no
-> stable release yet — every tag is a prerelease. `v0.1.0-beta.15` is prepared on `main`
-> (terminal recovery state for issue #29, console-text leftovers); this block moves to it the
-> moment it is published, so the links above never point at a file that does not exist yet.
+> stable release yet — every tag is a prerelease. This one adds no features: recovery now ends
+> in the terminal `ERROR` state with Retry instead of a splash that never resolves (issue #29),
+> and three console-update leftovers are fixed.
 
 ## What you get
 
