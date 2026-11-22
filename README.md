@@ -44,7 +44,9 @@ your normal `~/.dsh` data as well.
 > and [`SHA256SUMS.txt`](https://github.com/triagmas/dsh-wsl/releases/download/v0.1.0-beta.14/SHA256SUMS.txt).
 > Since `v0.1.0-beta.13` the file names carry the beta number; the earlier
 > `DSH-WSL-0.1.0-x64-…` assets belong to `v0.1.0-beta.2` … `v0.1.0-beta.12`. There is no
-> stable release yet — every tag is a prerelease.
+> stable release yet — every tag is a prerelease. `v0.1.0-beta.15` is prepared on `main`
+> (terminal recovery state for issue #29, console-text leftovers); this block moves to it the
+> moment it is published, so the links above never point at a file that does not exist yet.
 
 ## What you get
 
